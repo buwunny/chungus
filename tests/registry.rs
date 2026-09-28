@@ -136,3 +136,52 @@ async fn nodes_enforce_the_blocklist() {
     other.set_blocked(set);
     assert!(chungus::pack(&model, &other).is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_operator_sets_anchors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = Arc::new(Registry::open(&tmp.path().join("reg")).unwrap());
+    let op_key = reg.operator_key().clone();
+    let operator = reg.operator();
+    let url = spawn(reg).await;
+    let client = Client::new(&url).unwrap();
+    let mallory = sign::generate_key(&tmp.path().join("mallory")).unwrap();
+    assert!(client.anchors(None).await.unwrap().is_empty());
+
+    let peer = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+    let anchor = format!("/ip4/203.0.113.7/tcp/4001/p2p/{peer}");
+    let set = |k: &ed25519_dalek::SigningKey, addrs: Vec<String>| {
+        Statement::new(k, Claim::Anchors { addrs })
+    };
+    let err = client
+        .submit(&set(&mallory, vec![anchor.clone()]))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("only the registry operator"),
+        "{err}"
+    );
+    // Anchors must name their peer.
+    assert!(
+        client
+            .submit(&set(&op_key, vec!["/ip4/203.0.113.7/tcp/4001".into()]))
+            .await
+            .is_err()
+    );
+
+    client
+        .submit(&set(&op_key, vec![anchor.clone()]))
+        .await
+        .unwrap();
+    let got = client.anchors(Some(&operator)).await.unwrap();
+    assert_eq!(got, vec![anchor.parse::<libp2p::Multiaddr>().unwrap()]);
+    // Pinning a different operator key rejects the list.
+    let other = sign::public_key_string(&mallory.verifying_key());
+    assert!(client.anchors(Some(&other)).await.is_err());
+    // A new list replaces the old one, and the log still audits.
+    client.submit(&set(&op_key, vec![])).await.unwrap();
+    assert!(client.anchors(None).await.unwrap().is_empty());
+    client.audit(Some(&operator)).await.unwrap();
+}
