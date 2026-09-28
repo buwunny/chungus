@@ -586,6 +586,11 @@ async fn serve_file(
         _ => {}
     }
 
+    // Files that can run code when loaded never enter the store or come from peers.
+    if !crate::safety::is_allowed(path) {
+        return passthrough(hub, &fr, head, req, head_only).await;
+    }
+
     let found = hub.find_file(&fr.rk, &fr.commit, path).await;
     // A record is usable if it matches what the upstream says the file is now.
     let found = match (found, &head) {
@@ -837,6 +842,68 @@ async fn proxy_range(
             .map(|r| r.map_err(std::io::Error::other)),
     );
     Ok((headers.0, headers.1, body).into_response())
+}
+
+/// Serve a file straight from the upstream without caching it, for files chungus won't
+/// carry (see [`crate::safety`]). Clients that ask for them still work while
+/// huggingface.co is reachable; nothing is stored or offered to peers.
+async fn passthrough(
+    hub: &Hub,
+    fr: &FileRequest,
+    head: Option<UpstreamHead>,
+    req: &HeaderMap,
+    head_only: bool,
+) -> HubResult<Response> {
+    let Some(head) = head else {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "{} can run code when loaded, so chungus doesn't cache it, and huggingface.co \
+                 can't be reached",
+                fr.path
+            ),
+        );
+    };
+    if head_only {
+        let (status, mut h) = file_headers(&fr.commit, &head.etag, head.size.unwrap_or(0), None);
+        if head.size.is_none() {
+            h.remove(header::CONTENT_LENGTH);
+            h.remove("x-linked-size");
+        }
+        return Ok((status, h, Body::empty()).into_response());
+    }
+    let mut get = hub
+        .client
+        .get(&head.url)
+        .headers(fr.auth.clone())
+        .timeout(Duration::from_secs(24 * 3600));
+    if let Some(range) = req.get(header::RANGE) {
+        get = get.header(header::RANGE, range.as_bytes());
+    }
+    let resp = get
+        .send()
+        .await
+        .map_err(|e| HubError(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(Hub::upstream_error(resp).await);
+    }
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let (_, mut h) = file_headers(&fr.commit, &head.etag, head.size.unwrap_or(0), None);
+    h.remove(header::CONTENT_LENGTH);
+    for name in [header::CONTENT_LENGTH, header::CONTENT_RANGE] {
+        if let Some(v) = resp
+            .headers()
+            .get(name.as_str())
+            .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok())
+        {
+            h.insert(name, v);
+        }
+    }
+    let body = Body::from_stream(
+        resp.bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other)),
+    );
+    Ok((status, h, body).into_response())
 }
 
 /// Download an uncached file from the upstream, streaming it to the client while writing
