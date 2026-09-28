@@ -15,7 +15,7 @@ pub struct Manifest {
     pub root: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FileEntry {
     pub path: String,
     pub size: u64,

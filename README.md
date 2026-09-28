@@ -2,7 +2,7 @@
 
 A peer-to-peer network for distributing AI models, their runtimes and Docker AI images. Think of it as a decentralized Hugging Face with its own take on Xet-style storage.
 
-This repository currently holds **milestones 1 and 2**: the storage format, a benchmark tool, and sharing models between machines on a LAN.
+This repository currently holds **milestones 1 to 3**: the storage format, a benchmark tool, sharing models between machines on a LAN, and a drop-in Hugging Face cache.
 
 ## The pipeline
 
@@ -49,6 +49,25 @@ One machine packs a model and serves its store. It advertises itself over mDNS, 
 
 `serve` exposes the store read-only over plain HTTP to anyone who can reach the port. Run it only on networks you trust; encrypted, authenticated transport comes with the internet milestone.
 
+## Drop-in Hugging Face cache
+
+`chungus hub` speaks the part of the Hugging Face Hub API that `huggingface_hub`, `transformers`, vLLM and similar tools use. Point them at it and they work unchanged:
+
+```sh
+./target/release/chungus hub                          # http://localhost:8080
+export HF_ENDPOINT=http://localhost:8080
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-0.5B')"
+```
+
+For each file, the hub serves it from its store if it has it. Otherwise it pulls the chunks from other hubs on the LAN (found over mDNS), and otherwise downloads the file from huggingface.co, streaming it to you while it packs it into the store. The next machine in the office gets it from the LAN.
+
+- **Tokens** (`HF_TOKEN`) are forwarded only to huggingface.co, never to peers.
+- **Gated models** are served only to requests whose token huggingface.co accepts for that file. When huggingface.co can't be reached, a gated file is served only to a token that was accepted earlier in this run.
+- **Peer copies are checked.** While huggingface.co is reachable, a file assembled from LAN peers must match its SHA-256 (or git blob hash). The last bytes are held back until it does, so a bad copy never arrives complete, and that file is then fetched from huggingface.co instead. With `--offline`, peers are trusted, as with `serve`.
+- Tree listings drop Xet hashes, so clients download through the hub instead of going around it.
+
+`--offline` never contacts huggingface.co, `--upstream URL` points at a different Hub-compatible server, and `--peer URL` adds a hub by hand.
+
 No model handy? Generate a synthetic BF16 file:
 
 ```sh
@@ -61,7 +80,7 @@ On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports
 
 ## Manifest and store layout
 
-A store holds `chunks/<hh>/<hash>` blobs and `manifests/<root>.json`. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that and is the value an author will sign in a later milestone.
+A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that and is the value an author will sign in a later milestone.
 
 ## Roadmap
 
@@ -69,7 +88,7 @@ A store holds `chunks/<hh>/<hash>` blobs and `manifests/<root>.json`. A manifest
 |---|---|
 | **M1** (done) | Storage format, `pack` / `unpack` / `bench` |
 | **M2** (done) | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
-| M3 | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
+| **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
 | M4 | Internet swarm, signed publishing, registry and search |
 | Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 

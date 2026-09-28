@@ -6,6 +6,7 @@
 //! encoded with the smallest of {stored, zstd, byte-plane + zstd}.
 
 pub mod chunk;
+pub mod hub;
 pub mod manifest;
 pub mod net;
 pub mod safetensors;
