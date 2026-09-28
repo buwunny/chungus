@@ -7,6 +7,7 @@
 
 pub mod chunk;
 pub mod hub;
+pub mod limits;
 pub mod manifest;
 pub mod net;
 pub mod p2p;

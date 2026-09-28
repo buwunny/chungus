@@ -19,7 +19,8 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, dcutr, identify, noise, ping, relay, tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, connection_limits, dcutr, identify, noise, ping,
+    relay, tcp, yamux,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::limits::{Limits, RateLimiter, SubnetCaps};
 use crate::manifest::{BLOCK_BYTES, Manifest};
 use crate::net::{self, FetchStats};
 use crate::sign::{self, Signature};
@@ -55,6 +57,8 @@ pub enum Response {
     Manifest(Option<ByteBuf>),
     Signatures(Vec<Signature>),
     Chunk(Option<ByteBuf>),
+    /// The node is serving as much as its limits allow; try another peer.
+    Busy,
 }
 
 #[derive(NetworkBehaviour)]
@@ -66,6 +70,7 @@ struct Behaviour {
     relay_client: relay::client::Behaviour,
     relay: Toggle<relay::Behaviour>,
     dcutr: dcutr::Behaviour,
+    limits: connection_limits::Behaviour,
 }
 
 /// How a node joins the network.
@@ -86,6 +91,11 @@ pub struct Config {
     /// Raw bytes per announced block. Leave at 0 for [`BLOCK_BYTES`]; every node in a
     /// swarm must use the same value, so change it only in tests.
     pub block_bytes: u64,
+    /// Nodes to trust as starting points, usually the registry's signed list: always kept
+    /// in the routing table, exempt from connection and subnet limits, and asked directly
+    /// during every fetch alongside the DHT.
+    pub anchors: Vec<Multiaddr>,
+    pub limits: Limits,
 }
 
 enum Command {
@@ -102,6 +112,7 @@ pub struct Node {
     tx: mpsc::UnboundedSender<Command>,
     pub peer_id: PeerId,
     block_bytes: u64,
+    anchors: Vec<PeerId>,
 }
 
 /// Load this node's identity from `path`, creating it on first use.
@@ -170,10 +181,23 @@ impl Node {
                 let id = key.public().to_peer_id();
                 let mut kad_cfg = kad::Config::new(KAD_PROTOCOL);
                 kad_cfg.set_query_timeout(Duration::from_secs(30));
+                // Look up keys along several independent paths (S/Kademlia), so peers that
+                // capture one part of the network can't hide a model from us.
+                kad_cfg.disjoint_query_paths(true);
+                // We decide who enters the routing table (see `route`), to cap how many
+                // entries one subnet can take.
+                kad_cfg.set_kbucket_inserts(kad::BucketInserts::Manual);
                 let mut kad = kad::Behaviour::with_config(id, MemoryStore::new(id), kad_cfg);
-                if cfg.public || cfg.relay_server || !cfg.external.is_empty() {
+                if cfg.limits.download_only {
+                    kad.set_mode(Some(kad::Mode::Client));
+                } else if cfg.public || cfg.relay_server || !cfg.external.is_empty() {
                     kad.set_mode(Some(kad::Mode::Server));
                 }
+                let support = if cfg.limits.download_only {
+                    ProtocolSupport::Outbound
+                } else {
+                    ProtocolSupport::Full
+                };
                 let relay = cfg.relay_server.then(|| {
                     relay::Behaviour::new(
                         id,
@@ -197,13 +221,19 @@ impl Node {
                         request_response::cbor::codec::Codec::default()
                             .set_request_size_maximum(4096)
                             .set_response_size_maximum(MAX_RESPONSE),
-                        [(PROTOCOL, ProtocolSupport::Full)],
+                        [(PROTOCOL, support)],
                         request_response::Config::default()
                             .with_request_timeout(Duration::from_secs(60)),
                     ),
                     relay_client,
                     relay: relay.into(),
                     dcutr: dcutr::Behaviour::new(id),
+                    limits: connection_limits::Behaviour::new(
+                        connection_limits::ConnectionLimits::default()
+                            .with_max_established(Some(cfg.limits.max_connections))
+                            .with_max_established_per_peer(Some(4))
+                            .with_max_pending_incoming(Some(64)),
+                    ),
                 }
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -236,7 +266,18 @@ impl Node {
                 swarm.dial(addr.clone())?;
             }
         }
-        if !cfg.bootstrap.is_empty() {
+        let mut anchors = Vec::new();
+        for addr in &cfg.anchors {
+            let peer = peer_of(addr)
+                .with_context(|| format!("anchor address {addr} must end in /p2p/<peer id>"))?;
+            swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+            swarm.behaviour_mut().limits.bypass_peer_id(&peer);
+            if !relays.contains_key(&peer) {
+                swarm.dial(addr.clone())?;
+            }
+            anchors.push(peer);
+        }
+        if !cfg.bootstrap.is_empty() || !anchors.is_empty() {
             let _ = swarm.behaviour_mut().kad.bootstrap();
         }
 
@@ -258,12 +299,21 @@ impl Node {
             held: HashMap::new(),
             block_bytes,
             relays,
+            caps: SubnetCaps::new(cfg.limits.max_peers_per_subnet),
+            limiter: cfg
+                .limits
+                .upload_bytes_per_sec
+                .map(|r| Arc::new(RateLimiter::new(r))),
+            serving: HashMap::new(),
+            anchor_set: anchors.iter().copied().collect(),
+            limits: cfg.limits.clone(),
         };
         tokio::spawn(runner.run());
         Ok(Node {
             tx,
             peer_id,
             block_bytes,
+            anchors,
         })
     }
 
@@ -332,12 +382,19 @@ struct Runner {
     block_bytes: u64,
     /// Relays to listen through: their address, and the listener while we have one.
     relays: HashMap<PeerId, (Multiaddr, Option<libp2p::core::transport::ListenerId>)>,
+    caps: SubnetCaps,
+    limiter: Option<Arc<RateLimiter>>,
+    /// Requests being served, per peer.
+    serving: HashMap<PeerId, usize>,
+    anchor_set: HashSet<PeerId>,
+    limits: Limits,
 }
+
+type Reply = (PeerId, ResponseChannel<Response>, Response);
 
 impl Runner {
     async fn run(mut self) {
-        let (resp_tx, mut resp_rx) =
-            mpsc::unbounded_channel::<(ResponseChannel<Response>, Response)>();
+        let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<Reply>();
         let mut rescan = tokio::time::interval(RESCAN);
         loop {
             tokio::select! {
@@ -346,8 +403,14 @@ impl Runner {
                     Some(cmd) => self.on_command(cmd),
                     None => return,
                 },
-                Some((channel, resp)) = resp_rx.recv() => {
+                Some((peer, channel, resp)) = resp_rx.recv() => {
                     let _ = self.swarm.behaviour_mut().rr.send_response(channel, resp);
+                    if let Some(n) = self.serving.get_mut(&peer) {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.serving.remove(&peer);
+                        }
+                    }
                 }
                 _ = rescan.tick() => {
                     self.announce();
@@ -361,6 +424,9 @@ impl Runner {
     /// complete block, and the root of every complete model. Kademlia republishes the
     /// records on its own; this adds new ones and withdraws those that no longer hold.
     fn announce(&mut self) {
+        if self.limits.download_only {
+            return;
+        }
         let Ok(roots) = self.store.manifests() else {
             return;
         };
@@ -479,10 +545,18 @@ impl Runner {
         self.addrs.entry(peer).or_default().insert(addr);
     }
 
+    /// Offer a DHT peer to the routing table, subject to the subnet caps. Anchors always
+    /// get in.
+    fn route(&mut self, peer: PeerId, addr: Multiaddr) {
+        if self.anchor_set.contains(&peer) || self.caps.admit(peer, &addr) {
+            self.swarm.behaviour_mut().kad.add_address(&peer, addr);
+        }
+    }
+
     fn on_event(
         &mut self,
         event: SwarmEvent<BehaviourEvent>,
-        resp_tx: &mpsc::UnboundedSender<(ResponseChannel<Response>, Response)>,
+        resp_tx: &mpsc::UnboundedSender<Reply>,
     ) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -520,17 +594,21 @@ impl Runner {
                 let dht = info.protocols.contains(&KAD_PROTOCOL);
                 for addr in info.listen_addrs {
                     if dht {
-                        self.swarm
-                            .behaviour_mut()
-                            .kad
-                            .add_address(&peer_id, addr.clone());
+                        self.route(peer_id, addr.clone());
                     }
                     self.learn(peer_id, addr);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(ev)) => match ev {
                 kad::Event::RoutablePeer { peer, address }
-                | kad::Event::PendingRoutablePeer { peer, address } => self.learn(peer, address),
+                | kad::Event::PendingRoutablePeer { peer, address } => {
+                    self.learn(peer, address.clone());
+                    self.route(peer, address);
+                }
+                kad::Event::RoutingUpdated {
+                    old_peer: Some(old),
+                    ..
+                } => self.caps.remove(&old),
                 kad::Event::OutboundQueryProgressed {
                     id, result, step, ..
                 } => {
@@ -552,13 +630,29 @@ impl Runner {
                 _ => {}
             },
             SwarmEvent::Behaviour(BehaviourEvent::Rr(ev)) => match ev {
-                request_response::Event::Message { message, .. } => match message {
+                request_response::Event::Message { peer, message, .. } => match message {
                     request_response::Message::Request {
                         request, channel, ..
                     } => {
+                        let mine = self.serving.get(&peer).copied().unwrap_or(0);
+                        let total: usize = self.serving.values().sum();
+                        *self.serving.entry(peer).or_default() += 1;
+                        if mine >= self.limits.max_requests_per_peer
+                            || total >= self.limits.max_uploads
+                        {
+                            let _ = resp_tx.send((peer, channel, Response::Busy));
+                            return;
+                        }
                         let (store, resp_tx) = (self.store.clone(), resp_tx.clone());
-                        tokio::task::spawn_blocking(move || {
-                            let _ = resp_tx.send((channel, answer(&store, request)));
+                        let limiter = self.limiter.clone();
+                        tokio::spawn(async move {
+                            let resp = tokio::task::spawn_blocking(move || answer(&store, request))
+                                .await
+                                .unwrap_or(Response::Busy);
+                            if let Some(lim) = limiter {
+                                lim.take(resp.size() as u64).await;
+                            }
+                            let _ = resp_tx.send((peer, channel, resp));
                         });
                     }
                     request_response::Message::Response {
@@ -584,6 +678,17 @@ impl Runner {
     }
 }
 
+impl Response {
+    /// Roughly how many bytes this response puts on the wire.
+    fn size(&self) -> usize {
+        match self {
+            Response::Manifest(Some(b)) | Response::Chunk(Some(b)) => b.len(),
+            Response::Signatures(s) => s.len() * 200,
+            _ => 16,
+        }
+    }
+}
+
 /// Answer a peer's request from the store. Anything missing or malformed is `None`.
 fn answer(store: &Store, req: Request) -> Response {
     match req {
@@ -605,6 +710,11 @@ fn answer(store: &Store, req: Request) -> Response {
     }
 }
 
+/// Chunk requests a fetch keeps in flight to one peer.
+const PER_PEER_REQUESTS: usize = 8;
+/// How long a fetch keeps retrying a peer that answers "busy".
+const BUSY_PATIENCE: Duration = Duration::from_secs(60);
+
 /// Download model `root` from whoever has it on the DHT: nodes with the whole model, and
 /// nodes with some of its blocks (typically ones still downloading it themselves). As with
 /// a LAN fetch, the manifest must hash to `root` and every chunk to its hash, and when
@@ -623,7 +733,7 @@ pub async fn fetch(
     let (complete, holders) = tokio::try_join!(node.providers(root), node.holders(root))?;
     // Nodes with the whole model first; anyone with the manifest can supply it.
     let mut peers = complete.clone();
-    for p in holders {
+    for &p in holders.iter().chain(&node.anchors) {
         if !peers.contains(&p) {
             peers.push(p);
         }
@@ -689,7 +799,11 @@ pub async fn fetch(
         .enumerate()
         .flat_map(|(i, b)| b.chunks.iter().map(move |c| (c.hash.as_str(), i)))
         .collect();
-    if any_needed && complete.is_empty() && block_peers.iter().all(Vec::is_empty) {
+    if any_needed
+        && complete.is_empty()
+        && node.anchors.is_empty()
+        && block_peers.iter().all(Vec::is_empty)
+    {
         bail!("nobody on the network has the chunks of {root}");
     }
 
@@ -699,23 +813,51 @@ pub async fn fetch(
             .get(hash)
             .map(|&i| net::rotated(&block_peers[i], hash))
             .unwrap_or_default();
-        for p in net::rotated(&complete, hash) {
+        // Anchors last: they may have it even if the DHT is being kept from us.
+        for p in net::rotated(&complete, hash)
+            .into_iter()
+            .chain(node.anchors.iter().copied())
+        {
             if !order.contains(&p) {
                 order.push(p);
             }
         }
         order
     };
+    // Stay under a peer's default request limit, so a well-behaved fetch rarely hears
+    // "busy" even when one peer is its only source.
+    let slots: std::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Semaphore>>> = Default::default();
+    let slots = &slots;
     let mut stats = net::fetch_chunks_from(
         &store,
         manifest.files.iter().flat_map(|f| &f.chunks),
         sources,
         |peer, hash| {
             let node = node.clone();
+            let slot = slots
+                .lock()
+                .unwrap()
+                .entry(peer)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PER_PEER_REQUESTS)))
+                .clone();
             async move {
-                match node.request(peer, Request::Chunk(hash)).await {
-                    Ok(Response::Chunk(Some(b))) => Some(Bytes::from(b.into_vec())),
-                    _ => None,
+                let _permit = slot.acquire_owned().await.ok()?;
+                // A busy peer is at its upload limits but alive; keep asking for a while
+                // rather than moving on, since it may be the only one with this chunk.
+                let give_up = tokio::time::Instant::now() + BUSY_PATIENCE;
+                let mut attempt = 0u32;
+                loop {
+                    match node.request(peer, Request::Chunk(hash.clone())).await {
+                        Ok(Response::Chunk(Some(b))) => return Some(Bytes::from(b.into_vec())),
+                        Ok(Response::Busy) if tokio::time::Instant::now() < give_up => {
+                            // Spread retries out so waiting requests don't all return at once.
+                            let jitter = u64::from(hash.as_bytes()[attempt as usize % 64]) % 50;
+                            let wait = (50 << attempt.min(4)) + jitter;
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
+                            attempt += 1;
+                        }
+                        _ => return None,
+                    }
                 }
             }
         },

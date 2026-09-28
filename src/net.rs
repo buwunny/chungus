@@ -103,6 +103,21 @@ pub async fn serve_on(listener: tokio::net::TcpListener, store: Arc<Store>) -> R
     Ok(())
 }
 
+/// Hold each response until `limiter` allows its bytes, capping what a router uploads.
+pub fn rate_limited(router: Router, limiter: Arc<crate::limits::RateLimiter>) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let limiter = limiter.clone();
+            async move {
+                let resp = next.run(req).await;
+                let bytes = axum::body::HttpBody::size_hint(resp.body()).lower();
+                limiter.take(bytes).await;
+                resp
+            }
+        },
+    ))
+}
+
 /// Advertise this node on the LAN under instance `id`. Keep the returned daemon alive for
 /// as long as the advert should last.
 pub fn advertise(port: u16, id: &str) -> Result<mdns_sd::ServiceDaemon> {
