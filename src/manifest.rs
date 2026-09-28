@@ -59,8 +59,16 @@ impl Manifest {
         }
     }
 
+    /// Whether the root matches the contents, and every file is made of chunks no bigger
+    /// than chunking produces that add up to its size. Readers size buffers from these
+    /// lengths, so a manifest from anywhere must pass this before it is used.
     pub fn verify_root(&self) -> bool {
-        compute_root(&self.format, &self.files).is_some_and(|r| r == self.root)
+        self.files.iter().all(|f| {
+            f.chunks
+                .iter()
+                .all(|c| c.len as usize <= crate::chunk::MAX_SIZE)
+                && f.chunks.iter().map(|c| c.len as u64).sum::<u64>() == f.size
+        }) && compute_root(&self.format, &self.files).is_some_and(|r| r == self.root)
     }
 
     /// Whether the root commits to each chunk, so chunks can be used as they arrive.
@@ -158,6 +166,31 @@ fn compute_root(format: &str, files: &[FileEntry]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(lens: &[u32], size: u64) -> FileEntry {
+        FileEntry {
+            path: "model.safetensors".into(),
+            size,
+            hash: "00".repeat(32),
+            chunks: lens
+                .iter()
+                .map(|&len| ChunkRef {
+                    hash: "11".repeat(32),
+                    len,
+                    dtype: Dtype::Raw,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn chunk_lengths_must_be_sane() {
+        assert!(Manifest::new(vec![file(&[1000, 24], 1024)]).verify_root());
+        // A correctly hashed manifest that claims a 4 GB chunk (found by fuzzing: decoding
+        // it allocated the claimed length) or lengths that don't add up is refused.
+        assert!(!Manifest::new(vec![file(&[u32::MAX], u32::MAX as u64)]).verify_root());
+        assert!(!Manifest::new(vec![file(&[1000], 1024)]).verify_root());
+    }
 
     #[test]
     fn parse_names_newer_formats() {
