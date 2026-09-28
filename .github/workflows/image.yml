@@ -3,7 +3,8 @@
 # on its own native runner (emulating arm64 makes a Rust build take hours; arm64 has
 # no -latest label, so it names the newest Ubuntu), then one job
 # joins them under a multi-arch tag. Pull requests that touch the image build it without
-# publishing.
+# publishing. No build cache: the Dockerfile compiles in one layer that changes with every
+# commit, so a cache would only take up space.
 name: Image
 
 on:
@@ -51,8 +52,6 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
       - name: Save digest
         if: github.event_name != 'pull_request'
         run: |
