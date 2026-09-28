@@ -219,28 +219,10 @@ pub async fn fetch(
     origin: Option<&str>,
     trust: &[VerifyingKey],
 ) -> Result<(Manifest, FetchStats)> {
-    if !store::is_hash(root) {
-        bail!("{root:?} is not a manifest root hash");
-    }
     let started = Instant::now();
     let client = client()?;
     let origin: Vec<String> = origin.map(str::to_string).into_iter().collect();
-    let all: Vec<&String> = peers.iter().chain(&origin).collect();
-    if all.is_empty() {
-        bail!("no peers found and no origin given");
-    }
-
-    let manifest = match store.get_manifest(root) {
-        Ok(m) => m,
-        Err(_) => fetch_manifest(&client, root, &all).await?,
-    };
-    store.put_manifest(&manifest)?;
-    let sigs = fetch_signatures(&client, root, &all).await;
-    store.add_signatures(root, &sigs)?;
-    if !trust.is_empty() && !sign::trusted_by(&store.signatures(root)?, root, trust) {
-        bail!("no trusted key has signed {root}; refusing to download it");
-    }
-
+    let manifest = prepare(&client, root, &store, peers, &origin, trust).await?;
     let mut stats = fetch_chunks(
         &client,
         &store,
@@ -251,6 +233,58 @@ pub async fn fetch(
     .await?;
     stats.secs = started.elapsed().as_secs_f64();
     Ok((manifest, stats))
+}
+
+/// Get the manifest for `root` (from the store, or else from `peers` and `origin`) and
+/// every source's signatures for it, and check `trust` as [`fetch`] does.
+pub async fn prepare(
+    client: &reqwest::Client,
+    root: &str,
+    store: &Arc<Store>,
+    peers: &[String],
+    origin: &[String],
+    trust: &[VerifyingKey],
+) -> Result<Manifest> {
+    if !store::is_hash(root) {
+        bail!("{root:?} is not a manifest root hash");
+    }
+    let all: Vec<&String> = peers.iter().chain(origin).collect();
+    if all.is_empty() {
+        bail!("no peers found and no origin given");
+    }
+    let manifest = match store.get_manifest(root) {
+        Ok(m) => m,
+        Err(_) => fetch_manifest(client, root, &all).await?,
+    };
+    store.put_manifest(&manifest)?;
+    let sigs = fetch_signatures(client, root, &all).await;
+    store.add_signatures(root, &sigs)?;
+    if !trust.is_empty() && !sign::trusted_by(&store.signatures(root)?, root, trust) {
+        bail!("no trusted key has signed {root}; refusing to download it");
+    }
+    Ok(manifest)
+}
+
+/// LAN peers (spread by hash) and then an origin, as a source for [`crate::lazy`].
+pub struct HttpSource {
+    pub client: reqwest::Client,
+    pub peers: Vec<String>,
+    pub origin: Vec<String>,
+}
+
+impl crate::lazy::ChunkSource for HttpSource {
+    fn fetch<'a>(
+        &'a self,
+        store: &'a Arc<Store>,
+        hash: &'a str,
+        len: usize,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let mut sources = rotated(&self.peers, hash);
+            sources.extend(self.origin.iter().cloned());
+            fetch_one(&self.client, store, hash, len, &sources).await
+        })
+    }
 }
 
 pub fn client() -> Result<reqwest::Client> {

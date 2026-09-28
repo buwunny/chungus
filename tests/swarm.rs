@@ -341,3 +341,52 @@ async fn anchors_serve_under_tight_limits() {
     .await;
     assert!(p2p::fetch(&asker, &m.root, other, &[]).await.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_reads_lazily_from_the_swarm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let seed_store = store(&tmp.path().join("seed"));
+    let (m, _) = chungus::pack(&model, &seed_store).unwrap();
+    seed_store.put_manifest(&m).unwrap();
+    let (seed, seed_addrs) = node(
+        &seed_store,
+        Config {
+            listen: tcp(),
+            public: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    seed.announce().unwrap();
+    let local = store(&tmp.path().join("local"));
+    let (fetcher, _) = node(
+        &local,
+        Config {
+            listen: tcp(),
+            bootstrap: seed_addrs,
+            ..Default::default()
+        },
+    )
+    .await;
+    wait_for_providers(&fetcher, &m.root).await;
+
+    let (manifest, sources) = p2p::prepare(&fetcher, &m.root, &local, &[]).await.unwrap();
+    let file = manifest
+        .files
+        .iter()
+        .position(|f| f.path == "weights.bin")
+        .unwrap();
+    let lazy = chungus::lazy::Lazy::new(local.clone(), manifest, Arc::new(sources)).unwrap();
+    let original = fs::read(model.join("weights.bin")).unwrap();
+    let got = lazy.read(file, 1_234_567, 100_000).await.unwrap();
+    assert_eq!(got, original[1_234_567..1_334_567]);
+    lazy.prefetch(8).await.unwrap();
+    assert_eq!(
+        lazy.stats
+            .local_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        lazy.total_bytes()
+    );
+}

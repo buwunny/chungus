@@ -726,10 +726,30 @@ pub async fn fetch(
     store: Arc<Store>,
     trust: &[ed25519_dalek::VerifyingKey],
 ) -> Result<(Manifest, FetchStats)> {
+    let started = Instant::now();
+    let (manifest, sources) = prepare(node, root, &store, trust).await?;
+    let mut stats = net::fetch_chunks_from(
+        &store,
+        manifest.files.iter().flat_map(|f| &f.chunks),
+        |hash| sources.sources(hash),
+        |peer, hash| sources.get(peer, hash),
+    )
+    .await?;
+    stats.secs = started.elapsed().as_secs_f64();
+    Ok((manifest, stats))
+}
+
+/// Get ready to download `root` from the swarm: fetch and check its manifest and
+/// signatures, then look up who holds each block the store still lacks.
+pub async fn prepare(
+    node: &Node,
+    root: &str,
+    store: &Arc<Store>,
+    trust: &[ed25519_dalek::VerifyingKey],
+) -> Result<(Manifest, ModelSources)> {
     if !store::is_hash(root) {
         bail!("{root:?} is not a manifest root hash");
     }
-    let started = Instant::now();
     let (complete, holders) = tokio::try_join!(node.providers(root), node.holders(root))?;
     // Nodes with the whole model first; anyone with the manifest can supply it.
     let mut peers = complete.clone();
@@ -794,10 +814,10 @@ pub async fn fetch(
     for (i, p) in found {
         block_peers[i] = p;
     }
-    let block_of: HashMap<&str, usize> = blocks
+    let block_of: HashMap<String, usize> = blocks
         .iter()
         .enumerate()
-        .flat_map(|(i, b)| b.chunks.iter().map(move |c| (c.hash.as_str(), i)))
+        .flat_map(|(i, b)| b.chunks.iter().map(move |c| (c.hash.clone(), i)))
         .collect();
     if any_needed
         && complete.is_empty()
@@ -806,63 +826,99 @@ pub async fn fetch(
     {
         bail!("nobody on the network has the chunks of {root}");
     }
+    let sources = ModelSources {
+        node: node.clone(),
+        complete,
+        block_of,
+        block_peers,
+        slots: Default::default(),
+    };
+    Ok((manifest, sources))
+}
 
-    let sources = |hash: &str| -> Vec<PeerId> {
-        // Holders of the chunk's block, then holders of the whole model.
-        let mut order = block_of
+/// Who to ask for each chunk of one model, from [`prepare`].
+pub struct ModelSources {
+    node: Node,
+    complete: Vec<PeerId>,
+    block_of: HashMap<String, usize>,
+    block_peers: Vec<Vec<PeerId>>,
+    /// Stay under a peer's default request limit, so a well-behaved fetch rarely hears
+    /// "busy" even when one peer is its only source.
+    slots: std::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Semaphore>>>,
+}
+
+impl ModelSources {
+    /// Peers to ask for `hash`, best first: holders of the chunk's block, then holders of
+    /// the whole model, then anchors (they may have it even if the DHT is being kept from
+    /// us).
+    pub fn sources(&self, hash: &str) -> Vec<PeerId> {
+        let mut order = self
+            .block_of
             .get(hash)
-            .map(|&i| net::rotated(&block_peers[i], hash))
+            .map(|&i| net::rotated(&self.block_peers[i], hash))
             .unwrap_or_default();
-        // Anchors last: they may have it even if the DHT is being kept from us.
-        for p in net::rotated(&complete, hash)
+        for p in net::rotated(&self.complete, hash)
             .into_iter()
-            .chain(node.anchors.iter().copied())
+            .chain(self.node.anchors.iter().copied())
         {
             if !order.contains(&p) {
                 order.push(p);
             }
         }
         order
-    };
-    // Stay under a peer's default request limit, so a well-behaved fetch rarely hears
-    // "busy" even when one peer is its only source.
-    let slots: std::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Semaphore>>> = Default::default();
-    let slots = &slots;
-    let mut stats = net::fetch_chunks_from(
-        &store,
-        manifest.files.iter().flat_map(|f| &f.chunks),
-        sources,
-        |peer, hash| {
-            let node = node.clone();
-            let slot = slots
-                .lock()
-                .unwrap()
-                .entry(peer)
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PER_PEER_REQUESTS)))
-                .clone();
-            async move {
-                let _permit = slot.acquire_owned().await.ok()?;
-                // A busy peer is at its upload limits but alive; keep asking for a while
-                // rather than moving on, since it may be the only one with this chunk.
-                let give_up = tokio::time::Instant::now() + BUSY_PATIENCE;
-                let mut attempt = 0u32;
-                loop {
-                    match node.request(peer, Request::Chunk(hash.clone())).await {
-                        Ok(Response::Chunk(Some(b))) => return Some(Bytes::from(b.into_vec())),
-                        Ok(Response::Busy) if tokio::time::Instant::now() < give_up => {
-                            // Spread retries out so waiting requests don't all return at once.
-                            let jitter = u64::from(hash.as_bytes()[attempt as usize % 64]) % 50;
-                            let wait = (50 << attempt.min(4)) + jitter;
-                            tokio::time::sleep(Duration::from_millis(wait)).await;
-                            attempt += 1;
-                        }
-                        _ => return None,
+    }
+
+    /// Ask `peer` for chunk `hash`. Unverified.
+    pub fn get(&self, peer: PeerId, hash: String) -> impl Future<Output = Option<Bytes>> + use<> {
+        let node = self.node.clone();
+        let slot = self
+            .slots
+            .lock()
+            .unwrap()
+            .entry(peer)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PER_PEER_REQUESTS)))
+            .clone();
+        async move {
+            let _permit = slot.acquire_owned().await.ok()?;
+            // A busy peer is at its upload limits but alive; keep asking for a while
+            // rather than moving on, since it may be the only one with this chunk.
+            let give_up = tokio::time::Instant::now() + BUSY_PATIENCE;
+            let mut attempt = 0u32;
+            loop {
+                match node.request(peer, Request::Chunk(hash.clone())).await {
+                    Ok(Response::Chunk(Some(b))) => return Some(Bytes::from(b.into_vec())),
+                    Ok(Response::Busy) if tokio::time::Instant::now() < give_up => {
+                        // Spread retries out so waiting requests don't all return at once.
+                        let jitter = u64::from(hash.as_bytes()[attempt as usize % 64]) % 50;
+                        let wait = (50 << attempt.min(4)) + jitter;
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        attempt += 1;
                     }
+                    _ => return None,
                 }
             }
-        },
-    )
-    .await?;
-    stats.secs = started.elapsed().as_secs_f64();
-    Ok((manifest, stats))
+        }
+    }
+}
+
+impl crate::lazy::ChunkSource for ModelSources {
+    fn fetch<'a>(
+        &'a self,
+        store: &'a Arc<Store>,
+        hash: &'a str,
+        len: usize,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            for peer in self.sources(hash) {
+                if let Some(blob) = self.get(peer, hash.to_string()).await
+                    && net::verify_and_store(store, hash, len, blob)
+                        .await
+                        .is_some()
+                {
+                    return true;
+                }
+            }
+            false
+        })
+    }
 }

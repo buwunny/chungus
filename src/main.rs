@@ -108,36 +108,24 @@ enum Cmd {
         /// A manifest root, or a registry name (org/model[@rev]). A name is resolved in the
         /// registry, and the download then requires its publisher's signature.
         root: String,
-        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
-        registry: String,
-        #[arg(long, default_value = DEFAULT_STORE)]
-        store: PathBuf,
         /// Also unpack the files into this directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// A peer to use in addition to discovered ones, e.g. http://192.168.1.20:7447.
-        #[arg(long)]
-        peer: Vec<String>,
-        /// A server to use only when no peer has a chunk.
-        #[arg(long)]
-        origin: Option<String>,
-        /// Skip mDNS discovery and use only --peer and --origin.
-        #[arg(long)]
-        no_mdns: bool,
-        /// How long to listen for peers on the LAN, in seconds.
-        #[arg(long, default_value_t = 2.0)]
-        discover_secs: f64,
-        /// Only download if this public key (chungus1...) has signed the manifest. Repeatable.
-        #[arg(long)]
-        trust: Vec<String>,
-        /// Fetch over the internet swarm instead of the LAN, joining through this node
-        /// (a multiaddr ending in /p2p/<peer id>). Repeatable.
-        #[arg(long)]
-        bootstrap: Vec<Multiaddr>,
-        /// Fetch over the internet swarm, joining through the registry's signed anchor
-        /// nodes (and any --bootstrap).
-        #[arg(long)]
-        swarm: bool,
+        #[command(flatten)]
+        from: FromArgs,
+    },
+    /// Mount a model as a read-only directory that works before the download finishes:
+    /// reads fetch what they need, and the rest is prefetched in layer order.
+    Mount {
+        /// A manifest root, or a registry name (org/model[@rev]).
+        model: String,
+        /// An empty directory to mount on.
+        dir: PathBuf,
+        /// Chunks to prefetch at once; 0 fetches only what is read.
+        #[arg(long, default_value_t = 16)]
+        prefetch: usize,
+        #[command(flatten)]
+        from: FromArgs,
     },
     /// Join the internet swarm: announce this store's models on the DHT and serve them.
     Node {
@@ -350,6 +338,124 @@ fn report_fetch(s: &FetchStats) {
     }
 }
 
+/// Where to get a model from, shared by `fetch` and `mount`.
+#[derive(clap::Args)]
+struct FromArgs {
+    #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+    registry: String,
+    #[arg(long, default_value = DEFAULT_STORE)]
+    store: PathBuf,
+    /// A peer to use in addition to discovered ones, e.g. http://192.168.1.20:7447.
+    #[arg(long)]
+    peer: Vec<String>,
+    /// A server to use only when no peer has a chunk.
+    #[arg(long)]
+    origin: Option<String>,
+    /// Skip mDNS discovery and use only --peer and --origin.
+    #[arg(long)]
+    no_mdns: bool,
+    /// How long to listen for peers on the LAN, in seconds.
+    #[arg(long, default_value_t = 2.0)]
+    discover_secs: f64,
+    /// Only download if this public key (chungus1...) has signed the manifest. Repeatable.
+    #[arg(long)]
+    trust: Vec<String>,
+    /// Fetch over the internet swarm instead of the LAN, joining through this node
+    /// (a multiaddr ending in /p2p/<peer id>). Repeatable.
+    #[arg(long)]
+    bootstrap: Vec<Multiaddr>,
+    /// Fetch over the internet swarm, joining through the registry's signed anchor
+    /// nodes (and any --bootstrap).
+    #[arg(long)]
+    swarm: bool,
+}
+
+impl FromArgs {
+    fn over_swarm(&self) -> bool {
+        self.swarm || !self.bootstrap.is_empty()
+    }
+
+    /// The manifest root for `model` (a root or a registry name) and the keys that must
+    /// have signed it. A name trusts its publisher, and syncs the registry's blocklist.
+    async fn resolve(
+        &self,
+        model: &str,
+        store: &Store,
+    ) -> Result<(String, Vec<ed25519_dalek::VerifyingKey>)> {
+        let mut trust = parse_keys(&self.trust)?;
+        if store::is_hash(model) {
+            return Ok((model.to_string(), trust));
+        }
+        let (name, rev) = registry::parse_ref(model)?;
+        let entry = registry::Client::new(&self.registry)?
+            .resolve(&name, &rev)
+            .await?;
+        let Claim::Publish { root, .. } = entry.statement.claim else {
+            unreachable!("resolve returns publishes")
+        };
+        println!(
+            "{name}@{rev} is {root}, published by {}",
+            entry.statement.signature.key
+        );
+        trust.push(sign::parse_public_key(&entry.statement.signature.key)?);
+        registry::Follower::new(&self.registry, None)?
+            .sync(store)
+            .await?;
+        Ok((root, trust))
+    }
+
+    /// `--peer`s plus, unless `--no-mdns`, peers found on the LAN.
+    async fn lan_peers(&self) -> Result<Vec<String>> {
+        let mut peers = self.peer.clone();
+        if !self.no_mdns {
+            let wait = Duration::from_secs_f64(self.discover_secs);
+            let found = tokio::task::spawn_blocking(move || net::discover(wait, None)).await??;
+            println!("found {} peer(s) on the LAN", found.len());
+            peers.extend(found);
+        }
+        peers.sort();
+        peers.dedup();
+        Ok(peers)
+    }
+
+    fn origin(&self) -> Vec<String> {
+        self.origin.iter().cloned().collect()
+    }
+
+    /// A download-only swarm node joined through `--bootstrap` and, with `--swarm`, the
+    /// registry's anchors.
+    async fn swarm_node(&self, store: &Arc<Store>) -> Result<p2p::Node> {
+        let anchors = if self.swarm {
+            let anchors = registry::Client::new(&self.registry)?.anchors(None).await?;
+            if anchors.is_empty() && self.bootstrap.is_empty() {
+                bail!(
+                    "{} lists no anchor nodes; join with --bootstrap",
+                    self.registry
+                );
+            }
+            anchors
+        } else {
+            Vec::new()
+        };
+        let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
+        let config = p2p::Config {
+            listen: vec![
+                "/ip4/0.0.0.0/tcp/0".parse()?,
+                "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
+            ],
+            bootstrap: self.bootstrap.clone(),
+            anchors,
+            // A one-off download leaves before it could usefully serve anyone.
+            limits: Limits {
+                download_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        p2p::Node::start(store.clone(), key, config).await
+    }
+}
+
 fn parse_keys(keys: &[String]) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
     keys.iter().map(|k| sign::parse_public_key(k)).collect()
 }
@@ -531,84 +637,15 @@ async fn main() -> Result<()> {
             println!("use it with: export HF_ENDPOINT=http://localhost:{port}");
             axum::serve(listener, hub::router(hub)).await?;
         }
-        Cmd::Fetch {
-            root,
-            registry,
-            store,
-            output,
-            peer,
-            origin,
-            no_mdns,
-            discover_secs,
-            trust,
-            bootstrap,
-            swarm,
-        } => {
-            let mut trust = parse_keys(&trust)?;
-            let mut via_registry = false;
-            let root = if store::is_hash(&root) {
-                root
-            } else {
-                let (name, rev) = registry::parse_ref(&root)?;
-                let entry = registry::Client::new(&registry)?
-                    .resolve(&name, &rev)
-                    .await?;
-                let Claim::Publish { root, .. } = entry.statement.claim else {
-                    unreachable!("resolve returns publishes")
-                };
-                println!(
-                    "{name}@{rev} is {root}, published by {}",
-                    entry.statement.signature.key
-                );
-                trust.push(sign::parse_public_key(&entry.statement.signature.key)?);
-                via_registry = true;
-                root
-            };
-            let store = Arc::new(Store::open(&store)?);
-            if via_registry {
-                registry::Follower::new(&registry, None)?
-                    .sync(&store)
-                    .await?;
-            }
-            let (manifest, s) = if bootstrap.is_empty() && !swarm {
-                let mut peers = peer;
-                if !no_mdns {
-                    let wait = Duration::from_secs_f64(discover_secs);
-                    let found =
-                        tokio::task::spawn_blocking(move || net::discover(wait, None)).await??;
-                    println!("found {} peer(s) on the LAN", found.len());
-                    peers.extend(found);
-                }
-                peers.sort();
-                peers.dedup();
-                net::fetch(&root, store.clone(), &peers, origin.as_deref(), &trust).await?
-            } else {
-                let anchors = if swarm {
-                    let anchors = registry::Client::new(&registry)?.anchors(None).await?;
-                    if anchors.is_empty() && bootstrap.is_empty() {
-                        bail!("{registry} lists no anchor nodes; join with --bootstrap");
-                    }
-                    anchors
-                } else {
-                    Vec::new()
-                };
-                let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
-                let config = p2p::Config {
-                    listen: vec![
-                        "/ip4/0.0.0.0/tcp/0".parse()?,
-                        "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
-                    ],
-                    bootstrap,
-                    anchors,
-                    // A one-off fetch leaves before it could usefully serve anyone.
-                    limits: Limits {
-                        download_only: true,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                let node = p2p::Node::start(store.clone(), key, config).await?;
+        Cmd::Fetch { root, output, from } => {
+            let store = Arc::new(Store::open(&from.store)?);
+            let (root, trust) = from.resolve(&root, &store).await?;
+            let (manifest, s) = if from.over_swarm() {
+                let node = from.swarm_node(&store).await?;
                 p2p::fetch(&node, &root, store.clone(), &trust).await?
+            } else {
+                let peers = from.lan_peers().await?;
+                net::fetch(&root, store.clone(), &peers, from.origin.as_deref(), &trust).await?
             };
             report_fetch(&s);
             if let Some(output) = output {
@@ -617,6 +654,90 @@ async fn main() -> Result<()> {
                 println!("unpacked, all chunks verified");
             }
         }
+        #[cfg(unix)]
+        Cmd::Mount {
+            model,
+            dir,
+            prefetch,
+            from,
+        } => {
+            let store = Arc::new(Store::open(&from.store)?);
+            let (root, trust) = from.resolve(&model, &store).await?;
+            let (manifest, source): (Manifest, Arc<dyn chungus::lazy::ChunkSource>) =
+                if from.over_swarm() {
+                    let node = from.swarm_node(&store).await?;
+                    let (m, s) = p2p::prepare(&node, &root, &store, &trust).await?;
+                    (m, Arc::new(s))
+                } else {
+                    let client = net::client()?;
+                    let peers = from.lan_peers().await?;
+                    let origin = from.origin();
+                    let m = net::prepare(&client, &root, &store, &peers, &origin, &trust).await?;
+                    (
+                        m,
+                        Arc::new(net::HttpSource {
+                            client,
+                            peers,
+                            origin,
+                        }),
+                    )
+                };
+            let lazy = chungus::lazy::Lazy::new(store, manifest, source)?;
+            let mounted =
+                chungus::mount::mount(lazy.clone(), &dir, tokio::runtime::Handle::current())?;
+            println!(
+                "mounted {root} at {} ({:.1} MB, {:.1} MB already local); Ctrl-C to unmount",
+                dir.display(),
+                mb(lazy.total_bytes()),
+                mb(lazy
+                    .stats
+                    .local_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)),
+            );
+            let progress = {
+                let lazy = lazy.clone();
+                async move {
+                    if prefetch == 0 {
+                        return std::future::pending().await;
+                    }
+                    let started = std::time::Instant::now();
+                    let ticker = async {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            let local = lazy
+                                .stats
+                                .local_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            println!(
+                                "  {:.0}% local ({:.1} of {:.1} MB)",
+                                pct(local, lazy.total_bytes()),
+                                mb(local),
+                                mb(lazy.total_bytes())
+                            );
+                        }
+                    };
+                    tokio::select! {
+                        r = lazy.prefetch(prefetch) => match r {
+                            Ok(()) => println!(
+                                "prefetch done in {:.1}s: the whole model is local",
+                                started.elapsed().as_secs_f64()
+                            ),
+                            Err(e) => eprintln!("prefetch stopped: {e:#}"),
+                        },
+                        _ = ticker => {}
+                    }
+                    std::future::pending::<()>().await
+                }
+            };
+            tokio::select! {
+                _ = progress => {}
+                r = tokio::signal::ctrl_c() => r?,
+            }
+            mounted.unmount()?;
+            println!("unmounted");
+        }
+        #[cfg(not(unix))]
+        Cmd::Mount { .. } => bail!("mounting needs FUSE, which this platform doesn't have"),
         Cmd::Node {
             store,
             blocklist,
