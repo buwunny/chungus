@@ -285,6 +285,17 @@ A chunk's hash proves a file arrived intact, not that it is safe to load, and pi
 - The registry won't publish them.
 - `chungus hub` passes them through from huggingface.co without caching them or taking them from peers.
 
+## Gated and licensed models
+
+Some models, such as Llama, are gated on Hugging Face: you must accept a license before downloading. A swarm would otherwise let anyone re-share them without the gate, so gated models are served only to people whose own Hugging Face token passes it.
+
+- A publisher marks a model as gated when publishing it: `chungus publish <root> --name acme/llama-3.2-1b --gated-by meta-llama/Llama-3.2-1B`. The registry operator can gate any model after the fact (`chungus gate <root> meta-llama/Llama-3.2-1B --key operator.key`, or with no repo to lift it). Only the operator can lift a gate.
+- Nodes that follow a registry (`--blocklist <registry>`) learn which models are gated, and serve their chunks only to peers that present an **access ticket**: a statement signed by the registry's operator key that one peer id may download one repo's models, valid for a day.
+- To get a ticket, `fetch` and `mount` send the user's Hugging Face token (from `HF_TOKEN` or `huggingface-cli login`) to the registry, which asks Hugging Face whether that token may download the repo and, if so, signs a ticket for the fetch's peer id. The token is only used for that check: it is never stored, logged, or sent to peers. Peers only ever see the ticket, and a ticket is useless to any other peer id.
+- Without a token, or with one that hasn't accepted the license, the fetch stops and says which license to accept.
+
+This keeps the network itself from spreading gated models. It can't stop someone who already downloaded a model from re-packing it and sharing it without the gate; that is what the blocklist is for.
+
 ## What to expect
 
 On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports zstd alone at 78% of the original size and the full pipeline at 73%. Real models usually compress somewhat better than synthetic ones. Published results (ZipNN, DFloat11) put BF16 near 67–70% of original size. Models already quantized to 4 bits barely compress. Dedup savings depend on how much two models actually share: re-uploads and format copies dedup almost completely, and full fine-tunes dedup very little.

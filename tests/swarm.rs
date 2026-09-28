@@ -89,9 +89,15 @@ async fn fetch_through_the_dht() {
     let (fetcher, _) = node(&local, join).await;
     wait_for_providers(&fetcher, &m.root).await;
 
-    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[author.verifying_key()])
-        .await
-        .unwrap();
+    let (got, stats) = p2p::fetch(
+        &fetcher,
+        &m.root,
+        local.clone(),
+        &[author.verifying_key()],
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(stats.already_local, 0);
     assert_eq!(stats.bytes_by_source.len(), 1);
     assert_eq!(local.signatures(&m.root).unwrap().len(), 1);
@@ -106,7 +112,7 @@ async fn fetch_through_the_dht() {
 
     // Nobody provides a model that doesn't exist.
     let missing = "0".repeat(64);
-    let Err(err) = p2p::fetch(&fetcher, &missing, local, &[]).await else {
+    let Err(err) = p2p::fetch(&fetcher, &missing, local, &[], None).await else {
         panic!("fetched a model nobody has");
     };
     assert!(err.to_string().contains("nobody"), "{err}");
@@ -160,7 +166,7 @@ async fn fetch_from_a_node_reachable_only_through_a_relay() {
     )
     .await;
     wait_for_providers(&fetcher, &m.root).await;
-    let (got, _) = p2p::fetch(&fetcher, &m.root, local.clone(), &[])
+    let (got, _) = p2p::fetch(&fetcher, &m.root, local.clone(), &[], None)
         .await
         .unwrap();
     chungus::unpack(&got, &local, &tmp.path().join("out")).unwrap();
@@ -278,7 +284,7 @@ async fn a_node_with_part_of_a_model_serves_its_blocks() {
     assert_eq!(fetcher.providers(&m.root).await.unwrap(), [seed.peer_id]);
     assert_eq!(fetcher.holders(&m.root).await.unwrap().len(), 2);
 
-    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[])
+    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[], None)
         .await
         .unwrap();
     assert_eq!(stats.rejected, 0);
@@ -358,7 +364,7 @@ async fn anchors_serve_under_tight_limits() {
         },
     )
     .await;
-    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[])
+    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[], None)
         .await
         .unwrap();
     assert_eq!(stats.bytes_by_source.len(), 1);
@@ -393,7 +399,7 @@ async fn anchors_serve_under_tight_limits() {
         },
     )
     .await;
-    assert!(p2p::fetch(&asker, &m.root, other, &[]).await.is_err());
+    assert!(p2p::fetch(&asker, &m.root, other, &[], None).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -426,7 +432,9 @@ async fn a_model_reads_lazily_from_the_swarm() {
     .await;
     wait_for_providers(&fetcher, &m.root).await;
 
-    let (manifest, sources) = p2p::prepare(&fetcher, &m.root, &local, &[]).await.unwrap();
+    let (manifest, sources) = p2p::prepare(&fetcher, &m.root, &local, &[], None)
+        .await
+        .unwrap();
     let file = manifest
         .files
         .iter()
@@ -443,4 +451,116 @@ async fn a_model_reads_lazily_from_the_swarm() {
             .load(std::sync::atomic::Ordering::Relaxed),
         lazy.total_bytes()
     );
+}
+
+/// A fake huggingface.co whose `auth-check` accepts only the token "good".
+async fn fake_hf() -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    let app = axum::Router::new().fallback(|headers: HeaderMap| async move {
+        let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+        if auth == Some("Bearer good") {
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    url
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gated_models_need_a_ticket() {
+    use chungus::registry::{self, Claim, Registry, Statement};
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let seed_store = store(&tmp.path().join("seed"));
+    let (m, _) = chungus::pack(&model, &seed_store).unwrap();
+    seed_store.put_manifest(&m).unwrap();
+
+    // A registry that checks access against the fake Hub, with the model published gated.
+    let reg = Arc::new(
+        Registry::open(&tmp.path().join("reg"))
+            .unwrap()
+            .with_hf(&fake_hf().await),
+    );
+    let alice = sign::generate_key(&tmp.path().join("alice")).unwrap();
+    reg.submit(Statement::new(
+        &alice,
+        Claim::Publish {
+            name: "acme/llama".into(),
+            rev: "main".into(),
+            root: m.root.clone(),
+            description: String::new(),
+            gated: Some("meta-llama/Llama-3.2-1B".into()),
+        },
+    ))
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reg_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, registry::router(reg)).await });
+
+    // The seed follows the registry, so it knows the model is gated.
+    registry::Follower::new(&reg_url, None)
+        .unwrap()
+        .sync(&seed_store)
+        .await
+        .unwrap();
+    let (seed, seed_addrs) = node(
+        &seed_store,
+        Config {
+            listen: tcp(),
+            public: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    seed.announce().unwrap();
+    let join = Config {
+        listen: tcp(),
+        public: true,
+        bootstrap: seed_addrs,
+        ..Default::default()
+    };
+    let access = |token: &str| p2p::Access {
+        registry: reg_url.clone(),
+        hf_token: token.into(),
+    };
+
+    // No token: refused, and told why.
+    let local = store(&tmp.path().join("none"));
+    let (fetcher, _) = node(&local, join.clone()).await;
+    wait_for_providers(&fetcher, &m.root).await;
+    let err = p2p::fetch(&fetcher, &m.root, local, &[], None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains("gated by https://huggingface.co/meta-llama/Llama-3.2-1B"),
+        "{err}"
+    );
+
+    // A token the Hub rejects: refused.
+    let local = store(&tmp.path().join("bad"));
+    let (fetcher, _) = node(&local, join.clone()).await;
+    wait_for_providers(&fetcher, &m.root).await;
+    let err = p2p::fetch(&fetcher, &m.root, local, &[], Some(access("bad")))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("doesn't have access"), "{err}");
+
+    // An accepted token: the registry issues a ticket, the seed accepts it, and the model
+    // downloads intact.
+    let local = store(&tmp.path().join("good"));
+    let (fetcher, _) = node(&local, join).await;
+    wait_for_providers(&fetcher, &m.root).await;
+    let (got, _) = p2p::fetch(&fetcher, &m.root, local.clone(), &[], Some(access("good")))
+        .await
+        .unwrap();
+    chungus::unpack(&got, &local, &tmp.path().join("out")).unwrap();
 }

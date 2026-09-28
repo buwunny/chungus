@@ -81,8 +81,13 @@ function renderModel(name) {
     el("h1", { text: m.name }),
     latest.description ? el("p", { text: latest.description }) : null,
     el("p", { class: "meta", text: `Published by ${latest.publisher}` }),
+    latest.gated
+      ? el("p", {
+          text: `Gated: accept the license at huggingface.co/${latest.gated}, then set HF_TOKEN to your Hugging Face token. Only your token's access is checked; it goes to this registry and Hugging Face, never to peers.`,
+        })
+      : null,
     el("h2", { text: "Download" }),
-    command(`${setup}\nchungus fetch ${ref} --swarm -o ${m.name.split("/")[1]}/`),
+    command(`${setup}${latest.gated ? "\nexport HF_TOKEN=hf_..." : ""}\nchungus fetch ${ref} --swarm -o ${m.name.split("/")[1]}/`),
     el("p", { class: "muted", text: "Or mount it and start loading before the download finishes:" }),
     command(`chungus mount ${ref} ${m.name.split("/")[1]}/ --swarm`),
     el("p", {
