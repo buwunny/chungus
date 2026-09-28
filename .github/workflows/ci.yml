@@ -42,10 +42,12 @@ jobs:
         with:
           workspaces: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The prebuilt cargo-fuzz is a musl binary and would default to that target, which
+      # can't use the address sanitizer, so name the runner's own target.
       - name: Fuzz each target for a minute
         run: |
           for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=60 -rss_limit_mb=2048
           done
 
   # Release binaries include macOS, so make sure it still builds there.
