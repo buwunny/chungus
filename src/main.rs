@@ -574,6 +574,7 @@ async fn main() -> Result<()> {
                 external,
                 public,
                 relay_server,
+                ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key, config).await?;
             println!("peer id {}", node.peer_id);

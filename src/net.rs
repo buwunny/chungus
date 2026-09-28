@@ -286,6 +286,42 @@ where
     F: Fn(S, String) -> Fut,
     Fut: std::future::Future<Output = Option<Bytes>>,
 {
+    let sources = |hash: &str| -> Vec<S> {
+        // Spread load: each chunk starts at a different peer, chosen by its hash.
+        let mut order = rotated(peers, hash);
+        order.extend(fallback.iter().cloned());
+        order
+    };
+    fetch_chunks_from(store, chunks, sources, get).await
+}
+
+/// `items`, starting at a position picked by `hash`, so requests spread evenly.
+pub(crate) fn rotated<S: Clone>(items: &[S], hash: &str) -> Vec<S> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let start = usize::from_str_radix(&hash[..4], 16).unwrap_or(0) % items.len();
+    items[start..]
+        .iter()
+        .chain(&items[..start])
+        .cloned()
+        .collect()
+}
+
+/// Download every chunk in `chunks` that `store` lacks, trying `sources(hash)` in order
+/// with `get(source, hash)`. Each chunk is verified before it is stored.
+pub(crate) async fn fetch_chunks_from<'a, S, Src, F, Fut>(
+    store: &Arc<Store>,
+    chunks: impl IntoIterator<Item = &'a ChunkRef>,
+    sources: Src,
+    get: F,
+) -> Result<FetchStats>
+where
+    S: Clone + std::fmt::Display,
+    Src: Fn(&str) -> Vec<S>,
+    F: Fn(S, String) -> Fut,
+    Fut: std::future::Future<Output = Option<Bytes>>,
+{
     // Unique chunks, in order.
     let mut wanted: Vec<(String, usize)> = Vec::new();
     let mut seen = HashSet::new();
@@ -307,23 +343,13 @@ where
         .collect();
     stats.already_local = stats.chunks - missing.len();
 
-    let get = &get;
+    let (get, sources) = (&get, &sources);
     let results = stream::iter(missing)
         .map(|(hash, len)| {
             let store = store.clone();
             async move {
-                // Spread load: each chunk starts at a different peer, chosen by its hash.
-                let start = if peers.is_empty() {
-                    0
-                } else {
-                    usize::from_str_radix(&hash[..4], 16).unwrap() % peers.len()
-                };
-                let order = peers[start..]
-                    .iter()
-                    .chain(&peers[..start])
-                    .chain(fallback.iter());
                 let mut rejected = 0;
-                for source in order {
+                for source in sources(&hash) {
                     let Some(blob) = get(source.clone(), hash.clone()).await else {
                         continue;
                     };
