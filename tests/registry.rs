@@ -86,7 +86,7 @@ async fn nodes_enforce_the_blocklist() {
     let tmp = tempfile::tempdir().unwrap();
     let reg = Arc::new(Registry::open(&tmp.path().join("reg")).unwrap());
     let operator = reg.operator();
-    let op_key = reg.operator_key().clone();
+    let op_key = reg.operator_key().unwrap().clone();
     let url = spawn(reg).await;
     let client = Client::new(&url).unwrap();
 
@@ -147,7 +147,7 @@ async fn nodes_enforce_the_blocklist() {
 async fn only_the_operator_sets_anchors() {
     let tmp = tempfile::tempdir().unwrap();
     let reg = Arc::new(Registry::open(&tmp.path().join("reg")).unwrap());
-    let op_key = reg.operator_key().clone();
+    let op_key = reg.operator_key().unwrap().clone();
     let operator = reg.operator();
     let url = spawn(reg).await;
     let client = Client::new(&url).unwrap();
@@ -190,4 +190,55 @@ async fn only_the_operator_sets_anchors() {
     client.submit(&set(&op_key, vec![])).await.unwrap();
     assert!(client.anchors(None).await.unwrap().is_empty());
     client.audit(Some(&operator)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn followers_accept_a_delegated_online_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("reg");
+    let operator = Registry::open(&data).unwrap().operator();
+    let root_path = tmp.path().join("root.key");
+    std::fs::rename(data.join("operator.key"), &root_path).unwrap();
+    let root = sign::load_key(&root_path).unwrap();
+    let reg = Arc::new(Registry::open(&data).unwrap());
+    let online = reg.online_public();
+    let url = spawn(reg).await;
+    let client = Client::new(&url).unwrap();
+    let store = chungus::store::Store::open(&tmp.path().join("store")).unwrap();
+
+    // Before delegating, a follower pinned to the root refuses the online key's head.
+    let mut follower = registry::Follower::new(&url, Some(operator.clone())).unwrap();
+    assert!(follower.sync(&store).await.is_err());
+    assert!(client.audit(Some(&operator)).await.is_err());
+
+    client
+        .submit(&Statement::new(
+            &root,
+            Claim::Delegate {
+                key: online,
+                expires: registry::now() + 3600,
+            },
+        ))
+        .await
+        .unwrap();
+    let mut follower = registry::Follower::new(&url, Some(operator.clone())).unwrap();
+    follower.sync(&store).await.unwrap();
+    client.audit(Some(&operator)).await.unwrap();
+    // Unpinned clients learn the root from the head, and check it against the log.
+    client.audit(None).await.unwrap();
+
+    // Anchors set by the online key are accepted as the operator's.
+    let online_key = sign::load_key(&data.join("online.key")).unwrap();
+    let anchor =
+        "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWRaVx8DKtusbdVeThtaFxqR7C8jgSvz6fArBwh52SCAeR";
+    client
+        .submit(&Statement::new(
+            &online_key,
+            Claim::Anchors {
+                addrs: vec![anchor.into()],
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(client.anchors(Some(&operator)).await.unwrap().len(), 1);
 }
