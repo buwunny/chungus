@@ -96,14 +96,25 @@ pub fn load_key(path: &Path) -> Result<SigningKey> {
 }
 
 pub fn sign(key: &SigningKey, root: &str) -> Signature {
-    Signature {
-        key: public_key_string(&key.verifying_key()),
-        sig: to_hex(&key.sign(&message(root)).to_bytes()),
-    }
+    sign_message(key, &message(root))
 }
 
 /// True if `s` is a valid signature of `root` by the key it names.
 pub fn verify(s: &Signature, root: &str) -> bool {
+    verify_message(s, &message(root))
+}
+
+/// Sign an arbitrary message. Callers put a domain tag first, so a signature made for one
+/// purpose can never be replayed as another.
+pub fn sign_message(key: &SigningKey, msg: &[u8]) -> Signature {
+    Signature {
+        key: public_key_string(&key.verifying_key()),
+        sig: to_hex(&key.sign(msg).to_bytes()),
+    }
+}
+
+/// True if `s` is a valid signature of `msg` by the key it names.
+pub fn verify_message(s: &Signature, msg: &[u8]) -> bool {
     let Ok(key) = parse_public_key(&s.key) else {
         return false;
     };
@@ -111,7 +122,7 @@ pub fn verify(s: &Signature, root: &str) -> bool {
         return false;
     };
     let sig = ed25519_dalek::Signature::from_bytes(&bytes);
-    key.verify_strict(&message(root), &sig).is_ok()
+    key.verify_strict(msg, &sig).is_ok()
 }
 
 /// True if any of `sigs` is a valid signature of `root` by one of `trusted` keys.

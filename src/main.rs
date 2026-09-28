@@ -12,6 +12,7 @@ use chungus::hub;
 use chungus::manifest::Manifest;
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
+use chungus::registry::{self, Claim, Statement};
 use chungus::sign;
 use chungus::store::{self, Store};
 
@@ -59,6 +60,13 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = DEFAULT_STORE)]
         store: PathBuf,
+        /// Follow this registry's blocklist: refuse to hold or serve blocked models and
+        /// chunks, and delete any already stored.
+        #[arg(long)]
+        blocklist: Option<String>,
+        /// The registry operator's public key, to pin when following its blocklist.
+        #[arg(long)]
+        operator: Option<String>,
         #[arg(long, default_value_t = net::DEFAULT_PORT)]
         port: u16,
         /// Don't advertise over mDNS; peers must name this node with --peer.
@@ -69,6 +77,13 @@ enum Cmd {
     Hub {
         #[arg(long, default_value = DEFAULT_STORE)]
         store: PathBuf,
+        /// Follow this registry's blocklist: refuse to hold or serve blocked models and
+        /// chunks, and delete any already stored.
+        #[arg(long)]
+        blocklist: Option<String>,
+        /// The registry operator's public key, to pin when following its blocklist.
+        #[arg(long)]
+        operator: Option<String>,
         #[arg(long, default_value_t = hub::DEFAULT_PORT)]
         port: u16,
         /// Where to get files no peer has.
@@ -84,9 +99,13 @@ enum Cmd {
         #[arg(long)]
         no_mdns: bool,
     },
-    /// Download a model by manifest root from LAN peers, falling back to an origin.
+    /// Download a model by manifest root or registry name from peers.
     Fetch {
+        /// A manifest root, or a registry name (org/model[@rev]). A name is resolved in the
+        /// registry, and the download then requires its publisher's signature.
         root: String,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
         #[arg(long, default_value = DEFAULT_STORE)]
         store: PathBuf,
         /// Also unpack the files into this directory.
@@ -116,6 +135,13 @@ enum Cmd {
     Node {
         #[arg(long, default_value = DEFAULT_STORE)]
         store: PathBuf,
+        /// Follow this registry's blocklist: refuse to hold or serve blocked models and
+        /// chunks, and delete any already stored.
+        #[arg(long)]
+        blocklist: Option<String>,
+        /// The registry operator's public key, to pin when following its blocklist.
+        #[arg(long)]
+        operator: Option<String>,
         /// Address to listen on. Repeatable. Default: TCP and QUIC on port 4001.
         #[arg(long)]
         listen: Vec<Multiaddr>,
@@ -134,6 +160,77 @@ enum Cmd {
         /// Relay connections for nodes behind NAT. Use with --public.
         #[arg(long)]
         relay_server: bool,
+    },
+    /// Run a registry: model names, a signed append-only log of every change, and search.
+    Registry {
+        /// Where the log and the operator key live.
+        #[arg(long, default_value = ".chungus/registry")]
+        data: PathBuf,
+        #[arg(long, default_value_t = registry::DEFAULT_PORT)]
+        port: u16,
+    },
+    /// Give a model in the store a name (org/model[@rev]) in the registry, signed by you.
+    Publish {
+        root: String,
+        /// The name, e.g. acme/tiny-llama or acme/tiny-llama@v1 (the rev defaults to main).
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long, default_value = DEFAULT_STORE)]
+        store: PathBuf,
+        /// Signing key (default: ~/.chungus/key).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
+    /// Look up which manifest root a name points at, and who published it.
+    Resolve {
+        name: String,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
+    /// Search the registry by name and description.
+    Search {
+        #[arg(required = true)]
+        query: Vec<String>,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
+    /// Let another key publish under an org you own (or, with --revoke, stop it).
+    Grant {
+        org: String,
+        /// The public key (chungus1...) to add or remove.
+        public_key: String,
+        #[arg(long)]
+        revoke: bool,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
+    /// Download the registry's whole log and check every entry and the signed head.
+    Audit {
+        /// The registry operator's public key, to check the head against.
+        #[arg(long)]
+        operator: Option<String>,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
+    /// Add a hash (a model's root, or a chunk) to the registry's blocklist. Operator only.
+    Block {
+        hash: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Remove it from the blocklist instead.
+        #[arg(long)]
+        unblock: bool,
+        /// The registry's operator key (operator.key in its data directory).
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
     },
     /// Create a signing key and print its public key.
     Keygen {
@@ -169,6 +266,19 @@ fn key_path(key: Option<PathBuf>) -> Result<PathBuf> {
                 .join(".chungus/key"),
         ),
     }
+}
+
+fn follow_blocklist(
+    store: &Arc<Store>,
+    url: Option<String>,
+    operator: Option<String>,
+) -> Result<()> {
+    if let Some(url) = url {
+        let follower = registry::Follower::new(&url, operator)?;
+        registry::follow(store.clone(), follower, Duration::from_secs(60));
+        println!("following the blocklist of {url}");
+    }
+    Ok(())
 }
 
 fn report_fetch(s: &FetchStats) {
@@ -286,10 +396,13 @@ async fn main() -> Result<()> {
         }
         Cmd::Serve {
             store,
+            blocklist,
+            operator,
             port,
             no_mdns,
         } => {
             let store = Arc::new(Store::open(&store)?);
+            follow_blocklist(&store, blocklist, operator)?;
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -312,6 +425,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Hub {
             store,
+            blocklist,
+            operator,
             port,
             upstream,
             offline,
@@ -319,6 +434,7 @@ async fn main() -> Result<()> {
             no_mdns,
         } => {
             let store = Arc::new(Store::open(&store)?);
+            follow_blocklist(&store, blocklist, operator)?;
             let upstream = (!offline).then_some(upstream);
             let hub = Arc::new(hub::Hub::new(store, upstream.clone(), peer.clone())?);
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
@@ -361,6 +477,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Fetch {
             root,
+            registry,
             store,
             output,
             peer,
@@ -370,8 +487,32 @@ async fn main() -> Result<()> {
             trust,
             bootstrap,
         } => {
-            let trust = parse_keys(&trust)?;
+            let mut trust = parse_keys(&trust)?;
+            let mut via_registry = false;
+            let root = if store::is_hash(&root) {
+                root
+            } else {
+                let (name, rev) = registry::parse_ref(&root)?;
+                let entry = registry::Client::new(&registry)?
+                    .resolve(&name, &rev)
+                    .await?;
+                let Claim::Publish { root, .. } = entry.statement.claim else {
+                    unreachable!("resolve returns publishes")
+                };
+                println!(
+                    "{name}@{rev} is {root}, published by {}",
+                    entry.statement.signature.key
+                );
+                trust.push(sign::parse_public_key(&entry.statement.signature.key)?);
+                via_registry = true;
+                root
+            };
             let store = Arc::new(Store::open(&store)?);
+            if via_registry {
+                registry::Follower::new(&registry, None)?
+                    .sync(&store)
+                    .await?;
+            }
             let (manifest, s) = if bootstrap.is_empty() {
                 let mut peers = peer;
                 if !no_mdns {
@@ -406,6 +547,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Node {
             store,
+            blocklist,
+            operator,
             listen,
             bootstrap,
             relay,
@@ -414,6 +557,7 @@ async fn main() -> Result<()> {
             relay_server,
         } => {
             let store = Arc::new(Store::open(&store)?);
+            follow_blocklist(&store, blocklist, operator)?;
             let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
             let listen = if listen.is_empty() {
                 vec![
@@ -444,6 +588,140 @@ async fn main() -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
+        }
+        Cmd::Registry { data, port } => {
+            let reg = Arc::new(registry::Registry::open(&data)?);
+            let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind {addr}"))?;
+            println!("registry on http://localhost:{port}");
+            println!("operator key {}", reg.operator());
+            println!("{} entries in the log", reg.head().size);
+            axum::serve(listener, registry::router(reg)).await?;
+        }
+        Cmd::Publish {
+            root,
+            name,
+            description,
+            store,
+            key,
+            registry,
+        } => {
+            let (name, rev) = registry::parse_ref(&name)?;
+            let store = Store::open(&store)?;
+            store
+                .get_manifest(&root)
+                .context("publish a model that is in your store (see `chungus list`)")?;
+            let k = sign::load_key(&key_path(key)?)?;
+            // Sign the manifest too, so peers can prove it came from the name's owner.
+            store.add_signatures(&root, &[sign::sign(&k, &root)])?;
+            let st = Statement::new(
+                &k,
+                Claim::Publish {
+                    name: name.clone(),
+                    rev: rev.clone(),
+                    root: root.clone(),
+                    description,
+                },
+            );
+            let entry = registry::Client::new(&registry)?.submit(&st).await?;
+            println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
+        }
+        Cmd::Resolve { name, registry } => {
+            let (name, rev) = registry::parse_ref(&name)?;
+            let entry = registry::Client::new(&registry)?
+                .resolve(&name, &rev)
+                .await?;
+            if let Claim::Publish {
+                root, description, ..
+            } = &entry.statement.claim
+            {
+                println!("root {root}");
+                println!("publisher {}", entry.statement.signature.key);
+                println!("log entry {}", entry.seq);
+                if !description.is_empty() {
+                    println!("{description}");
+                }
+            }
+        }
+        Cmd::Search { query, registry } => {
+            let hits = registry::Client::new(&registry)?
+                .search(&query.join(" "))
+                .await?;
+            if hits.is_empty() {
+                println!("no matches");
+            }
+            for h in hits {
+                println!("{}@{}  {}", h.name, h.rev, h.root);
+                if !h.description.is_empty() {
+                    println!("    {}", h.description);
+                }
+            }
+        }
+        Cmd::Grant {
+            org,
+            public_key,
+            revoke,
+            key,
+            registry,
+        } => {
+            sign::parse_public_key(&public_key)?;
+            let k = sign::load_key(&key_path(key)?)?;
+            let claim = if revoke {
+                Claim::Revoke {
+                    org: org.clone(),
+                    key: public_key.clone(),
+                }
+            } else {
+                Claim::Grant {
+                    org: org.clone(),
+                    key: public_key.clone(),
+                }
+            };
+            let entry = registry::Client::new(&registry)?
+                .submit(&Statement::new(&k, claim))
+                .await?;
+            let verb = if revoke { "revoked" } else { "granted" };
+            println!("{verb} {public_key} on {org} (log entry {})", entry.seq);
+        }
+        Cmd::Audit { operator, registry } => {
+            let (log, head) = registry::Client::new(&registry)?
+                .audit(operator.as_deref())
+                .await?;
+            println!(
+                "{} entries verified; head signed by {}",
+                log.entries.len(),
+                head.signature.key
+            );
+            if operator.is_none() {
+                println!(
+                    "pass --operator {} to pin this registry",
+                    head.signature.key
+                );
+            }
+        }
+        Cmd::Block {
+            hash,
+            reason,
+            unblock,
+            key,
+            registry,
+        } => {
+            let k = sign::load_key(&key)?;
+            let claim = if unblock {
+                Claim::Unblock { hash: hash.clone() }
+            } else {
+                Claim::Block {
+                    hash: hash.clone(),
+                    reason,
+                }
+            };
+            let entry = registry::Client::new(&registry)?
+                .submit(&Statement::new(&k, claim))
+                .await?;
+            let verb = if unblock { "unblocked" } else { "blocked" };
+            println!("{verb} {hash} (log entry {})", entry.seq);
         }
         Cmd::Keygen { key } => {
             let path = key_path(key)?;

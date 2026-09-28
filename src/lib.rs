@@ -10,6 +10,7 @@ pub mod hub;
 pub mod manifest;
 pub mod net;
 pub mod p2p;
+pub mod registry;
 pub mod safetensors;
 pub mod segment;
 pub mod sign;
