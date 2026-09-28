@@ -473,7 +473,9 @@ impl FromArgs {
                 );
             }
         }
-        let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
+        // A fresh identity: a one-off download needs none of its own, and reusing the
+        // store's would clash with a node serving the same store (and skip it as "self").
+        let key = libp2p::identity::Keypair::generate_ed25519();
         let config = p2p::Config {
             listen: vec![
                 "/ip4/0.0.0.0/tcp/0".parse()?,
