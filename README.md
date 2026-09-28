@@ -98,21 +98,28 @@ Signatures travel with the manifest: `fetch` collects them from every peer and k
 Nodes form a swarm with [libp2p](https://libp2p.io). Each node announces the models in its store on a Kademlia DHT; a fetcher asks the DHT who has a model and downloads chunks from all of them at once, verifying every chunk as it does on a LAN. Connections are encrypted (Noise over TCP, or QUIC).
 
 ```sh
+# Share your store with the swarm, even from behind NAT
+chungus node
+
+# Anywhere: fetch a model from whoever has it
+chungus fetch <root> --swarm -o model/
+```
+
+With no flags, both join through the project's public node (`/ip4/40.160.91.185/tcp/4001/p2p/12D3KooWRaVx8DKtusbdVeThtaFxqR7C8jgSvz6fArBwh52SCAeR`, also on QUIC), and `node` also uses it as its relay, so a node behind NAT is reachable without any setup. `--bootstrap` and `--relay` (or `CHUNGUS_BOOTSTRAP` and `CHUNGUS_RELAY`) replace the defaults, and `--no-default-bootstrap` leaves the public node out entirely, for a private swarm. A node started with `--public`, `--relay-server`, `--external` or `--download-only` asks for no relay. To run a swarm of your own:
+
+```sh
 # A public server (a VPS, say) that others join through, and relays for nodes behind NAT
-chungus node --store relay --public --relay-server
+chungus node --store relay --public --relay-server --no-default-bootstrap
 #   prints: address /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW...
 
 # At home, behind NAT: share your store, reachable through the relay
 chungus node --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... \
              --relay     /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW...
-
-# Anywhere: fetch a model from whoever has it
-chungus fetch <root> --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... -o model/
 ```
 
 Models are announced at two levels. A node with the whole model announces its root; every node also announces each 64 MB block of a model it holds in full. A fetcher asks the DHT for both, so peers that are still downloading a model already serve the parts they have, and the swarm grows during a flash crowd instead of waiting for complete copies. Announcing blocks rather than individual chunks keeps the DHT small: a 140 GB model is about 2,200 blocks but 2 million chunks.
 
-A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute. There are no public bootstrap nodes yet, so someone has to run the first one.
+A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute.
 
 `node` logs what it connects to, so you can tell it joined: `connected to bootstrap <peer>`, `joined the DHT`, and with `--relay`, `relay reservation accepted by <peer>` followed by a `/p2p-circuit` address that others can reach you at. `could not reach bootstrap <peer>: <error>` means the bootstrap node's port is closed or the address is wrong. The public node logs a line for each peer that connects to it.
 
@@ -124,7 +131,7 @@ Two DHT attacks matter most here. In a **Sybil** attack someone runs thousands o
 
 - **Disjoint lookup paths.** Each DHT lookup follows several independent paths (S/Kademlia), so one poisoned path doesn't hide a model.
 - **Subnet caps.** At most `--max-peers-per-subnet` (default 2) routing-table entries come from one IPv4 /24 or IPv6 /48, so a single host or small cloud block can't fill a routing table cheaply.
-- **Anchor nodes.** The registry operator signs a list of anchor nodes (`chungus anchors <addr>... --key operator.key`). Nodes started with `--anchors-from <registry>` keep them in their routing table, exempt from the limits above, and ask them directly for every model alongside the DHT. `chungus fetch --swarm` joins through them, so fetching needs nothing but the registry.
+- **Anchor nodes.** The registry operator signs a list of anchor nodes (`chungus anchors <addr>... --key operator.key`). Nodes started with `--anchors-from <registry>` keep them in their routing table, exempt from the limits above, and ask them directly for every model alongside the DHT. `chungus fetch --swarm` asks them too, alongside the public node.
 
 ```sh
 # The operator publishes the anchor list
@@ -146,7 +153,7 @@ docker compose up -d --build
 docker compose logs node       # the addresses to share, ending in /p2p/<peer id>
 ```
 
-Open TCP and UDP port 4001 in the provider's firewall. The node runs as a non-root user in a read-only container with no shell, restarts on failure, and keeps its store and identity key in the `chungus-data` volume, so its peer id survives upgrades (`git pull && docker compose up -d --build`). Every `chungus node` flag can be set in `node.env` as a `CHUNGUS_*` variable: set `CHUNGUS_BLOCKLIST` and `CHUNGUS_OPERATOR` to follow a registry's blocklist, and `CHUNGUS_BOOTSTRAP` to join an existing swarm.
+Open TCP and UDP port 4001 in the provider's firewall. The node runs as a non-root user in a read-only container with no shell, restarts on failure, and keeps its store and identity key in the `chungus-data` volume, so its peer id survives upgrades (`git pull && docker compose up -d --build`). Every `chungus node` flag can be set in `node.env` as a `CHUNGUS_*` variable: set `CHUNGUS_BLOCKLIST` and `CHUNGUS_OPERATOR` to follow a registry's blocklist, and `CHUNGUS_BOOTSTRAP` to join a swarm other than the project's. A node never bootstraps through itself, so the project's own public node runs with the same defaults.
 
 The relay only carries connections between two chungus peers that both asked for it, and only until they hole-punch a direct one. The node seeds nothing until you pin a model into its store:
 

@@ -142,11 +142,18 @@ enum Cmd {
         #[arg(long, env = "CHUNGUS_LISTEN", value_delimiter = ',')]
         listen: Vec<Multiaddr>,
         /// A node to join through (a multiaddr ending in /p2p/<peer id>). Repeatable.
+        /// Default: the project's public node.
         #[arg(long, env = "CHUNGUS_BOOTSTRAP", value_delimiter = ',')]
         bootstrap: Vec<Multiaddr>,
         /// A relay to be reachable through when behind NAT (ending in /p2p/<peer id>).
+        /// Default: the project's public node, unless this node is --public, a
+        /// --relay-server, has an --external address or is --download-only.
         #[arg(long, env = "CHUNGUS_RELAY", value_delimiter = ',')]
         relay: Vec<Multiaddr>,
+        /// Don't join through or relay via the project's public node; use only
+        /// --bootstrap, --relay and anchors (for a private swarm).
+        #[arg(long, env = "CHUNGUS_NO_DEFAULT_BOOTSTRAP")]
+        no_default_bootstrap: bool,
         /// An address others can reach this node at, e.g. a public IP with a forwarded port.
         #[arg(long, env = "CHUNGUS_EXTERNAL", value_delimiter = ',')]
         external: Vec<Multiaddr>,
@@ -378,12 +385,15 @@ struct FromArgs {
     trust: Vec<String>,
     /// Fetch over the internet swarm instead of the LAN, joining through this node
     /// (a multiaddr ending in /p2p/<peer id>). Repeatable.
-    #[arg(long)]
+    #[arg(long, env = "CHUNGUS_BOOTSTRAP", value_delimiter = ',')]
     bootstrap: Vec<Multiaddr>,
-    /// Fetch over the internet swarm, joining through the registry's signed anchor
-    /// nodes (and any --bootstrap).
+    /// Fetch over the internet swarm, joining through the project's public node (or
+    /// --bootstrap) and the registry's signed anchor nodes.
     #[arg(long)]
     swarm: bool,
+    /// With --swarm, don't join through the project's public node.
+    #[arg(long, env = "CHUNGUS_NO_DEFAULT_BOOTSTRAP")]
+    no_default_bootstrap: bool,
 }
 
 impl FromArgs {
@@ -439,27 +449,37 @@ impl FromArgs {
     }
 
     /// A download-only swarm node joined through `--bootstrap` and, with `--swarm`, the
-    /// registry's anchors.
+    /// project's public node and the registry's anchors.
     async fn swarm_node(&self, store: &Arc<Store>) -> Result<p2p::Node> {
-        let anchors = if self.swarm {
-            let anchors = registry::Client::new(&self.registry)?.anchors(None).await?;
-            if anchors.is_empty() && self.bootstrap.is_empty() {
+        let mut bootstrap = self.bootstrap.clone();
+        let mut anchors = Vec::new();
+        if self.swarm {
+            if bootstrap.is_empty() && !self.no_default_bootstrap {
+                bootstrap = p2p::default_bootstrap();
+            }
+            // The public node is enough to join, so a registry that can't be reached
+            // only costs the anchors.
+            match registry::Client::new(&self.registry)?.anchors(None).await {
+                Ok(found) => anchors = found,
+                Err(e) if !bootstrap.is_empty() => {
+                    eprintln!("no anchor nodes from {}: {e:#}", self.registry)
+                }
+                Err(e) => return Err(e),
+            }
+            if anchors.is_empty() && bootstrap.is_empty() {
                 bail!(
                     "{} lists no anchor nodes; join with --bootstrap",
                     self.registry
                 );
             }
-            anchors
-        } else {
-            Vec::new()
-        };
+        }
         let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
         let config = p2p::Config {
             listen: vec![
                 "/ip4/0.0.0.0/tcp/0".parse()?,
                 "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
             ],
-            bootstrap: self.bootstrap.clone(),
+            bootstrap,
             anchors,
             // A one-off download leaves before it could usefully serve anyone.
             limits: Limits {
@@ -761,6 +781,7 @@ async fn main() -> Result<()> {
             listen,
             bootstrap,
             relay,
+            no_default_bootstrap,
             external,
             public,
             relay_server,
@@ -794,6 +815,19 @@ async fn main() -> Result<()> {
                 ]
             } else {
                 listen
+            };
+            let defaults = !no_default_bootstrap;
+            let bootstrap = if bootstrap.is_empty() && defaults {
+                p2p::default_bootstrap()
+            } else {
+                bootstrap
+            };
+            // A node that others can reach directly, or that never serves, needs no relay.
+            let reachable = public || relay_server || !external.is_empty() || download_only;
+            let relay = if relay.is_empty() && defaults && !reachable {
+                p2p::default_relays()
+            } else {
+                relay
             };
             let config = p2p::Config {
                 listen,
