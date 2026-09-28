@@ -4,6 +4,51 @@ A peer-to-peer network for distributing AI models, their runtimes and Docker AI 
 
 This repository currently holds **milestones 1 to 4**: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, signed models, sharing over the internet, and a registry for names, search and blocklists.
 
+> **Alpha.** chungus is at v0.1.0: formats are versioned and old data keeps working (see [docs/formats.md](docs/formats.md)), but expect rough edges and don't rely on it for anything production-critical yet.
+
+## Quickstart
+
+**1. Install** (Linux x86_64/aarch64 with glibc 2.39+, or macOS; see [Install](#install) for other options):
+
+```sh
+v=v0.1.0
+case "$(uname -sm)" in
+  "Linux x86_64")  t=x86_64-unknown-linux-gnu ;;
+  "Linux aarch64") t=aarch64-unknown-linux-gnu ;;
+  "Darwin arm64")  t=aarch64-apple-darwin ;;
+  "Darwin x86_64") t=x86_64-apple-darwin ;;
+esac
+curl -L https://github.com/buwunny/chungus/releases/download/$v/chungus-$v-$t.tar.gz | tar xz
+sudo mv chungus-$v-$t/chungus /usr/local/bin/ && chungus --version
+```
+
+**2. Find a model and download it** from the swarm. Every chunk is checked against its hash, and the publisher's signature is required:
+
+```sh
+export CHUNGUS_REGISTRY=https://<the registry's address>
+chungus search llama
+chungus fetch acme/tiny-llama --swarm -o tiny-llama/
+```
+
+On Linux, `chungus mount acme/tiny-llama tiny-llama/ --swarm` instead makes the files appear at once and downloads them as they're read (needs `fuse3`). Gated models also need `HF_TOKEN` (see [Gated models](#gated-and-licensed-models)).
+
+**3. Share it back.** A node seeds everything in its store, reachable even from behind NAT:
+
+```sh
+chungus node
+```
+
+**4. Publish your own** (safetensors or GGUF weights):
+
+```sh
+chungus keygen                                   # once: your signing key in ~/.chungus/key
+chungus pack path/to/model                       # prints: root <hash>
+chungus publish <hash> --name you/my-model --description "What it is"
+chungus node                                     # so others can download it
+```
+
+Already use Hugging Face tools? `chungus hub` plus `export HF_ENDPOINT=http://localhost:8080` puts a shared cache under them without changing any code ([details](#drop-in-hugging-face-cache)).
+
 ## The pipeline
 
 ```
