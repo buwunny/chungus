@@ -16,6 +16,7 @@ pub mod net;
 pub mod p2p;
 pub mod registry;
 pub mod safetensors;
+pub mod safety;
 pub mod segment;
 pub mod sign;
 pub mod store;
@@ -89,6 +90,8 @@ pub struct PackStats {
     pub new_chunks: u64,
     pub new_raw_bytes: u64,
     pub new_stored_bytes: u64,
+    /// Files left out because they can run code when loaded, with the reason.
+    pub skipped: Vec<String>,
 }
 
 /// Pack a file or directory into `store` and return its manifest.
@@ -96,6 +99,10 @@ pub fn pack(input: &Path, store: &Store) -> Result<(Manifest, PackStats)> {
     let mut stats = PackStats::default();
     let mut files = Vec::new();
     for (path, rel) in list_files(input)? {
+        if let Some(why) = safety::refusal(&rel) {
+            stats.skipped.push(why);
+            continue;
+        }
         let data = read(&path)?;
         let spans = chunk::chunk(&data, &file_segments(&path, &data)?);
         let new_chunks = AtomicU64::new(0);
@@ -133,6 +140,12 @@ pub fn pack(input: &Path, store: &Store) -> Result<(Manifest, PackStats)> {
             chunks,
         });
     }
+    if files.is_empty() && !stats.skipped.is_empty() {
+        bail!(
+            "nothing left to pack:\n  {}\nconvert the weights to safetensors first",
+            stats.skipped.join("\n  ")
+        );
+    }
     Ok((Manifest::new(files), stats))
 }
 
@@ -141,6 +154,7 @@ pub fn unpack(manifest: &Manifest, store: &Store, out: &Path) -> Result<()> {
     if !manifest.verify_root() {
         bail!("manifest root does not match its contents");
     }
+    safety::check_manifest(manifest)?;
     for f in &manifest.files {
         if f.path.split('/').any(|c| c == ".." || c.is_empty()) || f.path.starts_with('/') {
             bail!("unsafe path in manifest: {}", f.path);

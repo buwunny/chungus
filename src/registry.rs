@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sign::{self, Signature};
@@ -616,11 +616,16 @@ impl Hit {
 
 // ---------- server ----------
 
-/// A registry backed by a directory: `log.jsonl` (one entry per line) and `operator.key`.
+/// A registry backed by a directory: `log.jsonl` (one entry per line), `operator.key`,
+/// and `manifests/<root>.json` for every model published through it.
 pub struct Registry {
     log: Mutex<Log>,
     key: SigningKey,
     file: Mutex<fs::File>,
+    manifests: PathBuf,
+    /// Roots whose manifest the registry holds and has checked (see [`crate::safety`]).
+    /// Only these are listed in search and the index.
+    checked: RwLock<HashSet<String>>,
     /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
     hf: String,
     http: reqwest::Client,
@@ -636,6 +641,9 @@ pub struct AccessRequest {
     pub peer: String,
     pub token: String,
 }
+
+/// Largest manifest the registry accepts: about a 1 TB model.
+pub const MAX_MANIFEST: usize = 256 << 20;
 
 impl Registry {
     pub fn open(dir: &FsPath) -> Result<Registry> {
@@ -666,10 +674,23 @@ impl Registry {
             .append(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
+        let manifests = dir.join("manifests");
+        fs::create_dir_all(&manifests)?;
+        let mut checked = HashSet::new();
+        for e in fs::read_dir(&manifests)? {
+            let name = e?.file_name().to_string_lossy().into_owned();
+            if let Some(root) = name.strip_suffix(".json")
+                && store::is_hash(root)
+            {
+                checked.insert(root.to_string());
+            }
+        }
         Ok(Registry {
             log: Mutex::new(log),
             key,
             file: Mutex::new(file),
+            manifests,
+            checked: RwLock::new(checked),
             hf: DEFAULT_HF.into(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -763,6 +784,50 @@ impl Registry {
         Ok(entry)
     }
 
+    /// Publish a model: the statement must name `manifest`'s root, the manifest must
+    /// verify, and it must list only files chungus carries (no pickles). The registry keeps
+    /// the manifest, so anyone can see what a name contains before fetching it.
+    pub fn publish(&self, st: Statement, manifest: &[u8]) -> Result<Entry> {
+        let Claim::Publish { root, .. } = &st.claim else {
+            bail!("not a publish statement");
+        };
+        let m = crate::manifest::parse(manifest)?;
+        if &m.root != root || !m.verify_root() {
+            bail!("the manifest doesn't match the published root {root}");
+        }
+        crate::safety::check_manifest(&m)?;
+        // Check the statement before writing anything, so strangers can't fill the disk.
+        self.log.lock().unwrap().check(&st)?;
+        let path = self.manifests.join(format!("{root}.json"));
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, manifest)?;
+        fs::rename(&tmp, &path)?;
+        let entry = self.submit(st)?;
+        self.checked.write().unwrap().insert(m.root);
+        Ok(entry)
+    }
+
+    /// The manifest published under `root`, if this registry holds it.
+    pub fn manifest(&self, root: &str) -> Option<Vec<u8>> {
+        if !store::is_hash(root) {
+            return None;
+        }
+        fs::read(self.manifests.join(format!("{root}.json"))).ok()
+    }
+
+    /// Whether search and the index list `root`: only models whose manifest was checked
+    /// when they were published.
+    pub fn is_listed(&self, root: &str) -> bool {
+        self.checked.read().unwrap().contains(root)
+    }
+
+    fn listed(&self, hits: Vec<Hit>) -> Vec<Hit> {
+        let checked = self.checked.read().unwrap();
+        hits.into_iter()
+            .filter(|h| checked.contains(&h.root))
+            .collect()
+    }
+
     pub fn head(&self) -> Head {
         let log = self.log.lock().unwrap();
         let (size, hash, time) = (log.entries.len() as u64, log.head_hash().to_string(), now());
@@ -783,7 +848,7 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
     (code, e.to_string()).into_response()
 }
 
-/// `POST /v1/statements`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
+/// `POST /v1/statements`, `POST /v1/publish`, `GET /v1/manifests/{root}`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
 /// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
 /// `GET /v1/owners/{org}`, `GET /v1/anchors` and `POST /v1/access`.
 ///
@@ -793,6 +858,13 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 pub fn router(reg: Arc<Registry>) -> Router {
     Router::new()
         .route("/v1/statements", post(submit))
+        .route(
+            "/v1/publish",
+            post(publish).layer(axum::extract::DefaultBodyLimit::max(
+                MAX_MANIFEST + (1 << 16),
+            )),
+        )
+        .route("/v1/manifests/{root}", get(manifest))
         .route("/v1/head", get(head))
         .route("/v1/log", get(log_entries))
         .route("/v1/resolve/{org}/{model}/{rev}", get(resolve))
@@ -817,10 +889,47 @@ async fn submit(
     State(reg): State<Arc<Registry>>,
     axum::Json(st): axum::Json<Statement>,
 ) -> Response {
+    if matches!(st.claim, Claim::Publish { .. }) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "publish through /v1/publish, with the manifest (upgrade chungus)",
+        );
+    }
     match tokio::task::spawn_blocking(move || reg.submit(st)).await {
         Ok(Ok(entry)) => axum::Json(entry).into_response(),
         Ok(Err(e)) => err(StatusCode::FORBIDDEN, format!("{e:#}")),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// A publish statement and the manifest it names.
+#[derive(Serialize, Deserialize)]
+pub struct Publication {
+    pub statement: Statement,
+    /// The manifest's JSON, exactly as packed.
+    pub manifest: String,
+}
+
+async fn publish(
+    State(reg): State<Arc<Registry>>,
+    axum::Json(p): axum::Json<Publication>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || reg.publish(p.statement, p.manifest.as_bytes())).await
+    {
+        Ok(Ok(entry)) => axum::Json(entry).into_response(),
+        Ok(Err(e)) => err(StatusCode::FORBIDDEN, format!("{e:#}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+async fn manifest(State(reg): State<Arc<Registry>>, Path(root): Path<String>) -> Response {
+    match reg.manifest(&root) {
+        Some(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no manifest for {root}")),
     }
 }
 
@@ -879,11 +988,13 @@ struct SearchQuery {
 }
 
 async fn search(State(reg): State<Arc<Registry>>, Query(q): Query<SearchQuery>) -> Response {
-    axum::Json(reg.with_log(|log| log.search(&q.q, 50))).into_response()
+    // Search a little past the limit, since unlisted models are dropped afterwards.
+    let hits = reg.with_log(|log| log.search(&q.q, 200));
+    axum::Json(reg.listed(hits).into_iter().take(50).collect::<Vec<_>>()).into_response()
 }
 
 async fn index(State(reg): State<Arc<Registry>>) -> Response {
-    axum::Json(reg.with_log(|log| log.index())).into_response()
+    axum::Json(reg.listed(reg.with_log(|log| log.index()))).into_response()
 }
 
 async fn owners(State(reg): State<Arc<Registry>>, Path(org): Path<String>) -> Response {
@@ -966,6 +1077,29 @@ impl Client {
         let body = resp.bytes().await?;
         if !status.is_success() {
             bail!("{}", String::from_utf8_lossy(&body));
+        }
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Publish a model with its manifest (see [`Registry::publish`]).
+    pub async fn publish(&self, st: &Statement, manifest: &[u8]) -> Result<Entry> {
+        let body = Publication {
+            statement: st.clone(),
+            manifest: String::from_utf8(manifest.to_vec()).context("manifest isn't UTF-8")?,
+        };
+        let resp = self
+            .http
+            .post(format!("{}/v1/publish", self.base))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body)?)
+            .timeout(std::time::Duration::from_secs(600))
+            .send()
+            .await
+            .with_context(|| format!("reach the registry at {}", self.base))?;
+        let status = resp.status();
+        let body = resp.bytes().await?;
+        if !status.is_success() {
+            bail!("registry refused: {}", String::from_utf8_lossy(&body));
         }
         Ok(serde_json::from_slice(&body)?)
     }

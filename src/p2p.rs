@@ -264,10 +264,10 @@ impl Node {
                 });
                 Behaviour {
                     kad,
-                    identify: identify::Behaviour::new(identify::Config::new(
-                        "/chungus/1.0.0".into(),
-                        key.public(),
-                    )),
+                    identify: identify::Behaviour::new(
+                        identify::Config::new("/chungus/1.0.0".into(), key.public())
+                            .with_agent_version(format!("chungus/{}", env!("CARGO_PKG_VERSION"))),
+                    ),
                     ping: ping::Behaviour::default(),
                     rr: request_response::cbor::Behaviour::with_codec(
                         request_response::cbor::codec::Codec::default()
@@ -378,6 +378,8 @@ impl Node {
             log: cfg.log,
             known,
             observed: HashSet::new(),
+            refused: HashSet::new(),
+            mismatched: HashSet::new(),
             joined: false,
             granted: HashMap::new(),
         };
@@ -468,6 +470,10 @@ struct Runner {
     known: HashMap<PeerId, &'static str>,
     /// Named peers that have told us which address they see us at.
     observed: HashSet<PeerId>,
+    /// Models in the store that list unsafe files, so are never announced.
+    refused: HashSet<String>,
+    /// chungus peers on an incompatible protocol version, reported once each.
+    mismatched: HashSet<PeerId>,
     /// Whether a DHT bootstrap has succeeded yet.
     joined: bool,
     /// Gated repos each peer has shown a valid ticket for, and when each ticket expires.
@@ -516,13 +522,20 @@ impl Runner {
         };
         let mut want = HashSet::new();
         for root in &roots {
-            want.insert(holder_key(root));
+            if self.refused.contains(root) {
+                continue;
+            }
             let held = match self.held.get_mut(root) {
                 Some(h) => h,
                 None => {
                     let Ok(m) = self.store.get_manifest(root) else {
                         continue;
                     };
+                    // Stores packed before chungus refused pickles may still hold some.
+                    if crate::safety::check_manifest(&m).is_err() {
+                        self.refused.insert(root.clone());
+                        continue;
+                    }
                     let blocks = m.blocks(self.block_bytes);
                     self.held.entry(root.clone()).or_insert(Held {
                         blocks: blocks.iter().map(|b| b.id.clone()).collect(),
@@ -542,6 +555,7 @@ impl Runner {
                     }
                 }
             }
+            want.insert(holder_key(root));
             want.extend(held.done.iter().cloned());
             if held.done.len() == held.blocks.len() {
                 want.insert(root.clone());
@@ -824,6 +838,18 @@ impl Runner {
                     ));
                 }
                 let dht = info.protocols.contains(&KAD_PROTOCOL);
+                // A peer that speaks none of our protocols is usually a chungus from after
+                // a wire change; say so once rather than failing requests silently.
+                if info.agent_version.starts_with("chungus/")
+                    && !info.protocols.contains(&PROTOCOL)
+                    && self.mismatched.insert(peer_id)
+                {
+                    self.say(format_args!(
+                        "{peer_id} runs {} and speaks no protocol this node does; one of you \
+                         needs to upgrade",
+                        info.agent_version
+                    ));
+                }
                 for addr in info.listen_addrs {
                     if dht {
                         self.route(peer_id, addr.clone());
@@ -981,12 +1007,9 @@ impl Response {
 /// `granted` holds the gated repos the peer has a valid ticket for.
 fn answer(store: &Store, req: Request, granted: &HashSet<String>) -> Response {
     match req {
-        Request::Manifest(root) => Response::Manifest(
-            store::is_hash(&root)
-                .then(|| store.get_manifest_bytes(&root).ok())
-                .flatten()
-                .map(ByteBuf::from),
-        ),
+        Request::Manifest(root) => {
+            Response::Manifest(store.get_safe_manifest_bytes(&root).ok().map(ByteBuf::from))
+        }
         Request::Signatures(root) => {
             Response::Signatures(store.signatures(&root).unwrap_or_default())
         }
@@ -1075,12 +1098,13 @@ pub async fn prepare(
                 for &p in &peers {
                     let problem = match node.request(p, Request::Manifest(root.to_string())).await {
                         Ok(Response::Manifest(Some(bytes))) => {
-                            match serde_json::from_slice::<Manifest>(&bytes) {
+                            match crate::manifest::parse(&bytes) {
                                 Ok(m) if m.root == root && m.verify_root() => {
                                     found = Some(m);
                                     break;
                                 }
-                                _ => "sent an invalid manifest".to_string(),
+                                Ok(_) => "sent an invalid manifest".to_string(),
+                                Err(e) => format!("{e:#}"),
                             }
                         }
                         Ok(Response::Manifest(None)) => "doesn't have it".to_string(),

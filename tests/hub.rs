@@ -19,6 +19,8 @@ const TOKEN: &str = "Bearer good";
 struct Fake {
     weights: Vec<u8>,
     config: Vec<u8>,
+    /// A pickle, which the hub must pass through without caching.
+    pickle: Vec<u8>,
     /// Downloads of file bodies served.
     downloads: AtomicUsize,
     /// When set, every request fails with 503, as if huggingface.co were down.
@@ -39,6 +41,7 @@ impl Fake {
         Fake {
             weights,
             config: br#"{"hidden_size": 64}"#.to_vec(),
+            pickle: b"\x80\x04\x95pickled weights".to_vec(),
             downloads: AtomicUsize::new(0),
             down: AtomicBool::new(false),
         }
@@ -47,11 +50,16 @@ impl Fake {
     fn file(&self, name: &str) -> Option<(&[u8], String)> {
         match name {
             "model.safetensors" => Some((&self.weights, hex(&sha2::Sha256::digest(&self.weights)))),
-            "config.json" => {
+            "config.json" | "pytorch_model.bin" => {
+                let data = if name == "config.json" {
+                    &self.config
+                } else {
+                    &self.pickle
+                };
                 let mut h = sha1::Sha1::new();
-                h.update(format!("blob {}\0", self.config.len()).as_bytes());
-                h.update(&self.config);
-                Some((&self.config, hex(&h.finalize())))
+                h.update(format!("blob {}\0", data.len()).as_bytes());
+                h.update(data);
+                Some((data.as_slice(), hex(&h.finalize())))
             }
             _ => None,
         }
@@ -364,4 +372,38 @@ async fn gated_files_need_an_accepted_token() {
     assert_eq!(cached.bytes().await.unwrap(), fake.config);
     assert_eq!(get(&url, Some("Bearer evil")).await.status(), 403);
     assert_eq!(get(&url, None).await.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pickles_pass_through_uncached() {
+    let (fake, upstream) = spawn_fake().await;
+    let dir = tempfile::tempdir().unwrap();
+    let hub = spawn_hub(dir.path(), Some(upstream), vec![]).await;
+    let url = format!("{hub}/org/model/resolve/main/pytorch_model.bin");
+    for _ in 0..2 {
+        let r = get(&url, None).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.bytes().await.unwrap().as_ref(), fake.pickle.as_slice());
+    }
+    // Both came from upstream, and nothing was written to the store.
+    assert_eq!(fake.downloads.load(Ordering::SeqCst), 2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let chunks = walk(&dir.path().join("chunks"));
+    assert_eq!(chunks, 0, "a pickle was cached");
+}
+
+fn walk(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| {
+                    if e.path().is_dir() {
+                        walk(&e.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }

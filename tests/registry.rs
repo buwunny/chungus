@@ -25,6 +25,17 @@ fn publish(k: &ed25519_dalek::SigningKey, name: &str, root: &str, desc: &str) ->
     )
 }
 
+/// A manifest listing one empty file called `path`: its root and JSON.
+fn manifest(path: &str) -> (String, Vec<u8>) {
+    let m = chungus::manifest::Manifest::new(vec![chungus::manifest::FileEntry {
+        path: path.into(),
+        size: 0,
+        hash: blake3::hash(b"").to_hex().to_string(),
+        chunks: vec![],
+    }]);
+    (m.root.clone(), serde_json::to_vec(&m).unwrap())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_resolve_search_audit() {
     let tmp = tempfile::tempdir().unwrap();
@@ -34,27 +45,49 @@ async fn publish_resolve_search_audit() {
     let client = Client::new(&url).unwrap();
     let alice = sign::generate_key(&tmp.path().join("alice")).unwrap();
     let mallory = sign::generate_key(&tmp.path().join("mallory")).unwrap();
-    let root = "ab".repeat(32);
+    let (root, bytes) = manifest("model.safetensors");
 
     client
-        .submit(&publish(
-            &alice,
-            "acme/tiny-llama",
-            &root,
-            "A tiny Llama for tests",
-        ))
+        .publish(
+            &publish(&alice, "acme/tiny-llama", &root, "A tiny Llama for tests"),
+            &bytes,
+        )
         .await
         .unwrap();
     // Someone else can't take the name.
+    let (other, other_bytes) = manifest("other.safetensors");
     let err = client
-        .submit(&publish(&mallory, "acme/tiny-llama", &"cd".repeat(32), ""))
+        .publish(
+            &publish(&mallory, "acme/tiny-llama", &other, ""),
+            &other_bytes,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not an owner"), "{err}");
     // A statement altered in transit fails its signature check.
     let mut forged = publish(&alice, "acme/other", &root, "");
     forged.time += 1;
-    assert!(client.submit(&forged).await.is_err());
+    assert!(client.publish(&forged, &bytes).await.is_err());
+    // The manifest must be the one the statement names.
+    let st = publish(&alice, "acme/other", &root, "");
+    assert!(client.publish(&st, &other_bytes).await.is_err());
+    // Publishing takes the manifest, not a bare statement.
+    assert!(client.submit(&st).await.is_err());
+    // Pickles are refused, even from an org's owner.
+    let (pickle, pickle_bytes) = manifest("pytorch_model.bin");
+    let err = client
+        .publish(&publish(&alice, "acme/pickled", &pickle, ""), &pickle_bytes)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("can run code"), "{err}");
+    // Anyone can see what a published model contains.
+    let listed = reqwest::get(format!("{url}/v1/manifests/{root}"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_ref(), bytes.as_slice());
 
     let entry = client.resolve("acme/tiny-llama", "main").await.unwrap();
     assert_eq!(
@@ -92,7 +125,7 @@ async fn nodes_enforce_the_blocklist() {
     let client = Client::new(&url).unwrap();
 
     // A node with a model in its store, following the registry's blocklist.
-    let model = tmp.path().join("model.bin");
+    let model = tmp.path().join("model.safetensors");
     std::fs::write(&model, vec![42u8; 300_000]).unwrap();
     let seed = Arc::new(Store::open(&tmp.path().join("seed")).unwrap());
     let (m, _) = chungus::pack(&model, &seed).unwrap();
@@ -133,7 +166,9 @@ async fn nodes_enforce_the_blocklist() {
     );
     // Nor can anyone publish the blocked root.
     let publish = publish(&alice, "alice/banned", &m.root, "");
-    assert!(client.submit(&publish).await.is_err());
+    let bytes = serde_json::to_vec(&m).unwrap();
+    let err = client.publish(&publish, &bytes).await.unwrap_err();
+    assert!(err.to_string().contains("blocked"), "{err}");
 
     // Blocking a single chunk stops any model that contains it.
     let chunk = m.files[0].chunks[0].hash.clone();

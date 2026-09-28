@@ -23,7 +23,7 @@ fn write_model(dir: &Path) {
             (state >> 56) as u8
         })
         .collect();
-    fs::write(dir.join("weights.bin"), data).unwrap();
+    fs::write(dir.join("weights.safetensors"), data).unwrap();
     fs::write(dir.join("config.json"), b"{\"layers\": 2}").unwrap();
 }
 
@@ -103,7 +103,7 @@ async fn fetch_through_the_dht() {
     assert_eq!(local.signatures(&m.root).unwrap().len(), 1);
     let out = tmp.path().join("out");
     chungus::unpack(&got, &local, &out).unwrap();
-    for f in ["weights.bin", "config.json"] {
+    for f in ["weights.safetensors", "config.json"] {
         assert_eq!(
             fs::read(out.join(f)).unwrap(),
             fs::read(model.join(f)).unwrap()
@@ -371,8 +371,8 @@ async fn anchors_serve_under_tight_limits() {
     let out = tmp.path().join("out");
     chungus::unpack(&got, &local, &out).unwrap();
     assert_eq!(
-        fs::read(out.join("weights.bin")).unwrap(),
-        fs::read(model.join("weights.bin")).unwrap()
+        fs::read(out.join("weights.safetensors")).unwrap(),
+        fs::read(model.join("weights.safetensors")).unwrap()
     );
 
     // A download-only node holds the model but serves none of it.
@@ -438,10 +438,10 @@ async fn a_model_reads_lazily_from_the_swarm() {
     let file = manifest
         .files
         .iter()
-        .position(|f| f.path == "weights.bin")
+        .position(|f| f.path == "weights.safetensors")
         .unwrap();
     let lazy = chungus::lazy::Lazy::new(local.clone(), manifest, Arc::new(sources)).unwrap();
-    let original = fs::read(model.join("weights.bin")).unwrap();
+    let original = fs::read(model.join("weights.safetensors")).unwrap();
     let got = lazy.read(file, 1_234_567, 100_000).await.unwrap();
     assert_eq!(got, original[1_234_567..1_334_567]);
     lazy.prefetch(8).await.unwrap();
