@@ -12,6 +12,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::manifest::Manifest;
 use crate::segment::Dtype;
 use crate::transform::{self, FloatKind};
 
@@ -94,41 +95,98 @@ pub fn decode(blob: &[u8], len: usize) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
+/// True if `s` is a lowercase hex BLAKE3 digest. Checked before any hash from the
+/// network or a manifest is turned into a path.
+pub fn is_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// On-disk layout: `chunks/<hh>/<hash>` for blobs, `manifests/<root>.json` for manifests.
 pub struct Store {
     root: PathBuf,
 }
 
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        fs::create_dir_all(root).with_context(|| format!("create store {}", root.display()))?;
+        fs::create_dir_all(root.join("chunks"))
+            .with_context(|| format!("create store {}", root.display()))?;
+        fs::create_dir_all(root.join("manifests"))?;
         Ok(Store {
             root: root.to_path_buf(),
         })
     }
 
     fn path(&self, hash: &str) -> PathBuf {
-        self.root.join(&hash[..2]).join(hash)
+        self.root.join("chunks").join(&hash[..2]).join(hash)
     }
 
     pub fn contains(&self, hash: &str) -> bool {
-        self.path(hash).exists()
+        is_hash(hash) && self.path(hash).exists()
     }
 
     /// Write a blob unless it's already present. Returns true if it was new.
-    /// Writes go to a temp file first so a crash never leaves a truncated blob.
     pub fn put(&self, hash: &str, blob: &[u8]) -> Result<bool> {
+        if !is_hash(hash) {
+            bail!("invalid chunk hash {hash:?}");
+        }
         let path = self.path(hash);
         if path.exists() {
             return Ok(false);
         }
-        fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        fs::File::create(&tmp)?.write_all(blob)?;
-        fs::rename(&tmp, &path)?;
+        write_atomic(&path, blob)?;
         Ok(true)
     }
 
     pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
+        if !is_hash(hash) {
+            bail!("invalid chunk hash {hash:?}");
+        }
         fs::read(self.path(hash)).with_context(|| format!("missing chunk {hash}"))
     }
+
+    fn manifest_path(&self, root: &str) -> PathBuf {
+        self.root.join("manifests").join(format!("{root}.json"))
+    }
+
+    pub fn put_manifest(&self, m: &Manifest) -> Result<()> {
+        if !is_hash(&m.root) || !m.verify_root() {
+            bail!("refusing to store a manifest whose root doesn't verify");
+        }
+        write_atomic(&self.manifest_path(&m.root), &serde_json::to_vec_pretty(m)?)
+    }
+
+    pub fn get_manifest_bytes(&self, root: &str) -> Result<Vec<u8>> {
+        if !is_hash(root) {
+            bail!("invalid manifest root {root:?}");
+        }
+        fs::read(self.manifest_path(root)).with_context(|| format!("no manifest {root}"))
+    }
+
+    pub fn get_manifest(&self, root: &str) -> Result<Manifest> {
+        Ok(serde_json::from_slice(&self.get_manifest_bytes(root)?)?)
+    }
+
+    /// Roots of every manifest in the store, sorted.
+    pub fn manifests(&self) -> Result<Vec<String>> {
+        let mut roots = Vec::new();
+        for entry in fs::read_dir(self.root.join("manifests"))? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Some(root) = name.strip_suffix(".json")
+                && is_hash(root)
+            {
+                roots.push(root.to_string());
+            }
+        }
+        roots.sort();
+        Ok(roots)
+    }
+}
+
+/// Write via a temp file and rename, so a crash never leaves a truncated file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::File::create(&tmp)?.write_all(bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }

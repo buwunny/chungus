@@ -7,6 +7,7 @@
 
 pub mod chunk;
 pub mod manifest;
+pub mod net;
 pub mod safetensors;
 pub mod segment;
 pub mod store;
