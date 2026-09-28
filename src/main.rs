@@ -9,7 +9,7 @@ use std::time::Duration;
 use libp2p::Multiaddr;
 
 use chungus::hub;
-use chungus::limits::{Limits, RateLimiter};
+use chungus::limits::{Limits, RateLimiter, RelayLimits};
 use chungus::manifest::Manifest;
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
@@ -129,59 +129,71 @@ enum Cmd {
     },
     /// Join the internet swarm: announce this store's models on the DHT and serve them.
     Node {
-        #[arg(long, default_value = DEFAULT_STORE)]
+        #[arg(long, env = "CHUNGUS_STORE", default_value = DEFAULT_STORE)]
         store: PathBuf,
         /// Follow this registry's blocklist: refuse to hold or serve blocked models and
         /// chunks, and delete any already stored.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_BLOCKLIST")]
         blocklist: Option<String>,
         /// The registry operator's public key, to pin when following its blocklist.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_OPERATOR")]
         operator: Option<String>,
         /// Address to listen on. Repeatable. Default: TCP and QUIC on port 4001.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_LISTEN", value_delimiter = ',')]
         listen: Vec<Multiaddr>,
         /// A node to join through (a multiaddr ending in /p2p/<peer id>). Repeatable.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_BOOTSTRAP", value_delimiter = ',')]
         bootstrap: Vec<Multiaddr>,
         /// A relay to be reachable through when behind NAT (ending in /p2p/<peer id>).
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_RELAY", value_delimiter = ',')]
         relay: Vec<Multiaddr>,
         /// An address others can reach this node at, e.g. a public IP with a forwarded port.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_EXTERNAL", value_delimiter = ',')]
         external: Vec<Multiaddr>,
         /// This node is directly reachable on its listen addresses (a public server).
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_PUBLIC")]
         public: bool,
         /// Relay connections for nodes behind NAT. Use with --public.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_RELAY_SERVER")]
         relay_server: bool,
         /// A node to trust as a starting point: always kept in the routing table and asked
         /// directly for every model alongside the DHT. Repeatable.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_ANCHOR", value_delimiter = ',')]
         anchor: Vec<Multiaddr>,
         /// Use this registry's signed list of anchor nodes (checked against --operator).
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_ANCHORS_FROM")]
         anchors_from: Option<String>,
         /// Upload cap in MB/s, across all peers.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_MAX_UPLOAD")]
         max_upload: Option<f64>,
         /// Open connections, in and out.
-        #[arg(long, default_value_t = Limits::default().max_connections)]
+        #[arg(long, env = "CHUNGUS_MAX_CONNECTIONS", default_value_t = Limits::default().max_connections)]
         max_connections: u32,
         /// Requests one peer may have served at once; more are told to come back later.
-        #[arg(long, default_value_t = Limits::default().max_requests_per_peer)]
+        #[arg(long, env = "CHUNGUS_MAX_REQUESTS_PER_PEER", default_value_t = Limits::default().max_requests_per_peer)]
         max_requests_per_peer: usize,
         /// Requests served at once, across all peers.
-        #[arg(long, default_value_t = Limits::default().max_uploads)]
+        #[arg(long, env = "CHUNGUS_MAX_UPLOADS", default_value_t = Limits::default().max_uploads)]
         max_uploads: usize,
         /// Routing-table entries from one IPv4 /24 or IPv6 /48, so no one network can
         /// crowd out the rest.
-        #[arg(long, default_value_t = Limits::default().max_peers_per_subnet)]
+        #[arg(long, env = "CHUNGUS_MAX_PEERS_PER_SUBNET", default_value_t = Limits::default().max_peers_per_subnet)]
         max_peers_per_subnet: usize,
         /// Download through the swarm but never serve or announce anything.
-        #[arg(long)]
+        #[arg(long, env = "CHUNGUS_DOWNLOAD_ONLY")]
         download_only: bool,
+        /// With --relay-server: relayed connections open at once.
+        #[arg(long, env = "CHUNGUS_RELAY_MAX_CIRCUITS", default_value_t = RelayLimits::default().max_circuits)]
+        relay_max_circuits: usize,
+        /// With --relay-server: MB one relayed connection may carry before it is closed.
+        #[arg(long, env = "CHUNGUS_RELAY_CIRCUIT_MB", default_value_t = RelayLimits::default().circuit_bytes / 1_000_000)]
+        relay_circuit_mb: u64,
+        /// With --relay-server: seconds one relayed connection may stay open.
+        #[arg(long, env = "CHUNGUS_RELAY_CIRCUIT_SECS", default_value_t = RelayLimits::default().circuit_duration.as_secs())]
+        relay_circuit_secs: u64,
+        /// With --relay-server: peers that may be reachable through this relay at once.
+        #[arg(long, env = "CHUNGUS_RELAY_MAX_RESERVATIONS", default_value_t = RelayLimits::default().max_reservations)]
+        relay_max_reservations: usize,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -756,6 +768,10 @@ async fn main() -> Result<()> {
             max_uploads,
             max_peers_per_subnet,
             download_only,
+            relay_max_circuits,
+            relay_circuit_mb,
+            relay_circuit_secs,
+            relay_max_reservations,
         } => {
             let store = Arc::new(Store::open(&store)?);
             if let Some(url) = anchors_from {
@@ -790,6 +806,13 @@ async fn main() -> Result<()> {
                     max_uploads,
                     max_peers_per_subnet,
                     download_only,
+                },
+                relay: RelayLimits {
+                    max_circuits: relay_max_circuits,
+                    circuit_bytes: relay_circuit_mb.saturating_mul(1_000_000),
+                    circuit_duration: Duration::from_secs(relay_circuit_secs),
+                    max_reservations: relay_max_reservations,
+                    ..Default::default()
                 },
                 ..Default::default()
             };
