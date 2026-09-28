@@ -188,12 +188,6 @@ pub struct FetchStats {
     pub secs: f64,
 }
 
-enum Attempt {
-    Stored(u64),
-    Missing,
-    Rejected,
-}
-
 /// Download manifest `root` and every chunk it needs that `store` lacks.
 ///
 /// `peers` are tried first, with chunks spread across them; `origin`, if given, is the
@@ -260,6 +254,38 @@ pub async fn fetch_chunks<'a>(
     peers: &[String],
     origin: &[String],
 ) -> Result<FetchStats> {
+    fetch_chunks_with(store, chunks, peers, origin, |source, hash| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .get(format!("{source}/v1/chunks/{hash}"))
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.bytes().await.ok()
+        }
+    })
+    .await
+}
+
+/// Download every chunk in `chunks` that `store` lacks with `get(source, hash)`, trying
+/// `peers` (spread by hash) and then `fallback`. Each chunk is verified against its hash
+/// before it is stored, so a source can't make us keep bad data.
+pub(crate) async fn fetch_chunks_with<'a, S, F, Fut>(
+    store: &Arc<Store>,
+    chunks: impl IntoIterator<Item = &'a ChunkRef>,
+    peers: &[S],
+    fallback: &[S],
+    get: F,
+) -> Result<FetchStats>
+where
+    S: Clone + std::fmt::Display,
+    F: Fn(S, String) -> Fut,
+    Fut: std::future::Future<Output = Option<Bytes>>,
+{
     // Unique chunks, in order.
     let mut wanted: Vec<(String, usize)> = Vec::new();
     let mut seen = HashSet::new();
@@ -278,9 +304,10 @@ pub async fn fetch_chunks<'a>(
         .collect();
     stats.already_local = stats.chunks - missing.len();
 
+    let get = &get;
     let results = stream::iter(missing)
         .map(|(hash, len)| {
-            let (client, store) = (client.clone(), store.clone());
+            let store = store.clone();
             async move {
                 // Spread load: each chunk starts at a different peer, chosen by its hash.
                 let start = if peers.is_empty() {
@@ -291,13 +318,15 @@ pub async fn fetch_chunks<'a>(
                 let order = peers[start..]
                     .iter()
                     .chain(&peers[..start])
-                    .chain(origin.iter());
+                    .chain(fallback.iter());
                 let mut rejected = 0;
                 for source in order {
-                    match try_chunk(&client, &store, source, &hash, len).await {
-                        Attempt::Stored(bytes) => return Ok((source.clone(), bytes, rejected)),
-                        Attempt::Rejected => rejected += 1,
-                        Attempt::Missing => {}
+                    let Some(blob) = get(source.clone(), hash.clone()).await else {
+                        continue;
+                    };
+                    match verify_and_store(&store, &hash, len, blob).await {
+                        Some(bytes) => return Ok((source.to_string(), bytes, rejected)),
+                        None => rejected += 1,
                     }
                 }
                 Err(anyhow!("chunk {hash} is not available from any source"))
@@ -313,6 +342,28 @@ pub async fn fetch_chunks<'a>(
         stats.rejected += rejected;
     }
     Ok(stats)
+}
+
+/// Store `blob` as chunk `hash` if it decodes to `len` bytes with that hash. Returns the
+/// blob's size, or None if it was rejected.
+pub(crate) async fn verify_and_store(
+    store: &Arc<Store>,
+    hash: &str,
+    len: usize,
+    blob: Bytes,
+) -> Option<u64> {
+    let (store, hash) = (store.clone(), hash.to_string());
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        let raw = store::decode(&blob, len)?;
+        if blake3::hash(&raw).to_hex().as_str() != hash {
+            bail!("hash mismatch");
+        }
+        store.put(&hash, &blob)?;
+        Ok(blob.len() as u64)
+    })
+    .await
+    .ok()?
+    .ok()
 }
 
 /// Every signature any source has for `root`. Unverified; the store keeps only valid ones.
@@ -382,7 +433,7 @@ pub async fn fetch_one(
     sources: &[String],
 ) -> bool {
     for source in sources {
-        if let Attempt::Stored(_) = try_chunk(client, store, source, hash, len).await {
+        if try_chunk(client, store, source, hash, len).await {
             return true;
         }
     }
@@ -395,31 +446,17 @@ async fn try_chunk(
     source: &str,
     hash: &str,
     len: usize,
-) -> Attempt {
+) -> bool {
     let resp = match client
         .get(format!("{source}/v1/chunks/{hash}"))
         .send()
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return Attempt::Missing,
+        _ => return false,
     };
-    let blob = match resp.bytes().await {
-        Ok(b) => b,
-        Err(_) => return Attempt::Missing,
+    let Ok(blob) = resp.bytes().await else {
+        return false;
     };
-    let (store, hash) = (store.clone(), hash.to_string());
-    let verified = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let raw = store::decode(&blob, len)?;
-        if blake3::hash(&raw).to_hex().as_str() != hash {
-            bail!("hash mismatch");
-        }
-        store.put(&hash, &blob)?;
-        Ok(blob.len() as u64)
-    })
-    .await;
-    match verified {
-        Ok(Ok(bytes)) => Attempt::Stored(bytes),
-        _ => Attempt::Rejected,
-    }
+    verify_and_store(store, hash, len, blob).await.is_some()
 }

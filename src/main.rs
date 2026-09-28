@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use libp2p::Multiaddr;
+
 use chungus::hub;
 use chungus::manifest::Manifest;
-use chungus::net;
+use chungus::net::{self, FetchStats};
+use chungus::p2p;
 use chungus::sign;
 use chungus::store::{self, Store};
 
@@ -104,6 +107,33 @@ enum Cmd {
         /// Only download if this public key (chungus1...) has signed the manifest. Repeatable.
         #[arg(long)]
         trust: Vec<String>,
+        /// Fetch over the internet swarm instead of the LAN, joining through this node
+        /// (a multiaddr ending in /p2p/<peer id>). Repeatable.
+        #[arg(long)]
+        bootstrap: Vec<Multiaddr>,
+    },
+    /// Join the internet swarm: announce this store's models on the DHT and serve them.
+    Node {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        store: PathBuf,
+        /// Address to listen on. Repeatable. Default: TCP and QUIC on port 4001.
+        #[arg(long)]
+        listen: Vec<Multiaddr>,
+        /// A node to join through (a multiaddr ending in /p2p/<peer id>). Repeatable.
+        #[arg(long)]
+        bootstrap: Vec<Multiaddr>,
+        /// A relay to be reachable through when behind NAT (ending in /p2p/<peer id>).
+        #[arg(long)]
+        relay: Vec<Multiaddr>,
+        /// An address others can reach this node at, e.g. a public IP with a forwarded port.
+        #[arg(long)]
+        external: Vec<Multiaddr>,
+        /// This node is directly reachable on its listen addresses (a public server).
+        #[arg(long)]
+        public: bool,
+        /// Relay connections for nodes behind NAT. Use with --public.
+        #[arg(long)]
+        relay_server: bool,
     },
     /// Create a signing key and print its public key.
     Keygen {
@@ -138,6 +168,24 @@ fn key_path(key: Option<PathBuf>) -> Result<PathBuf> {
             PathBuf::from(std::env::var_os("HOME").context("HOME is not set; pass --key")?)
                 .join(".chungus/key"),
         ),
+    }
+}
+
+fn report_fetch(s: &FetchStats) {
+    let received: u64 = s.bytes_by_source.values().sum();
+    println!(
+        "{} chunks: {} already local, {} fetched ({:.1} MB) in {:.1}s",
+        s.chunks,
+        s.already_local,
+        s.chunks - s.already_local,
+        mb(received),
+        s.secs
+    );
+    for (source, bytes) in &s.bytes_by_source {
+        println!("  {source}: {:.1} MB", mb(*bytes));
+    }
+    if s.rejected > 0 {
+        println!("  rejected {} bad chunk(s) and refetched them", s.rejected);
     }
 }
 
@@ -320,40 +368,81 @@ async fn main() -> Result<()> {
             no_mdns,
             discover_secs,
             trust,
+            bootstrap,
         } => {
             let trust = parse_keys(&trust)?;
             let store = Arc::new(Store::open(&store)?);
-            let mut peers = peer;
-            if !no_mdns {
-                let wait = Duration::from_secs_f64(discover_secs);
-                let found =
-                    tokio::task::spawn_blocking(move || net::discover(wait, None)).await??;
-                println!("found {} peer(s) on the LAN", found.len());
-                peers.extend(found);
-            }
-            peers.sort();
-            peers.dedup();
-            let (manifest, s) =
-                net::fetch(&root, store.clone(), &peers, origin.as_deref(), &trust).await?;
-            let received: u64 = s.bytes_by_source.values().sum();
-            println!(
-                "{} chunks: {} already local, {} fetched ({:.1} MB) in {:.1}s",
-                s.chunks,
-                s.already_local,
-                s.chunks - s.already_local,
-                mb(received),
-                s.secs
-            );
-            for (source, bytes) in &s.bytes_by_source {
-                println!("  {source}: {:.1} MB", mb(*bytes));
-            }
-            if s.rejected > 0 {
-                println!("  rejected {} bad chunk(s) and refetched them", s.rejected);
-            }
+            let (manifest, s) = if bootstrap.is_empty() {
+                let mut peers = peer;
+                if !no_mdns {
+                    let wait = Duration::from_secs_f64(discover_secs);
+                    let found =
+                        tokio::task::spawn_blocking(move || net::discover(wait, None)).await??;
+                    println!("found {} peer(s) on the LAN", found.len());
+                    peers.extend(found);
+                }
+                peers.sort();
+                peers.dedup();
+                net::fetch(&root, store.clone(), &peers, origin.as_deref(), &trust).await?
+            } else {
+                let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
+                let config = p2p::Config {
+                    listen: vec![
+                        "/ip4/0.0.0.0/tcp/0".parse()?,
+                        "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
+                    ],
+                    bootstrap,
+                    ..Default::default()
+                };
+                let node = p2p::Node::start(store.clone(), key, config).await?;
+                p2p::fetch(&node, &root, store.clone(), &trust).await?
+            };
+            report_fetch(&s);
             if let Some(output) = output {
                 tokio::task::spawn_blocking(move || chungus::unpack(&manifest, &store, &output))
                     .await??;
                 println!("unpacked, all chunks verified");
+            }
+        }
+        Cmd::Node {
+            store,
+            listen,
+            bootstrap,
+            relay,
+            external,
+            public,
+            relay_server,
+        } => {
+            let store = Arc::new(Store::open(&store)?);
+            let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
+            let listen = if listen.is_empty() {
+                vec![
+                    format!("/ip4/0.0.0.0/tcp/{}", p2p::DEFAULT_PORT).parse()?,
+                    format!("/ip4/0.0.0.0/udp/{}/quic-v1", p2p::DEFAULT_PORT).parse()?,
+                ]
+            } else {
+                listen
+            };
+            let config = p2p::Config {
+                listen,
+                bootstrap,
+                relays: relay,
+                external,
+                public,
+                relay_server,
+            };
+            let node = p2p::Node::start(store.clone(), key, config).await?;
+            println!("peer id {}", node.peer_id);
+            println!("sharing {} models", store.manifests()?.len());
+            // Relayed addresses appear once a reservation is made, so keep reporting new ones.
+            let mut shown = std::collections::HashSet::new();
+            loop {
+                for a in node.addresses(Duration::ZERO).await? {
+                    if shown.insert(a.clone()) {
+                        println!("address {a}");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
         Cmd::Keygen { key } => {

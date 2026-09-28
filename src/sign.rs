@@ -53,7 +53,7 @@ pub fn parse_public_key(s: &str) -> Result<VerifyingKey> {
         .strip_prefix(KEY_PREFIX)
         .with_context(|| format!("{s:?} is not a chungus public key"))?;
     let bytes = from_hex::<32>(hex).context("public key must be 64 hex characters")?;
-    Ok(VerifyingKey::from_bytes(&bytes)?)
+    VerifyingKey::from_bytes(&bytes).with_context(|| format!("{s:?} is not a valid public key"))
 }
 
 /// Create a new signing key at `path` (readable only by the owner) and return it.
