@@ -9,6 +9,8 @@ RUN cargo build --release --locked --bin chungus && mkdir /data
 
 # Just the binary, glibc and CA certificates: no shell or package manager.
 FROM gcr.io/distroless/cc-debian12:nonroot
+# Links the GHCR package to this repository.
+LABEL org.opencontainers.image.source=https://github.com/buwunny/chungus
 COPY --from=build /src/target/release/chungus /usr/local/bin/chungus
 # The store, and the node's identity key inside it, live here.
 COPY --from=build --chown=nonroot:nonroot /data /data

@@ -17,6 +17,20 @@ model files ─► segments ─► FastCDC chunks ─► BLAKE3 ─► float tra
 4. **Float transform.** For BF16 and F32 tensors, each element is rearranged into an exponent byte and sign+mantissa bytes, then grouped into planes. Exponents are low-entropy and compress well. This is lossless: unpacking gives back the exact bits. The split and unshuffle run SIMD kernels (SSSE3 on x86-64, NEON on ARM) at 4 to 9 GB/s per core, faster than zstd decodes; `cargo run --release --example transform_speed` measures them.
 5. **zstd.** Each chunk is compressed on its own so any chunk can be read independently. The encoder keeps whichever of {stored, zstd, transform + zstd} is smallest.
 
+## Install
+
+Each release has prebuilt binaries for Linux (x86_64, aarch64; glibc 2.35 or newer) and macOS (Apple silicon, Intel) on the [releases page](https://github.com/buwunny/chungus/releases):
+
+```sh
+# Pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
+# aarch64-apple-darwin or x86_64-apple-darwin
+v=v0.1.0 t=aarch64-apple-darwin
+curl -LO https://github.com/buwunny/chungus/releases/download/$v/chungus-$v-$t.tar.gz
+tar xzf chungus-$v-$t.tar.gz && sudo mv chungus-$v-$t/chungus /usr/local/bin/
+```
+
+On macOS, a downloaded binary is quarantined; `xattr -d com.apple.quarantine /usr/local/bin/chungus` lets it run. Or build from source with `cargo build --release` (the binary is `target/release/chungus`). The node container is published as `ghcr.io/buwunny/chungus` for linux/amd64 and arm64, from every commit to main.
+
 ## Usage
 
 ```sh
@@ -142,11 +156,11 @@ Every swarm needs a few public nodes for others to join through and to relay for
 ```sh
 git clone https://github.com/buwunny/chungus && cd chungus/deploy
 cp node.env.example node.env   # set CHUNGUS_EXTERNAL to the server's IP, adjust the limits
-docker compose up -d --build
+docker compose up -d
 docker compose logs node       # the addresses to share, ending in /p2p/<peer id>
 ```
 
-Open TCP and UDP port 4001 in the provider's firewall. The node runs as a non-root user in a read-only container with no shell, restarts on failure, and keeps its store and identity key in the `chungus-data` volume, so its peer id survives upgrades (`git pull && docker compose up -d --build`). Every `chungus node` flag can be set in `node.env` as a `CHUNGUS_*` variable: set `CHUNGUS_BLOCKLIST` and `CHUNGUS_OPERATOR` to follow a registry's blocklist, and `CHUNGUS_BOOTSTRAP` to join an existing swarm.
+Open TCP and UDP port 4001 in the provider's firewall. The node runs as a non-root user in a read-only container with no shell, restarts on failure, and keeps its store and identity key in the `chungus-data` volume, so its peer id survives upgrades (`docker compose pull && docker compose up -d`; `up -d --build` builds from the checkout instead of pulling). Every `chungus node` flag can be set in `node.env` as a `CHUNGUS_*` variable: set `CHUNGUS_BLOCKLIST` and `CHUNGUS_OPERATOR` to follow a registry's blocklist, and `CHUNGUS_BOOTSTRAP` to join an existing swarm.
 
 The relay only carries connections between two chungus peers that both asked for it, and only until they hole-punch a direct one. The node seeds nothing until you pin a model into its store:
 
@@ -197,7 +211,7 @@ To run a public registry on the same server as the public node, with the website
 ```sh
 cd chungus/deploy
 cp .env.example .env           # set CHUNGUS_DOMAIN, with its DNS pointing at the server
-docker compose --profile registry up -d --build
+docker compose --profile registry up -d
 docker compose logs registry   # the operator key: nodes pin it with --operator
 ```
 
