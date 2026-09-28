@@ -98,7 +98,11 @@ fn pack_unpack_is_bit_identical_and_dedups() {
         .find(|f| f.path == "model.safetensors")
         .unwrap()
         .chunks[0];
-    let blob_path = dir.join("store").join(&victim.hash[..2]).join(&victim.hash);
+    let blob_path = dir
+        .join("store")
+        .join("chunks")
+        .join(&victim.hash[..2])
+        .join(&victim.hash);
     fs::write(&blob_path, [1u8, 0, 1, 0xde, 0xad]).unwrap();
     let _ = fs::remove_dir_all(&out);
     assert!(chungus::unpack(&m1, &store, &out).is_err());
