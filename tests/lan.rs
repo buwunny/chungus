@@ -54,7 +54,7 @@ async fn fetch_from_peer_is_verified_and_resumes() {
     let peer = spawn_server(seed).await;
 
     let local = Arc::new(Store::open(&tmp.path().join("b")).unwrap());
-    let (m, stats) = net::fetch(&root, local.clone(), std::slice::from_ref(&peer), None)
+    let (m, stats) = net::fetch(&root, local.clone(), std::slice::from_ref(&peer), None, &[])
         .await
         .unwrap();
     assert_eq!(stats.already_local, 0);
@@ -70,7 +70,7 @@ async fn fetch_from_peer_is_verified_and_resumes() {
     }
 
     // A second fetch finds everything already local and transfers nothing.
-    let (_, again) = net::fetch(&root, local, &[peer], None).await.unwrap();
+    let (_, again) = net::fetch(&root, local, &[peer], None, &[]).await.unwrap();
     assert_eq!(again.already_local, again.chunks);
     assert!(again.bytes_by_source.is_empty());
 }
@@ -98,7 +98,7 @@ async fn bad_peer_is_rejected_and_origin_fills_in() {
     let origin = spawn_server(honest).await;
 
     let local = Arc::new(Store::open(&tmp.path().join("local")).unwrap());
-    let (m, stats) = net::fetch(&root, local.clone(), &[liar, empty], Some(&origin))
+    let (m, stats) = net::fetch(&root, local.clone(), &[liar, empty], Some(&origin), &[])
         .await
         .unwrap();
     assert_eq!(stats.rejected, stats.chunks);
@@ -112,7 +112,7 @@ async fn fetch_fails_cleanly_when_nobody_has_the_model() {
     let empty = spawn_server(Arc::new(Store::open(&tmp.path().join("e")).unwrap())).await;
     let local = Arc::new(Store::open(&tmp.path().join("l")).unwrap());
     let root = "0".repeat(64);
-    assert!(net::fetch(&root, local, &[empty], None).await.is_err());
+    assert!(net::fetch(&root, local, &[empty], None, &[]).await.is_err());
 }
 
 fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
@@ -126,4 +126,71 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_fetch_needs_a_signature_from_a_trusted_key() {
+    use chungus::sign;
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let (seed, root) = pack_into(&model, &tmp.path().join("seed"));
+    let author = sign::generate_key(&tmp.path().join("author.key")).unwrap();
+    let stranger = sign::generate_key(&tmp.path().join("stranger.key")).unwrap();
+    seed.add_signatures(&root, &[sign::sign(&author, &root)])
+        .unwrap();
+    // A forged signature slipped into the peer's file is dropped by the fetcher.
+    let forged = sign::Signature {
+        key: sign::public_key_string(&stranger.verifying_key()),
+        sig: sign::sign(&author, &root).sig,
+    };
+    let sigs_file = tmp
+        .path()
+        .join("seed/manifests")
+        .join(format!("{root}.sigs.json"));
+    let mut sigs = seed.signatures(&root).unwrap();
+    sigs.push(forged);
+    fs::write(&sigs_file, serde_json::to_vec(&sigs).unwrap()).unwrap();
+    let peer = spawn_server(seed).await;
+
+    // Trusting only the stranger: refused before any chunk is downloaded.
+    let wary = Arc::new(Store::open(&tmp.path().join("wary")).unwrap());
+    let Err(err) = net::fetch(
+        &root,
+        wary.clone(),
+        std::slice::from_ref(&peer),
+        None,
+        &[stranger.verifying_key()],
+    )
+    .await
+    else {
+        panic!("fetch without a trusted signature succeeded");
+    };
+    assert!(err.to_string().contains("no trusted key"), "{err}");
+    assert!(
+        !tmp.path()
+            .join("wary/chunks")
+            .read_dir()
+            .unwrap()
+            .any(|e| { e.unwrap().path().read_dir().unwrap().next().is_some() })
+    );
+
+    // Trusting the author: downloads, and keeps only the valid signature.
+    let local = Arc::new(Store::open(&tmp.path().join("local")).unwrap());
+    let (m, _) = net::fetch(
+        &root,
+        local.clone(),
+        &[peer],
+        None,
+        &[author.verifying_key()],
+    )
+    .await
+    .unwrap();
+    chungus::unpack(&m, &local, &tmp.path().join("out")).unwrap();
+    let kept = local.signatures(&root).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        kept[0].key,
+        sign::public_key_string(&author.verifying_key())
+    );
 }

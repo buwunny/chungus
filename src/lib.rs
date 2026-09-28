@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod net;
 pub mod safetensors;
 pub mod segment;
+pub mod sign;
 pub mod store;
 pub mod transform;
 

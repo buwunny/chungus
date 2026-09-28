@@ -2,7 +2,7 @@
 
 A peer-to-peer network for distributing AI models, their runtimes and Docker AI images. Think of it as a decentralized Hugging Face with its own take on Xet-style storage.
 
-This repository currently holds **milestones 1 to 3**: the storage format, a benchmark tool, sharing models between machines on a LAN, and a drop-in Hugging Face cache.
+This repository currently holds **milestones 1 to 3** and the first part of milestone 4: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, and signed models.
 
 ## The pipeline
 
@@ -74,13 +74,32 @@ No model handy? Generate a synthetic BF16 file:
 cargo run --release --example synth -- synthetic.safetensors 64   # 64M parameters
 ```
 
+## Signed models
+
+A publisher signs a model's manifest root with an ed25519 key. The root commits to every file and chunk, so one signature covers the whole model, and anyone can check it without trusting the peer that served it.
+
+```sh
+# Publisher: create a key once (stored in ~/.chungus/key), then sign what you pack
+chungus keygen
+chungus sign <root>
+
+# Anyone: see who signed a model, or require a particular key
+chungus verify <root>
+chungus verify <root> --trust chungus1<publisher key>
+
+# Only download if a trusted key signed it; nothing is fetched otherwise
+chungus fetch <root> --trust chungus1<publisher key>
+```
+
+Signatures travel with the manifest: `fetch` collects them from every peer and keeps only the valid ones, so a peer can't forge or swap one.
+
 ## What to expect
 
 On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports zstd alone at 78% of the original size and the full pipeline at 73%. Real models usually compress somewhat better than synthetic ones. Published results (ZipNN, DFloat11) put BF16 near 67–70% of original size. Models already quantized to 4 bits barely compress. Dedup savings depend on how much two models actually share: re-uploads and format copies dedup almost completely, and full fine-tunes dedup very little.
 
 ## Manifest and store layout
 
-A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that and is the value an author will sign in a later milestone.
+A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatures in `manifests/<root>.sigs.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that and is the value a publisher signs.
 
 ## Roadmap
 
@@ -89,7 +108,7 @@ A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, and `meta/hub
 | **M1** (done) | Storage format, `pack` / `unpack` / `bench` |
 | **M2** (done) | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
-| M4 | Internet swarm, signed publishing, registry and search |
+| M4 | Signed models (done); internet swarm over libp2p (Kademlia DHT, NAT traversal); registry and search |
 | Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 
 The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.
