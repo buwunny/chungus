@@ -20,7 +20,7 @@ use crate::sign::{self, Signature};
 use crate::transform::{self, FloatKind};
 
 const VERSION: u8 = 1;
-const ZSTD_LEVEL: i32 = 3;
+pub const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
