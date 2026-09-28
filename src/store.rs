@@ -117,6 +117,11 @@ impl Store {
         })
     }
 
+    /// The store's directory.
+    pub fn dir(&self) -> &Path {
+        &self.root
+    }
+
     fn path(&self, hash: &str) -> PathBuf {
         self.root.join("chunks").join(&hash[..2]).join(hash)
     }
