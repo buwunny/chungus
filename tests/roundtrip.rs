@@ -148,3 +148,29 @@ fn bench_counts_each_input_against_the_ones_before() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn pack_skips_pickles_and_stores_refuse_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("config.json"), b"{}").unwrap();
+    std::fs::write(model.join("pytorch_model.bin"), b"\x80\x04pickle").unwrap();
+    let store = chungus::store::Store::open(&tmp.path().join("store")).unwrap();
+    let (m, stats) = chungus::pack(&model, &store).unwrap();
+    let paths: Vec<&str> = m.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["config.json"]);
+    assert_eq!(stats.skipped.len(), 1);
+
+    // A directory of nothing but pickles has nothing to pack.
+    std::fs::remove_file(model.join("config.json")).unwrap();
+    assert!(chungus::pack(&model, &store).is_err());
+
+    // A hand-made manifest listing a pickle is refused by the store and by unpack.
+    let bad = chungus::manifest::Manifest::new(vec![chungus::manifest::FileEntry {
+        path: "weights.pt".into(),
+        ..m.files[0].clone()
+    }]);
+    assert!(store.put_manifest(&bad).is_err());
+    assert!(chungus::unpack(&bad, &store, &tmp.path().join("out")).is_err());
+}

@@ -57,7 +57,7 @@ async fn get_manifest(State(store): State<Arc<Store>>, Path(root): Path<String>)
     if !store::is_hash(&root) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match tokio::task::spawn_blocking(move || store.get_manifest_bytes(&root)).await {
+    match tokio::task::spawn_blocking(move || store.get_safe_manifest_bytes(&root)).await {
         Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
