@@ -365,6 +365,7 @@ impl Node {
             log: cfg.log,
             known,
             observed: HashSet::new(),
+            refused: HashSet::new(),
             mismatched: HashSet::new(),
             joined: false,
         };
@@ -455,6 +456,8 @@ struct Runner {
     known: HashMap<PeerId, &'static str>,
     /// Named peers that have told us which address they see us at.
     observed: HashSet<PeerId>,
+    /// Models in the store that list unsafe files, so are never announced.
+    refused: HashSet<String>,
     /// chungus peers on an incompatible protocol version, reported once each.
     mismatched: HashSet<PeerId>,
     /// Whether a DHT bootstrap has succeeded yet.
@@ -503,13 +506,20 @@ impl Runner {
         };
         let mut want = HashSet::new();
         for root in &roots {
-            want.insert(holder_key(root));
+            if self.refused.contains(root) {
+                continue;
+            }
             let held = match self.held.get_mut(root) {
                 Some(h) => h,
                 None => {
                     let Ok(m) = self.store.get_manifest(root) else {
                         continue;
                     };
+                    // Stores packed before chungus refused pickles may still hold some.
+                    if crate::safety::check_manifest(&m).is_err() {
+                        self.refused.insert(root.clone());
+                        continue;
+                    }
                     let blocks = m.blocks(self.block_bytes);
                     self.held.entry(root.clone()).or_insert(Held {
                         blocks: blocks.iter().map(|b| b.id.clone()).collect(),
@@ -529,6 +539,7 @@ impl Runner {
                     }
                 }
             }
+            want.insert(holder_key(root));
             want.extend(held.done.iter().cloned());
             if held.done.len() == held.blocks.len() {
                 want.insert(root.clone());
@@ -954,12 +965,9 @@ impl Response {
 /// Answer a peer's request from the store. Anything missing or malformed is `None`.
 fn answer(store: &Store, req: Request) -> Response {
     match req {
-        Request::Manifest(root) => Response::Manifest(
-            store::is_hash(&root)
-                .then(|| store.get_manifest_bytes(&root).ok())
-                .flatten()
-                .map(ByteBuf::from),
-        ),
+        Request::Manifest(root) => {
+            Response::Manifest(store.get_safe_manifest_bytes(&root).ok().map(ByteBuf::from))
+        }
         Request::Signatures(root) => {
             Response::Signatures(store.signatures(&root).unwrap_or_default())
         }

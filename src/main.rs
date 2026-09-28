@@ -548,6 +548,9 @@ async fn main() -> Result<()> {
                 fs::write(&output, serde_json::to_vec_pretty(&manifest)?)
                     .with_context(|| format!("write {}", output.display()))?;
             }
+            for why in &s.skipped {
+                eprintln!("skipped {why}");
+            }
             println!("packed {:.1} MB in {} chunks", mb(s.raw_bytes), s.chunks);
             println!(
                 "new: {} chunks, {:.1} MB raw -> {:.1} MB stored ({:.1}%)",
@@ -940,8 +943,8 @@ async fn main() -> Result<()> {
         } => {
             let (name, rev) = registry::parse_ref(&name)?;
             let store = Store::open(&store)?;
-            store
-                .get_manifest(&root)
+            let manifest = store
+                .get_manifest_bytes(&root)
                 .context("publish a model that is in your store (see `chungus list`)")?;
             let k = sign::load_key(&key_path(key)?)?;
             // Sign the manifest too, so peers can prove it came from the name's owner.
@@ -955,7 +958,9 @@ async fn main() -> Result<()> {
                     description,
                 },
             );
-            let entry = registry::Client::new(&registry)?.submit(&st).await?;
+            let entry = registry::Client::new(&registry)?
+                .publish(&st, &manifest)
+                .await?;
             println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
         }
         Cmd::Resolve { name, registry } => {

@@ -78,6 +78,7 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwe
 For each file, the hub serves it from its store if it has it. Otherwise it pulls the chunks from other hubs on the LAN (found over mDNS), and otherwise downloads the file from huggingface.co, streaming it to you while it packs it into the store. The next machine in the office gets it from the LAN.
 
 - **Tokens** (`HF_TOKEN`) are forwarded only to huggingface.co, never to peers.
+- **Files that can run code** (pickle-based `.bin`, `.pt`, `.ckpt` and the like) are passed straight through from huggingface.co and never cached or shared with peers. See [Safe files only](#safe-files-only).
 - **Gated models** are served only to requests whose token huggingface.co accepts for that file. When huggingface.co can't be reached, a gated file is served only to a token that was accepted earlier in this run.
 - **Peer copies are checked.** While huggingface.co is reachable, a file assembled from LAN peers must match its SHA-256 (or git blob hash). The last bytes are held back until it does, so a bad copy never arrives complete, and that file is then fetched from huggingface.co instead. With `--offline`, peers are trusted, as with `serve`.
 - Tree listings drop Xet hashes, so clients download through the hub instead of going around it.
@@ -209,6 +210,8 @@ chungus fetch acme/tiny-llama@v1 -o model/     # requires the publisher's signat
 chungus audit --operator chungus1<operator key>
 ```
 
+`publish` sends the manifest along with the signed statement. The registry checks that it hashes to the published root and lists no unsafe files, keeps it (`GET /v1/manifests/<root>` shows what a name contains), and only lists models whose manifest it checked in search and the index. Models published before this check need publishing again to be listed.
+
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
 ### A public registry and website
@@ -227,6 +230,15 @@ docker compose logs registry   # the operator key: nodes pin it with --operator
 Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and operator key live in the `registry-data` volume, so back it up: the operator key signs the log head, the blocklist and the anchor list, and a new key means every node has to pin a new one. Operator commands run inside the container, e.g. `docker compose exec registry chungus block <hash> --key /data/registry/operator.key`.
 
 The site can also be published to GitHub Pages: set the repository variable `CHUNGUS_REGISTRY_URL` to the registry's HTTPS address (the workflow refuses anything else), set Settings > Pages > Source to "GitHub Actions" and tick "Enforce HTTPS". The Pages workflow points the page at the live registry and bundles a snapshot of its index, refreshed every six hours, for when the registry is down.
+
+## Safe files only
+
+A chunk's hash proves a file arrived intact, not that it is safe to load, and pickle-based weights can run arbitrary code the moment PyTorch, joblib or NumPy opens them. So chungus carries weights only as **safetensors** or **GGUF**, plus the small files around them (configs, tokenizers, READMEs). Files ending in `.bin`, `.pt`, `.pth`, `.ckpt`, `.pkl`, `.pickle`, `.joblib`, `.dill`, `.pd`, `.npy`, `.npz`, `.h5`, `.hdf5` or `.keras` are kept out everywhere:
+
+- `pack` skips them and says which it skipped (convert them to safetensors first).
+- Stores refuse manifests that list them, so `fetch`, `unpack` and `mount` won't write them, and nodes neither announce nor serve older manifests that do.
+- The registry won't publish them.
+- `chungus hub` passes them through from huggingface.co without caching them or taking them from peers.
 
 ## What to expect
 

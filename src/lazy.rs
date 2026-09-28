@@ -74,6 +74,7 @@ impl Lazy {
         if !manifest.verify_root() {
             bail!("manifest root does not match its contents");
         }
+        crate::safety::check_manifest(&manifest)?;
         if !manifest.commits_to_chunks() {
             bail!(
                 "{} was packed in an older format that can't be read before it is complete; \

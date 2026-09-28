@@ -217,6 +217,7 @@ impl Store {
         if !is_hash(&m.root) || !m.verify_root() {
             bail!("refusing to store a manifest whose root doesn't verify");
         }
+        crate::safety::check_manifest(m)?;
         self.check_allowed(&m.root)?;
         write_atomic(&self.manifest_path(&m.root), &serde_json::to_vec_pretty(m)?)
     }
@@ -227,6 +228,14 @@ impl Store {
         }
         self.check_allowed(root)?;
         fs::read(self.manifest_path(root)).with_context(|| format!("no manifest {root}"))
+    }
+
+    /// A manifest's bytes, to hand to someone else: refused if it lists unsafe files (it
+    /// may predate the check in [`Store::put_manifest`]).
+    pub fn get_safe_manifest_bytes(&self, root: &str) -> Result<Vec<u8>> {
+        let bytes = self.get_manifest_bytes(root)?;
+        crate::safety::check_manifest(&crate::manifest::parse(&bytes)?)?;
+        Ok(bytes)
     }
 
     pub fn get_manifest(&self, root: &str) -> Result<Manifest> {
