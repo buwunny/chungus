@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::manifest::Manifest;
+use crate::manifest::{BLOCK_BYTES, Manifest};
 use crate::net::{self, FetchStats};
 use crate::sign::{self, Signature};
 use crate::store::{self, Store};
@@ -83,12 +83,15 @@ pub struct Config {
     pub public: bool,
     /// Relay traffic for nodes behind NAT.
     pub relay_server: bool,
+    /// Raw bytes per announced block. Leave at 0 for [`BLOCK_BYTES`]; every node in a
+    /// swarm must use the same value, so change it only in tests.
+    pub block_bytes: u64,
 }
 
 enum Command {
     Providers(String, oneshot::Sender<Vec<PeerId>>),
     Request(PeerId, Request, oneshot::Sender<Result<Response>>),
-    Provide(String),
+    Announce,
     Addresses(oneshot::Sender<Vec<Multiaddr>>),
 }
 
@@ -98,6 +101,7 @@ enum Command {
 pub struct Node {
     tx: mpsc::UnboundedSender<Command>,
     pub peer_id: PeerId,
+    block_bytes: u64,
 }
 
 /// Load this node's identity from `path`, creating it on first use.
@@ -130,8 +134,21 @@ fn peer_of(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-fn root_key(root: &str) -> kad::RecordKey {
-    kad::RecordKey::new(&root)
+/// DHT keys. A model's root is announced by nodes that hold all of it, `manifest/<root>`
+/// by any node with its manifest, and each block id by nodes that hold that block.
+fn dht_key(key: &str) -> kad::RecordKey {
+    kad::RecordKey::new(&key)
+}
+
+fn holder_key(root: &str) -> String {
+    format!("manifest/{root}")
+}
+
+/// What this node knows it holds of one model.
+struct Held {
+    blocks: Vec<String>,
+    /// Blocks known to be complete.
+    done: HashSet<String>,
 }
 
 impl Node {
@@ -223,6 +240,11 @@ impl Node {
             let _ = swarm.behaviour_mut().kad.bootstrap();
         }
 
+        let block_bytes = if cfg.block_bytes == 0 {
+            BLOCK_BYTES
+        } else {
+            cfg.block_bytes
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let runner = Runner {
             swarm,
@@ -233,10 +255,16 @@ impl Node {
             providers: HashMap::new(),
             requests: HashMap::new(),
             provided: HashSet::new(),
+            held: HashMap::new(),
+            block_bytes,
             relays,
         };
         tokio::spawn(runner.run());
-        Ok(Node { tx, peer_id })
+        Ok(Node {
+            tx,
+            peer_id,
+            block_bytes,
+        })
     }
 
     fn send(&self, cmd: Command) -> Result<()> {
@@ -245,10 +273,20 @@ impl Node {
             .map_err(|_| anyhow!("the node has stopped"))
     }
 
-    /// Peers that announce `root` on the DHT, not counting this node.
+    /// Peers that hold all of model `root`, not counting this node.
     pub async fn providers(&self, root: &str) -> Result<Vec<PeerId>> {
+        self.providers_of(root).await
+    }
+
+    /// Peers that hold at least the manifest of `root`.
+    pub async fn holders(&self, root: &str) -> Result<Vec<PeerId>> {
+        self.providers_of(&holder_key(root)).await
+    }
+
+    /// Peers that announce DHT key `key`, not counting this node.
+    async fn providers_of(&self, key: &str) -> Result<Vec<PeerId>> {
         let (tx, rx) = oneshot::channel();
-        self.send(Command::Providers(root.to_string(), tx))?;
+        self.send(Command::Providers(key.to_string(), tx))?;
         Ok(rx.await?)
     }
 
@@ -258,9 +296,9 @@ impl Node {
         rx.await?
     }
 
-    /// Announce `root` now instead of at the next store rescan.
-    pub fn provide(&self, root: &str) -> Result<()> {
-        self.send(Command::Provide(root.to_string()))
+    /// Announce what the store holds now instead of at the next rescan.
+    pub fn announce(&self) -> Result<()> {
+        self.send(Command::Announce)
     }
 
     /// Addresses others can dial this node at, each ending in `/p2p/<peer id>`. Waits up
@@ -288,7 +326,10 @@ struct Runner {
     addrs: HashMap<PeerId, HashSet<Multiaddr>>,
     providers: HashMap<kad::QueryId, (HashSet<PeerId>, oneshot::Sender<Vec<PeerId>>)>,
     requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Response>>>,
+    /// DHT keys this node currently announces.
     provided: HashSet<String>,
+    held: HashMap<String, Held>,
+    block_bytes: u64,
     /// Relays to listen through: their address, and the listener while we have one.
     relays: HashMap<PeerId, (Multiaddr, Option<libp2p::core::transport::ListenerId>)>,
 }
@@ -309,37 +350,73 @@ impl Runner {
                     let _ = self.swarm.behaviour_mut().rr.send_response(channel, resp);
                 }
                 _ = rescan.tick() => {
-                    self.announce_new();
+                    self.announce();
                     self.reconnect_relays();
                 }
             }
         }
     }
 
-    /// Announce every model in the store that hasn't been announced yet. Kademlia
-    /// republishes the records it already has on its own.
-    fn announce_new(&mut self) {
+    /// Bring the DHT announcements in line with the store: every model's manifest, every
+    /// complete block, and the root of every complete model. Kademlia republishes the
+    /// records on its own; this adds new ones and withdraws those that no longer hold.
+    fn announce(&mut self) {
         let Ok(roots) = self.store.manifests() else {
             return;
         };
-        // Stop announcing models that left the store (deleted, or blocked).
-        let current: HashSet<&String> = roots.iter().collect();
-        let gone: Vec<String> = self
-            .provided
-            .iter()
-            .filter(|r| !current.contains(r))
-            .cloned()
-            .collect();
-        for root in gone {
+        let mut want = HashSet::new();
+        for root in &roots {
+            want.insert(holder_key(root));
+            let held = match self.held.get_mut(root) {
+                Some(h) => h,
+                None => {
+                    let Ok(m) = self.store.get_manifest(root) else {
+                        continue;
+                    };
+                    let blocks = m.blocks(self.block_bytes);
+                    self.held.entry(root.clone()).or_insert(Held {
+                        blocks: blocks.iter().map(|b| b.id.clone()).collect(),
+                        done: HashSet::new(),
+                    })
+                }
+            };
+            if held.done.len() < held.blocks.len() {
+                // Only models still downloading need their chunks checked again.
+                if let Ok(m) = self.store.get_manifest(root) {
+                    for b in m.blocks(self.block_bytes) {
+                        if !held.done.contains(&b.id)
+                            && b.chunks.iter().all(|c| self.store.contains(&c.hash))
+                        {
+                            held.done.insert(b.id);
+                        }
+                    }
+                }
+            }
+            want.extend(held.done.iter().cloned());
+            if held.done.len() == held.blocks.len() {
+                want.insert(root.clone());
+            }
+        }
+        self.held.retain(|r, _| roots.contains(r));
+
+        let stale: Vec<String> = self.provided.difference(&want).cloned().collect();
+        for key in stale {
             self.swarm
                 .behaviour_mut()
                 .kad
-                .stop_providing(&root_key(&root));
-            self.provided.remove(&root);
+                .stop_providing(&dht_key(&key));
+            self.provided.remove(&key);
         }
-        for root in roots {
-            if !self.provided.contains(&root) {
-                self.provide(root);
+        for key in want {
+            if !self.provided.contains(&key)
+                && self
+                    .swarm
+                    .behaviour_mut()
+                    .kad
+                    .start_providing(dht_key(&key))
+                    .is_ok()
+            {
+                self.provided.insert(key);
             }
         }
     }
@@ -357,26 +434,10 @@ impl Runner {
         }
     }
 
-    fn provide(&mut self, root: String) {
-        if self
-            .swarm
-            .behaviour_mut()
-            .kad
-            .start_providing(root_key(&root))
-            .is_ok()
-        {
-            self.provided.insert(root);
-        }
-    }
-
     fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Providers(root, tx) => {
-                let id = self
-                    .swarm
-                    .behaviour_mut()
-                    .kad
-                    .get_providers(root_key(&root));
+            Command::Providers(key, tx) => {
+                let id = self.swarm.behaviour_mut().kad.get_providers(dht_key(&key));
                 self.providers.insert(id, (HashSet::new(), tx));
             }
             Command::Request(peer, req, tx) => {
@@ -392,7 +453,7 @@ impl Runner {
                     .send_request_with_addresses(&peer, req, addrs);
                 self.requests.insert(id, tx);
             }
-            Command::Provide(root) => self.provide(root),
+            Command::Announce => self.announce(),
             Command::Addresses(tx) => {
                 let me = *self.swarm.local_peer_id();
                 let mut addrs: Vec<Multiaddr> = self
@@ -544,9 +605,11 @@ fn answer(store: &Store, req: Request) -> Response {
     }
 }
 
-/// Download model `root` from whoever provides it on the DHT. As with a LAN fetch, the
-/// manifest must hash to `root` and every chunk to its hash, and when `trust` is
-/// non-empty one of those keys must have signed the manifest before any chunk is fetched.
+/// Download model `root` from whoever has it on the DHT: nodes with the whole model, and
+/// nodes with some of its blocks (typically ones still downloading it themselves). As with
+/// a LAN fetch, the manifest must hash to `root` and every chunk to its hash, and when
+/// `trust` is non-empty one of those keys must have signed the manifest before any chunk
+/// is fetched.
 pub async fn fetch(
     node: &Node,
     root: &str,
@@ -557,13 +620,20 @@ pub async fn fetch(
         bail!("{root:?} is not a manifest root hash");
     }
     let started = Instant::now();
-    let providers = node.providers(root).await?;
+    let (complete, holders) = tokio::try_join!(node.providers(root), node.holders(root))?;
+    // Nodes with the whole model first; anyone with the manifest can supply it.
+    let mut peers = complete.clone();
+    for p in holders {
+        if !peers.contains(&p) {
+            peers.push(p);
+        }
+    }
 
     let manifest = match store.get_manifest(root) {
         Ok(m) => m,
         Err(_) => {
             let mut found = None;
-            for &p in &providers {
+            for &p in &peers {
                 if let Ok(Response::Manifest(Some(bytes))) =
                     node.request(p, Request::Manifest(root.to_string())).await
                     && let Ok(m) = serde_json::from_slice::<Manifest>(&bytes)
@@ -576,15 +646,15 @@ pub async fn fetch(
             }
             match found {
                 Some(m) => m,
-                None if providers.is_empty() => bail!("nobody on the network is sharing {root}"),
-                None => bail!("no provider sent a valid manifest for {root}"),
+                None if peers.is_empty() => bail!("nobody on the network is sharing {root}"),
+                None => bail!("no peer sent a valid manifest for {root}"),
             }
         }
     };
     store.put_manifest(&manifest)?;
 
     let mut sigs = Vec::new();
-    for &p in &providers {
+    for &p in &peers {
         if let Ok(Response::Signatures(s)) =
             node.request(p, Request::Signatures(root.to_string())).await
         {
@@ -596,11 +666,50 @@ pub async fn fetch(
         bail!("no trusted key has signed {root}; refusing to download it");
     }
 
-    let mut stats = net::fetch_chunks_with(
+    // Look up who holds each block we still need. Blocks we already have need no lookup.
+    let blocks = manifest.blocks(node.block_bytes);
+    let needed: Vec<usize> = (0..blocks.len())
+        .filter(|&i| blocks[i].chunks.iter().any(|c| !store.contains(&c.hash)))
+        .collect();
+    let any_needed = !needed.is_empty();
+    let found: Vec<(usize, Vec<PeerId>)> = futures::stream::iter(needed)
+        .map(|i| {
+            let key = blocks[i].id.clone();
+            async move { (i, node.providers_of(&key).await.unwrap_or_default()) }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    let mut block_peers: Vec<Vec<PeerId>> = vec![Vec::new(); blocks.len()];
+    for (i, p) in found {
+        block_peers[i] = p;
+    }
+    let block_of: HashMap<&str, usize> = blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| b.chunks.iter().map(move |c| (c.hash.as_str(), i)))
+        .collect();
+    if any_needed && complete.is_empty() && block_peers.iter().all(Vec::is_empty) {
+        bail!("nobody on the network has the chunks of {root}");
+    }
+
+    let sources = |hash: &str| -> Vec<PeerId> {
+        // Holders of the chunk's block, then holders of the whole model.
+        let mut order = block_of
+            .get(hash)
+            .map(|&i| net::rotated(&block_peers[i], hash))
+            .unwrap_or_default();
+        for p in net::rotated(&complete, hash) {
+            if !order.contains(&p) {
+                order.push(p);
+            }
+        }
+        order
+    };
+    let mut stats = net::fetch_chunks_from(
         &store,
         manifest.files.iter().flat_map(|f| &f.chunks),
-        &providers,
-        &[],
+        sources,
         |peer, hash| {
             let node = node.clone();
             async move {

@@ -2,7 +2,7 @@
 
 A peer-to-peer network for distributing AI models, their runtimes and Docker AI images. Think of it as a decentralized Hugging Face with its own take on Xet-style storage.
 
-This repository currently holds **milestones 1 to 3** and most of milestone 4: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, signed models, sharing over the internet, and a registry for names, search and blocklists.
+This repository currently holds **milestones 1 to 4**: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, signed models, sharing over the internet, and a registry for names, search and blocklists.
 
 ## The pipeline
 
@@ -110,6 +110,8 @@ chungus node --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... \
 chungus fetch <root> --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... -o model/
 ```
 
+Models are announced at two levels. A node with the whole model announces its root; every node also announces each 64 MB block of a model it holds in full. A fetcher asks the DHT for both, so peers that are still downloading a model already serve the parts they have, and the swarm grows during a flash crowd instead of waiting for complete copies. Announcing blocks rather than individual chunks keeps the DHT small: a 140 GB model is about 2,200 blocks but 2 million chunks.
+
 A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute. There are no public bootstrap nodes yet, so someone has to run the first one.
 
 ## The registry: names, search and the blocklist
@@ -147,7 +149,7 @@ A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatu
 | **M1** (done) | Storage format, `pack` / `unpack` / `bench` |
 | **M2** (done) | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
-| M4 | Signed models, internet swarm over libp2p, registry with a transparency log, search and blocklist (done); 64 MB block announcements |
+| **M4** (done) | Signed models, internet swarm over libp2p with 64 MB block announcements, registry with a transparency log, search and blocklist |
 | Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 
 The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.

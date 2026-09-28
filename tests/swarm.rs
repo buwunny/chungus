@@ -83,7 +83,7 @@ async fn fetch_through_the_dht() {
         ..Default::default()
     };
     let (seed, _) = node(&seed_store, join.clone()).await;
-    seed.provide(&m.root).unwrap();
+    seed.announce().unwrap();
     let local = store(&tmp.path().join("local"));
     let (fetcher, _) = node(&local, join).await;
     wait_for_providers(&fetcher, &m.root).await;
@@ -146,7 +146,7 @@ async fn fetch_from_a_node_reachable_only_through_a_relay() {
             .all(|a| a.to_string().contains("p2p-circuit")),
         "{seed_addrs:?}"
     );
-    seed.provide(&m.root).unwrap();
+    seed.announce().unwrap();
 
     let local = store(&tmp.path().join("local"));
     let (fetcher, _) = node(
@@ -163,4 +163,102 @@ async fn fetch_from_a_node_reachable_only_through_a_relay() {
         .await
         .unwrap();
     chungus::unpack(&got, &local, &tmp.path().join("out")).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_with_part_of_a_model_serves_its_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let block_bytes = 256 << 10;
+    let seed_store = store(&tmp.path().join("seed"));
+    let (m, _) = chungus::pack(&model, &seed_store).unwrap();
+    seed_store.put_manifest(&m).unwrap();
+
+    // The partial node has the manifest and only the first half of the blocks.
+    let partial_store = store(&tmp.path().join("partial"));
+    partial_store.put_manifest(&m).unwrap();
+    let blocks = m.blocks(block_bytes);
+    assert!(blocks.len() >= 4, "{} blocks", blocks.len());
+    for b in &blocks[..blocks.len() / 2] {
+        for c in &b.chunks {
+            partial_store
+                .put(&c.hash, &seed_store.get(&c.hash).unwrap())
+                .unwrap();
+        }
+    }
+
+    let (_boot, boot_addrs) = node(
+        &store(&tmp.path().join("boot")),
+        Config {
+            listen: tcp(),
+            public: true,
+            block_bytes,
+            ..Default::default()
+        },
+    )
+    .await;
+    let join = Config {
+        listen: tcp(),
+        public: true,
+        bootstrap: boot_addrs,
+        block_bytes,
+        ..Default::default()
+    };
+    let (seed, _) = node(&seed_store, join.clone()).await;
+    let (partial, _) = node(&partial_store, join.clone()).await;
+    seed.announce().unwrap();
+    partial.announce().unwrap();
+    let local = store(&tmp.path().join("local"));
+    let (fetcher, _) = node(&local, join).await;
+    wait_for_providers(&fetcher, &m.root).await;
+    for _ in 0..50 {
+        if fetcher.holders(&m.root).await.unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Only the seed claims the whole model; both hold the manifest.
+    assert_eq!(fetcher.providers(&m.root).await.unwrap(), [seed.peer_id]);
+    assert_eq!(fetcher.holders(&m.root).await.unwrap().len(), 2);
+
+    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[])
+        .await
+        .unwrap();
+    assert_eq!(stats.rejected, 0);
+    assert!(
+        stats
+            .bytes_by_source
+            .contains_key(&partial.peer_id.to_string()),
+        "{:?}",
+        stats.bytes_by_source
+    );
+    chungus::unpack(&got, &local, &tmp.path().join("out")).unwrap();
+}
+
+#[test]
+fn blocks_cover_every_unique_chunk_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let s = store(&tmp.path().join("s"));
+    let (m, _) = chungus::pack(&model, &s).unwrap();
+    let blocks = m.blocks(256 << 10);
+    let mut seen = std::collections::HashSet::new();
+    for b in &blocks {
+        for c in &b.chunks {
+            assert!(seen.insert(c.hash.clone()));
+        }
+    }
+    let unique: std::collections::HashSet<_> = m
+        .files
+        .iter()
+        .flat_map(|f| &f.chunks)
+        .map(|c| &c.hash)
+        .collect();
+    assert_eq!(seen.len(), unique.len());
+    // Block ids are stable.
+    let again = m.blocks(256 << 10);
+    assert!(blocks.iter().zip(&again).all(|(a, b)| a.id == b.id));
 }
