@@ -435,6 +435,7 @@ impl FromArgs {
         Ok(peers)
     }
 
+    #[cfg(target_os = "linux")]
     fn origin(&self) -> Vec<String> {
         self.origin.iter().cloned().collect()
     }
