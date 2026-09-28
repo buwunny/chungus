@@ -294,6 +294,9 @@ where
             wanted.push((c.hash.clone(), c.len as usize));
         }
     }
+    if let Some((h, _)) = wanted.iter().find(|(h, _)| store.is_blocked(h)) {
+        bail!("this model contains chunk {h}, which is on the blocklist");
+    }
     let mut stats = FetchStats {
         chunks: wanted.len(),
         ..Default::default()

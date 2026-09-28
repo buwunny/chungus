@@ -322,6 +322,21 @@ impl Runner {
         let Ok(roots) = self.store.manifests() else {
             return;
         };
+        // Stop announcing models that left the store (deleted, or blocked).
+        let current: HashSet<&String> = roots.iter().collect();
+        let gone: Vec<String> = self
+            .provided
+            .iter()
+            .filter(|r| !current.contains(r))
+            .cloned()
+            .collect();
+        for root in gone {
+            self.swarm
+                .behaviour_mut()
+                .kad
+                .stop_providing(&root_key(&root));
+            self.provided.remove(&root);
+        }
         for root in roots {
             if !self.provided.contains(&root) {
                 self.provide(root);

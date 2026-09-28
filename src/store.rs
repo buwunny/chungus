@@ -8,9 +8,11 @@
 //! width for `PlaneZstd` and the float kind for `ExponentZstd`.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use crate::manifest::Manifest;
 use crate::segment::Dtype;
@@ -105,6 +107,8 @@ pub fn is_hash(s: &str) -> bool {
 /// On-disk layout: `chunks/<hh>/<hash>` for blobs, `manifests/<root>.json` for manifests.
 pub struct Store {
     root: PathBuf,
+    /// Manifest roots and chunk hashes this store refuses to hold or hand out.
+    blocked: RwLock<HashSet<String>>,
 }
 
 impl Store {
@@ -114,7 +118,34 @@ impl Store {
         fs::create_dir_all(root.join("manifests"))?;
         Ok(Store {
             root: root.to_path_buf(),
+            blocked: Default::default(),
         })
+    }
+
+    /// Replace the blocklist, and delete any blocked chunks and manifests already on disk.
+    /// Returns how many were deleted.
+    pub fn set_blocked(&self, hashes: HashSet<String>) -> usize {
+        let mut removed = 0;
+        for h in hashes.iter().filter(|h| is_hash(h)) {
+            for path in [self.path(h), self.manifest_path(h)] {
+                if fs::remove_file(path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        *self.blocked.write().unwrap() = hashes;
+        removed
+    }
+
+    pub fn is_blocked(&self, hash: &str) -> bool {
+        self.blocked.read().unwrap().contains(hash)
+    }
+
+    fn check_allowed(&self, hash: &str) -> Result<()> {
+        if self.is_blocked(hash) {
+            bail!("{hash} is on the blocklist");
+        }
+        Ok(())
     }
 
     /// The store's directory.
@@ -127,7 +158,7 @@ impl Store {
     }
 
     pub fn contains(&self, hash: &str) -> bool {
-        is_hash(hash) && self.path(hash).exists()
+        is_hash(hash) && !self.is_blocked(hash) && self.path(hash).exists()
     }
 
     /// Write a blob unless it's already present. Returns true if it was new.
@@ -135,6 +166,7 @@ impl Store {
         if !is_hash(hash) {
             bail!("invalid chunk hash {hash:?}");
         }
+        self.check_allowed(hash)?;
         let path = self.path(hash);
         if path.exists() {
             return Ok(false);
@@ -159,6 +191,7 @@ impl Store {
         if !is_hash(hash) {
             bail!("invalid chunk hash {hash:?}");
         }
+        self.check_allowed(hash)?;
         fs::read(self.path(hash)).with_context(|| format!("missing chunk {hash}"))
     }
 
@@ -170,6 +203,7 @@ impl Store {
         if !is_hash(&m.root) || !m.verify_root() {
             bail!("refusing to store a manifest whose root doesn't verify");
         }
+        self.check_allowed(&m.root)?;
         write_atomic(&self.manifest_path(&m.root), &serde_json::to_vec_pretty(m)?)
     }
 
@@ -177,6 +211,7 @@ impl Store {
         if !is_hash(root) {
             bail!("invalid manifest root {root:?}");
         }
+        self.check_allowed(root)?;
         fs::read(self.manifest_path(root)).with_context(|| format!("no manifest {root}"))
     }
 
@@ -228,6 +263,7 @@ impl Store {
             let name = entry?.file_name().to_string_lossy().into_owned();
             if let Some(root) = name.strip_suffix(".json")
                 && is_hash(root)
+                && !self.is_blocked(root)
             {
                 roots.push(root.to_string());
             }
