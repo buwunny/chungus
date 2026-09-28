@@ -1,51 +1,59 @@
 # chungus
 
-A byte-level deduplicating front-proxy and P2P mesh for OCI registries. chungus cuts WAN egress and pull times for standard container images and OCI-packaged AI models. It needs no image conversion and no changes to how images are built.
+A peer-to-peer network for distributing AI models, their runtimes and Docker AI images. Think of it as a decentralized Hugging Face with its own take on Xet-style storage.
 
-When a 10 GB layer changes slightly, chungus transfers only the changed chunks instead of the whole layer.
+This repository currently holds **milestone 1**: the storage format and a benchmark tool. Networking comes next.
 
-## How it works
+## The pipeline
 
-- **Content-defined chunking:** Layers are decompressed and split with FastCDC. Only chunks the node doesn't already have cross the WAN.
-- **Metadata Recipes:** For each layer, the server stores the ordered chunk hashes, the tar and compression metadata, and an encoder fingerprint. Nodes use the recipe to rebuild the layer exactly.
-- **Front-proxy topology:** chungus sits in front of your existing registry of record (ECR, Harbor, Docker Hub, GHCR). The upstream registry still controls authorization: chungus relays its bearer-token challenges and checks every request against it.
-- **Cold pulls:** The first time an image is pulled, the original blob streams straight through with no added latency. Chunking and verification happen in the background.
+```
+model files ─► segments ─► FastCDC chunks ─► BLAKE3 ─► float transform ─► zstd ─► chunk store
+              (per tensor)   (~64 KiB)       (raw bytes)  (exponent split)
+```
 
-## Node delivery modes
+1. **Segments.** Safetensors files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
+2. **Content-defined chunking.** FastCDC cuts each segment into chunks of 16–256 KiB (64 KiB average). Cut points inside float tensors are rounded to whole elements.
+3. **Hashing.** Each chunk is addressed by the BLAKE3 hash of its *raw* bytes. Identical chunks are stored once, across files and across models.
+4. **Float transform.** For BF16 and F32 tensors, each element is rearranged into an exponent byte and sign+mantissa bytes, then grouped into planes. Exponents are low-entropy and compress well. This is lossless: unpacking gives back the exact bits.
+5. **zstd.** Each chunk is compressed on its own so any chunk can be read independently. The encoder keeps whichever of {stored, zstd, transform + zstd} is smallest.
 
-| Mode | Setup | How layers are delivered |
-|---|---|---|
-| **Mirror** (default) | containerd `hosts.toml` mirror only | Recompresses chunks byte-for-byte to match the compressed digest. Speed is limited by single-core gzip. |
-| **Snapshotter** | containerd remote snapshotter DaemonSet | Rebuilds the uncompressed tar and verifies it against `diff_id`. No recompression, so speed is limited only by network and disk. |
+## Usage
 
-In Mirror Mode, an **Adaptive Path Planner** chooses per layer between chunk reconstruction and a native blob pull, using measured bandwidth and recompression rate. Mirror Mode is therefore never meaningfully slower than a native pull. Set `optimize_for = "egress"` to always deduplicate.
+```sh
+cargo build --release
 
-## Where it helps
+# Pack a model directory into a shared chunk store and write its manifest
+./target/release/chungus pack path/to/model --store .chungus/store -o model.manifest.json
 
-- Edge and remote sites on constrained links (≤ 500 Mbps)
-- Cross-region and cross-cloud pulls where egress fees dominate
-- Fast datacenter links, when using Snapshotter Mode
-- Many nodes pulling the same update over a shared link (P2P)
+# Rebuild it (every chunk and every file is verified against its hash)
+./target/release/chungus unpack model.manifest.json --store .chungus/store -o restored/
 
-## Components
+# Measure compression and dedup without writing anything
+./target/release/chungus bench path/to/base-model path/to/fine-tune
+```
 
-- **`chungusd`:** A single daemon that runs as `--mode proxy` on nodes or `--mode server` next to the upstream registry. It contains the chunking engine, the planner, the cache, and libp2p networking. Pass `--snapshotter` to enable the snapshotter.
-- **`chungus-cli`:** Admin tool for health checks, dedup metrics, GC, and index inspection.
+No model handy? Generate a synthetic BF16 file:
 
-All networking runs on rust-libp2p: QUIC, with TCP fallback. P2P chunk requests use short-lived JWTs bound to the requester's PeerId.
+```sh
+cargo run --release --example synth -- synthetic.safetensors 64   # 64M parameters
+```
 
-## Key risk
+## What to expect
 
-OCI digests require byte-exact reproduction of compressed layers, and different gzip implementations produce different bytes. chungus includes a Rust port of Go's `compress/flate` and verifies every layer at ingest. If reproduction fails, that layer is stored unchunked. Snapshotter Mode verifies against uncompressed digests, so this risk does not affect it.
+On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports zstd alone at 78% of the original size and the full pipeline at 73%. Real models usually compress somewhat better than synthetic ones. Published results (ZipNN, DFloat11) put BF16 near 67–70% of original size. Models already quantized to 4 bits barely compress. Dedup savings depend on how much two models actually share: re-uploads and format copies dedup almost completely, and full fine-tunes dedup very little.
+
+## Manifest
+
+A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that and is the value an author will sign in a later milestone.
 
 ## Roadmap
 
-| Phase | Scope |
+| Milestone | Scope |
 |---|---|
-| 0 | Offline spikes: digest reproduction (≥ 85% of bytes) and dedup ratio (≥ 70% savings) |
-| 1 | MVP: read-only Mirror Mode pull-through cache, Adaptive Path Planner, CPU budget |
-| 2 | Snapshotter Mode |
-| 3 | P2P swarming and push path (CI uses a 1-line image retag to a local proxy) |
-| 4 | Lazy pulling |
+| **M1** (this) | Storage format, `pack` / `unpack` / `bench` |
+| M2 | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
+| M3 | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
+| M4 | Internet swarm, signed publishing, registry and search |
+| Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 
-See [idea.md](idea.md) for the full design.
+The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.
