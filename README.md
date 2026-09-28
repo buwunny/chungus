@@ -46,6 +46,8 @@ cargo build --release
 ./target/release/chungus bench path/to/base-model path/to/fine-tune
 ```
 
+`uv run bench/run.py` runs the benchmark suite on real models from Hugging Face: storage saved per dtype, dedup between versions, and download time direct vs through chungus. See [docs/benchmarks.md](docs/benchmarks.md).
+
 ## Sharing on a LAN
 
 One machine packs a model and serves its store. It advertises itself over mDNS, so others on the same network find it without configuration.

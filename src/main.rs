@@ -53,9 +53,13 @@ enum Cmd {
         store: PathBuf,
     },
     /// Report compression and dedup ratios for one or more models, without writing.
+    /// With several inputs, each is deduplicated against the ones before it.
     Bench {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
+        /// Print the full report as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Share this store with peers on the LAN (read-only HTTP, advertised over mDNS).
     Serve {
@@ -566,8 +570,12 @@ async fn main() -> Result<()> {
                 println!("{root}  {:>10.1} MB  {}", mb(size), names.join(", "));
             }
         }
-        Cmd::Bench { inputs } => {
+        Cmd::Bench { inputs, json } => {
             let r = chungus::bench(&inputs)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
             let row = |name: &str, bytes: u64| {
                 println!(
                     "{name:<28} {:>12.1} MB  {:>6.1}%",
@@ -585,8 +593,32 @@ async fn main() -> Result<()> {
                 r.unique_chunks,
                 pct(r.unique_raw_bytes, r.raw_bytes)
             );
+            if r.by_dtype.len() > 1 {
+                println!("by dtype (zstd only / transform + zstd, % of raw):");
+                for (dtype, d) in &r.by_dtype {
+                    println!(
+                        "  {dtype:<8} {:>12.1} MB  {:>6.1}%  {:>6.1}%",
+                        mb(d.raw_bytes),
+                        pct(d.zstd_bytes, d.raw_bytes),
+                        pct(d.encoded_bytes, d.raw_bytes)
+                    );
+                }
+            }
+            if r.inputs.len() > 1 {
+                println!("per input, deduplicated against the inputs before it:");
+                for i in &r.inputs {
+                    println!(
+                        "  {:>10.1} MB raw, {:>5.1}% new, {:>10.1} MB to fetch  {}",
+                        mb(i.raw_bytes),
+                        pct(i.new_raw_bytes, i.raw_bytes),
+                        mb(i.new_stored_bytes),
+                        i.path
+                    );
+                }
+            }
             println!(
-                "encode {:.0} MB/s, decode {:.0} MB/s (raw bytes, all cores)",
+                "MB/s of raw bytes: chunk {:.0} (one core), hash + encode {:.0}, decode {:.0} (all cores)",
+                mb(r.raw_bytes) / r.chunk_secs.max(1e-9),
                 mb(r.raw_bytes) / r.encode_secs.max(1e-9),
                 mb(r.raw_bytes) / r.decode_secs.max(1e-9)
             );

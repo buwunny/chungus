@@ -172,7 +172,7 @@ pub fn unpack(manifest: &Manifest, store: &Store, out: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, serde::Serialize)]
 pub struct BenchReport {
     pub raw_bytes: u64,
     /// zstd on every chunk, no transform, no dedup: the baseline.
@@ -184,8 +184,33 @@ pub struct BenchReport {
     pub unique_raw_bytes: u64,
     pub chunks: u64,
     pub unique_chunks: u64,
+    /// Wall time of FastCDC over every file.
+    pub chunk_secs: f64,
+    /// Wall time of BLAKE3 plus choosing and writing the best encoding, as `pack` does.
     pub encode_secs: f64,
     pub decode_secs: f64,
+    /// One row per input, in order. Each counts only chunks no earlier input had, so the
+    /// second of two model versions shows what downloading it after the first would cost.
+    pub inputs: Vec<InputReport>,
+    /// Totals per tensor dtype ("raw" is headers, non-safetensors files and other types).
+    pub by_dtype: std::collections::BTreeMap<String, DtypeReport>,
+}
+
+#[derive(Default, Debug, serde::Serialize)]
+pub struct InputReport {
+    pub path: String,
+    pub raw_bytes: u64,
+    /// Raw bytes in chunks that no earlier input (or earlier part of this one) had.
+    pub new_raw_bytes: u64,
+    /// Encoded size of those new chunks: what fetching this input would transfer.
+    pub new_stored_bytes: u64,
+}
+
+#[derive(Default, Debug, serde::Serialize)]
+pub struct DtypeReport {
+    pub raw_bytes: u64,
+    pub zstd_bytes: u64,
+    pub encoded_bytes: u64,
 }
 
 /// Measure the pipeline on inputs without writing a store.
@@ -193,30 +218,55 @@ pub fn bench(inputs: &[PathBuf]) -> Result<BenchReport> {
     let mut r = BenchReport::default();
     let mut seen = HashSet::new();
     for input in inputs {
+        let mut row = InputReport {
+            path: input.display().to_string(),
+            ..Default::default()
+        };
         for (path, _) in list_files(input)? {
             let data = read(&path)?;
+            let t = std::time::Instant::now();
             let spans = chunk::chunk(&data, &file_segments(&path, &data)?);
+            r.chunk_secs += t.elapsed().as_secs_f64();
+
             let t = std::time::Instant::now();
             let rows = spans
                 .par_iter()
                 .map(|s| -> Result<_> {
                     let raw = &data[s.start..s.end];
                     let hash = *blake3::hash(raw).as_bytes();
-                    let zstd = zstd::bulk::compress(raw, 3)?.len() as u64;
-                    let blob = store::encode(raw, s.dtype)?;
-                    Ok((hash, raw.len() as u64, zstd, blob))
+                    Ok((hash, s, store::encode(raw, s.dtype)?))
                 })
                 .collect::<Result<Vec<_>>>()?;
             r.encode_secs += t.elapsed().as_secs_f64();
 
             let t = std::time::Instant::now();
             rows.par_iter()
-                .map(|(_, len, _, blob)| store::decode(blob, *len as usize).map(|_| ()))
+                .map(|(_, s, blob)| store::decode(blob, s.end - s.start).map(|_| ()))
                 .collect::<Result<()>>()?;
             r.decode_secs += t.elapsed().as_secs_f64();
 
+            // The baseline, outside the timed passes.
+            let zstd = spans
+                .par_iter()
+                .map(|s| {
+                    Ok(
+                        zstd::bulk::compress(&data[s.start..s.end], store::ZSTD_LEVEL)?.len()
+                            as u64,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+
             r.raw_bytes += data.len() as u64;
-            for (hash, len, zstd, blob) in rows {
+            row.raw_bytes += data.len() as u64;
+            for ((hash, s, blob), zstd) in rows.into_iter().zip(zstd) {
+                let len = (s.end - s.start) as u64;
+                let d = r
+                    .by_dtype
+                    .entry(format!("{:?}", s.dtype).to_lowercase())
+                    .or_default();
+                d.raw_bytes += len;
+                d.zstd_bytes += zstd;
+                d.encoded_bytes += blob.len() as u64;
                 r.chunks += 1;
                 r.zstd_bytes += zstd;
                 r.encoded_bytes += blob.len() as u64;
@@ -224,9 +274,12 @@ pub fn bench(inputs: &[PathBuf]) -> Result<BenchReport> {
                     r.unique_chunks += 1;
                     r.unique_raw_bytes += len;
                     r.dedup_bytes += blob.len() as u64;
+                    row.new_raw_bytes += len;
+                    row.new_stored_bytes += blob.len() as u64;
                 }
             }
         }
+        r.inputs.push(row);
     }
     Ok(r)
 }

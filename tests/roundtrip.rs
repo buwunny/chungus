@@ -109,3 +109,42 @@ fn pack_unpack_is_bit_identical_and_dedups() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn bench_counts_each_input_against_the_ones_before() {
+    let dir = std::env::temp_dir().join(format!("chungus-bench-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let (base, tuned) = (dir.join("base"), dir.join("tuned"));
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&tuned).unwrap();
+    let layers = [("a.weight", 700_000), ("b.weight", 300_000)];
+    write_model(&base.join("model.safetensors"), &layers, 7);
+    // Same first tensor, retrained second one.
+    let mut bytes = fs::read(base.join("model.safetensors")).unwrap();
+    let tail = bytes.len() - 600_000;
+    for b in &mut bytes[tail..] {
+        *b = b.wrapping_add(1);
+    }
+    fs::write(tuned.join("model.safetensors"), bytes).unwrap();
+
+    let r = chungus::bench(&[base.clone(), tuned.clone()]).unwrap();
+    assert_eq!(r.inputs.len(), 2);
+    let (a, b) = (&r.inputs[0], &r.inputs[1]);
+    assert_eq!(a.new_raw_bytes, a.raw_bytes);
+    // Only the changed tensor (plus the chunk the change starts in) is new.
+    assert!(
+        b.new_raw_bytes > 500_000 && b.new_raw_bytes < 800_000,
+        "{b:?}"
+    );
+    assert_eq!(r.unique_raw_bytes, a.new_raw_bytes + b.new_raw_bytes);
+    assert_eq!(r.dedup_bytes, a.new_stored_bytes + b.new_stored_bytes);
+    let bf16 = &r.by_dtype["bf16"];
+    assert_eq!(bf16.raw_bytes, 2 * 2_000_000);
+    assert!(bf16.encoded_bytes < bf16.zstd_bytes, "{bf16:?}");
+
+    // The same model twice is entirely deduplicated.
+    let r = chungus::bench(&[base.clone(), base.clone()]).unwrap();
+    assert_eq!(r.inputs[1].new_raw_bytes, 0);
+
+    fs::remove_dir_all(&dir).unwrap();
+}

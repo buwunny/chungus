@@ -3,3 +3,4 @@ images/
 .chungus/
 deploy/node.env
 deploy/.env
+bench/.cache/
