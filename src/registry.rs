@@ -454,7 +454,7 @@ impl Log {
                 _ => false,
             })
             .collect();
-        hits.sort_by(|a, b| b.statement.time.cmp(&a.statement.time));
+        hits.sort_by_key(|e| std::cmp::Reverse(e.statement.time));
         hits.into_iter().map(Hit::from).collect()
     }
 }
