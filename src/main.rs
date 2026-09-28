@@ -2,7 +2,10 @@
 //!
 //! Usage: chungus <layer.tar.gz>...
 
+use chungus::oci::Descriptor;
 use chungus::oci::Layout;
+use std::collections::HashSet;
+use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -55,10 +58,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn verify(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     let layout = Layout::new(dir);
     let index = layout.index()?;
-    let manifest_desc = index
-        .manifests
-        .first()
-        .ok_or("index.json has no manifests")?;
+    let mut all_ok = true;
+    let mut seen = HashSet::new();
+    for manifest_desc in &index.manifests {
+        println!(
+            "checking manifest {}",
+            manifest_desc.ref_name().unwrap_or("<untagged>")
+        );
+        all_ok &= verify_image(&layout, manifest_desc, &mut seen)?;
+    }
+    Ok(all_ok)
+}
+
+fn verify_image(
+    layout: &Layout,
+    manifest_desc: &Descriptor,
+    seen: &mut HashSet<String>,
+) -> Result<bool, Box<dyn Error>> {
     let manifest = layout.manifest(manifest_desc)?;
     let config = layout.config(&manifest.config)?;
 
@@ -68,6 +84,10 @@ fn verify(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
 
     let mut all_ok = true;
     for (layer, expected_diff_id) in manifest.layers.iter().zip(&config.rootfs.diff_ids) {
+        if !seen.insert(layer.digest.clone()) {
+            println!("already verified layer");
+            continue;
+        }
         let mut layer_ok = true;
         println!("checking layer {}", layer.digest);
         if layer.media_type != "application/vnd.oci.image.layer.v1.tar+gzip"

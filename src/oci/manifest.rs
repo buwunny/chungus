@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 /// A pointer to a blob: what kind it is, its digest, and its size.
@@ -7,6 +9,16 @@ pub struct Descriptor {
     pub media_type: String,
     pub digest: String,
     pub size: u64,
+    #[serde(default)]
+    pub annotations: HashMap<String, String>,
+}
+
+impl Descriptor {
+    pub fn ref_name(&self) -> Option<&str> {
+        self.annotations
+            .get("org.opencontainers.image.ref.name")
+            .map(|s| s.as_str())
+    }
 }
 
 /// `index.json` at the root of the layout.
