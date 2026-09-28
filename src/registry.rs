@@ -67,6 +67,12 @@ pub enum Claim {
     Unblock {
         hash: String,
     },
+    /// The operator's list of anchor nodes (multiaddrs ending in `/p2p/<peer id>`), which
+    /// replaces any earlier list. Nodes ask anchors alongside the DHT, so an attacker who
+    /// fills the DHT around a model still can't hide it.
+    Anchors {
+        addrs: Vec<String>,
+    },
 }
 
 /// A claim, when it was made, and the signature of the key that made it.
@@ -179,6 +185,19 @@ pub fn parse_ref(s: &str) -> Result<(String, String)> {
     Ok((name.to_string(), rev.to_string()))
 }
 
+const MAX_ANCHORS: usize = 64;
+
+/// An anchor must be a multiaddr that names its peer, so nodes know whom they reach.
+fn valid_anchor(addr: &str) -> Result<libp2p::Multiaddr> {
+    let a: libp2p::Multiaddr = addr
+        .parse()
+        .with_context(|| format!("{addr} is not a multiaddr"))?;
+    if !matches!(a.iter().last(), Some(libp2p::multiaddr::Protocol::P2p(_))) {
+        bail!("{addr} must end in /p2p/<peer id>");
+    }
+    Ok(a)
+}
+
 fn org_of(name: &str) -> &str {
     name.split_once('/').map(|(o, _)| o).unwrap_or(name)
 }
@@ -194,6 +213,8 @@ pub struct Log {
     /// (name, rev) -> index of the publish entry that currently defines it.
     names: BTreeMap<(String, String), usize>,
     blocked: HashSet<String>,
+    /// Index of the latest anchors entry.
+    anchors: Option<usize>,
     seen: HashSet<String>,
 }
 
@@ -270,6 +291,17 @@ impl Log {
                     bail!("invalid hash");
                 }
             }
+            Claim::Anchors { addrs } => {
+                if key != self.operator {
+                    bail!("only the registry operator can set the anchors");
+                }
+                if addrs.len() > MAX_ANCHORS {
+                    bail!("at most {MAX_ANCHORS} anchors");
+                }
+                for a in addrs {
+                    valid_anchor(a)?;
+                }
+            }
         }
         Ok(())
     }
@@ -308,6 +340,9 @@ impl Log {
             }
             Claim::Unblock { hash } => {
                 self.blocked.remove(hash);
+            }
+            Claim::Anchors { .. } => {
+                self.anchors = Some(idx);
             }
         }
         self.seen.insert(st.signature.sig.clone());
@@ -359,6 +394,11 @@ impl Log {
 
     pub fn blocked(&self) -> impl Iterator<Item = &String> {
         self.blocked.iter()
+    }
+
+    /// The entry holding the current anchor list, if the operator has set one.
+    pub fn anchors(&self) -> Option<&Entry> {
+        self.anchors.map(|i| &self.entries[i])
     }
 
     /// Models whose name or description matches `query`, best first. Every word of the
@@ -546,6 +586,7 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/v1/resolve/{org}/{model}/{rev}", get(resolve))
         .route("/v1/search", get(search))
         .route("/v1/owners/{org}", get(owners))
+        .route("/v1/anchors", get(anchors))
         .with_state(reg)
 }
 
@@ -610,6 +651,13 @@ async fn search(State(reg): State<Arc<Registry>>, Query(q): Query<SearchQuery>) 
 
 async fn owners(State(reg): State<Arc<Registry>>, Path(org): Path<String>) -> Response {
     axum::Json(reg.with_log(|log| log.owners(&org).to_vec())).into_response()
+}
+
+async fn anchors(State(reg): State<Arc<Registry>>) -> Response {
+    match reg.with_log(|log| log.anchors().cloned()) {
+        Some(e) => axum::Json(e).into_response(),
+        None => err(StatusCode::NOT_FOUND, "no anchors set"),
+    }
 }
 
 // ---------- client ----------
@@ -693,6 +741,37 @@ impl Client {
             bail!("search failed: {}", resp.status());
         }
         Ok(serde_json::from_slice(&resp.bytes().await?)?)
+    }
+
+    /// The operator's anchor nodes, checked against the operator's signature. `operator`
+    /// pins the registry's key; without it, the key that signs the registry's head is
+    /// trusted. Empty if none are set.
+    pub async fn anchors(&self, operator: Option<&str>) -> Result<Vec<libp2p::Multiaddr>> {
+        let operator = match operator {
+            Some(op) => op.to_string(),
+            None => self.head().await?.signature.key,
+        };
+        let resp = self
+            .http
+            .get(format!("{}/v1/anchors", self.base))
+            .send()
+            .await
+            .with_context(|| format!("reach the registry at {}", self.base))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !resp.status().is_success() {
+            bail!("anchors failed: {}", resp.status());
+        }
+        let entry: Entry = serde_json::from_slice(&resp.bytes().await?)?;
+        let st = &entry.statement;
+        let Claim::Anchors { addrs } = &st.claim else {
+            bail!("the registry sent a bad anchors entry");
+        };
+        if !st.verify() || st.key() != operator {
+            bail!("the anchor list is not signed by the registry operator {operator}");
+        }
+        addrs.iter().map(|a| valid_anchor(a)).collect()
     }
 
     /// Entries from `from` onwards.

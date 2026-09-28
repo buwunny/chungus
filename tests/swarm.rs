@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chungus::limits::Limits;
 use chungus::p2p::{self, Config, Node};
 use chungus::sign;
 use chungus::store::Store;
@@ -261,4 +262,82 @@ fn blocks_cover_every_unique_chunk_once() {
     // Block ids are stable.
     let again = m.blocks(256 << 10);
     assert!(blocks.iter().zip(&again).all(|(a, b)| a.id == b.id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn anchors_serve_under_tight_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let seed_store = store(&tmp.path().join("seed"));
+    let (m, _) = chungus::pack(&model, &seed_store).unwrap();
+    seed_store.put_manifest(&m).unwrap();
+
+    // The seed never announces, serves one request per peer at a time and uploads at
+    // 4 MB/s. The fetcher knows it only as an anchor, with no bootstrap node.
+    let (_seed, seed_addrs) = node(
+        &seed_store,
+        Config {
+            listen: tcp(),
+            public: true,
+            limits: Limits {
+                upload_bytes_per_sec: Some(4_000_000),
+                max_requests_per_peer: 1,
+                max_uploads: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let local = store(&tmp.path().join("local"));
+    let (fetcher, _) = node(
+        &local,
+        Config {
+            listen: tcp(),
+            anchors: seed_addrs,
+            limits: Limits {
+                download_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let (got, stats) = p2p::fetch(&fetcher, &m.root, local.clone(), &[])
+        .await
+        .unwrap();
+    assert_eq!(stats.bytes_by_source.len(), 1);
+    let out = tmp.path().join("out");
+    chungus::unpack(&got, &local, &out).unwrap();
+    assert_eq!(
+        fs::read(out.join("weights.bin")).unwrap(),
+        fs::read(model.join("weights.bin")).unwrap()
+    );
+
+    // A download-only node holds the model but serves none of it.
+    let (_leech, leech_addrs) = node(
+        &local,
+        Config {
+            listen: tcp(),
+            public: true,
+            limits: Limits {
+                download_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let other = store(&tmp.path().join("other"));
+    let (asker, _) = node(
+        &other,
+        Config {
+            listen: tcp(),
+            anchors: leech_addrs,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(p2p::fetch(&asker, &m.root, other, &[]).await.is_err());
 }

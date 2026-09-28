@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -9,6 +9,7 @@ use std::time::Duration;
 use libp2p::Multiaddr;
 
 use chungus::hub;
+use chungus::limits::{Limits, RateLimiter};
 use chungus::manifest::Manifest;
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
@@ -72,6 +73,9 @@ enum Cmd {
         /// Don't advertise over mDNS; peers must name this node with --peer.
         #[arg(long)]
         no_mdns: bool,
+        /// Upload cap in MB/s, across all peers.
+        #[arg(long)]
+        max_upload: Option<f64>,
     },
     /// Run a local Hugging Face cache. Point tools at it with HF_ENDPOINT=http://localhost:8080.
     Hub {
@@ -130,6 +134,10 @@ enum Cmd {
         /// (a multiaddr ending in /p2p/<peer id>). Repeatable.
         #[arg(long)]
         bootstrap: Vec<Multiaddr>,
+        /// Fetch over the internet swarm, joining through the registry's signed anchor
+        /// nodes (and any --bootstrap).
+        #[arg(long)]
+        swarm: bool,
     },
     /// Join the internet swarm: announce this store's models on the DHT and serve them.
     Node {
@@ -160,6 +168,32 @@ enum Cmd {
         /// Relay connections for nodes behind NAT. Use with --public.
         #[arg(long)]
         relay_server: bool,
+        /// A node to trust as a starting point: always kept in the routing table and asked
+        /// directly for every model alongside the DHT. Repeatable.
+        #[arg(long)]
+        anchor: Vec<Multiaddr>,
+        /// Use this registry's signed list of anchor nodes (checked against --operator).
+        #[arg(long)]
+        anchors_from: Option<String>,
+        /// Upload cap in MB/s, across all peers.
+        #[arg(long)]
+        max_upload: Option<f64>,
+        /// Open connections, in and out.
+        #[arg(long, default_value_t = Limits::default().max_connections)]
+        max_connections: u32,
+        /// Requests one peer may have served at once; more are told to come back later.
+        #[arg(long, default_value_t = Limits::default().max_requests_per_peer)]
+        max_requests_per_peer: usize,
+        /// Requests served at once, across all peers.
+        #[arg(long, default_value_t = Limits::default().max_uploads)]
+        max_uploads: usize,
+        /// Routing-table entries from one IPv4 /24 or IPv6 /48, so no one network can
+        /// crowd out the rest.
+        #[arg(long, default_value_t = Limits::default().max_peers_per_subnet)]
+        max_peers_per_subnet: usize,
+        /// Download through the swarm but never serve or announce anything.
+        #[arg(long)]
+        download_only: bool,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -218,6 +252,16 @@ enum Cmd {
         #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
         registry: String,
     },
+    /// Show the registry's anchor nodes, or replace them (operator only, with --key).
+    Anchors {
+        /// The new list: multiaddrs ending in /p2p/<peer id>. Empty with --key clears it.
+        addrs: Vec<Multiaddr>,
+        /// The registry's operator key (operator.key in its data directory).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
     /// Add a hash (a model's root, or a chunk) to the registry's blocklist. Operator only.
     Block {
         hash: String,
@@ -266,6 +310,13 @@ fn key_path(key: Option<PathBuf>) -> Result<PathBuf> {
                 .join(".chungus/key"),
         ),
     }
+}
+
+fn mb_per_sec(mb: f64) -> Result<u64> {
+    if !(mb > 0.0 && mb.is_finite()) {
+        bail!("an upload cap must be a positive number of MB/s");
+    }
+    Ok((mb * 1e6) as u64)
 }
 
 fn follow_blocklist(
@@ -400,6 +451,7 @@ async fn main() -> Result<()> {
             operator,
             port,
             no_mdns,
+            max_upload,
         } => {
             let store = Arc::new(Store::open(&store)?);
             follow_blocklist(&store, blocklist, operator)?;
@@ -421,7 +473,11 @@ async fn main() -> Result<()> {
                     ", advertised on the LAN"
                 }
             );
-            net::serve_on(listener, store).await?;
+            let mut router = net::router(store);
+            if let Some(mbps) = max_upload {
+                router = net::rate_limited(router, Arc::new(RateLimiter::new(mb_per_sec(mbps)?)));
+            }
+            axum::serve(listener, router).await?;
         }
         Cmd::Hub {
             store,
@@ -486,6 +542,7 @@ async fn main() -> Result<()> {
             discover_secs,
             trust,
             bootstrap,
+            swarm,
         } => {
             let mut trust = parse_keys(&trust)?;
             let mut via_registry = false;
@@ -513,7 +570,7 @@ async fn main() -> Result<()> {
                     .sync(&store)
                     .await?;
             }
-            let (manifest, s) = if bootstrap.is_empty() {
+            let (manifest, s) = if bootstrap.is_empty() && !swarm {
                 let mut peers = peer;
                 if !no_mdns {
                     let wait = Duration::from_secs_f64(discover_secs);
@@ -526,6 +583,15 @@ async fn main() -> Result<()> {
                 peers.dedup();
                 net::fetch(&root, store.clone(), &peers, origin.as_deref(), &trust).await?
             } else {
+                let anchors = if swarm {
+                    let anchors = registry::Client::new(&registry)?.anchors(None).await?;
+                    if anchors.is_empty() && bootstrap.is_empty() {
+                        bail!("{registry} lists no anchor nodes; join with --bootstrap");
+                    }
+                    anchors
+                } else {
+                    Vec::new()
+                };
                 let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
                 let config = p2p::Config {
                     listen: vec![
@@ -533,6 +599,12 @@ async fn main() -> Result<()> {
                         "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
                     ],
                     bootstrap,
+                    anchors,
+                    // A one-off fetch leaves before it could usefully serve anyone.
+                    limits: Limits {
+                        download_only: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 let node = p2p::Node::start(store.clone(), key, config).await?;
@@ -555,8 +627,23 @@ async fn main() -> Result<()> {
             external,
             public,
             relay_server,
+            mut anchor,
+            anchors_from,
+            max_upload,
+            max_connections,
+            max_requests_per_peer,
+            max_uploads,
+            max_peers_per_subnet,
+            download_only,
         } => {
             let store = Arc::new(Store::open(&store)?);
+            if let Some(url) = anchors_from {
+                let found = registry::Client::new(&url)?
+                    .anchors(operator.as_deref())
+                    .await?;
+                println!("{} anchor node(s) from {url}", found.len());
+                anchor.extend(found);
+            }
             follow_blocklist(&store, blocklist, operator)?;
             let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
             let listen = if listen.is_empty() {
@@ -574,11 +661,24 @@ async fn main() -> Result<()> {
                 external,
                 public,
                 relay_server,
+                anchors: anchor,
+                limits: Limits {
+                    upload_bytes_per_sec: max_upload.map(mb_per_sec).transpose()?,
+                    max_connections,
+                    max_requests_per_peer,
+                    max_uploads,
+                    max_peers_per_subnet,
+                    download_only,
+                },
                 ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key, config).await?;
             println!("peer id {}", node.peer_id);
-            println!("sharing {} models", store.manifests()?.len());
+            if download_only {
+                println!("download-only: serving and announcing nothing");
+            } else {
+                println!("sharing {} models", store.manifests()?.len());
+            }
             // Relayed addresses appear once a reservation is made, so keep reporting new ones.
             let mut shown = std::collections::HashSet::new();
             loop {
@@ -723,6 +823,27 @@ async fn main() -> Result<()> {
                 .await?;
             let verb = if unblock { "unblocked" } else { "blocked" };
             println!("{verb} {hash} (log entry {})", entry.seq);
+        }
+        Cmd::Anchors {
+            addrs,
+            key,
+            registry,
+        } => {
+            let client = registry::Client::new(&registry)?;
+            if let Some(key) = key {
+                let k = sign::load_key(&key)?;
+                let claim = Claim::Anchors {
+                    addrs: addrs.iter().map(|a| a.to_string()).collect(),
+                };
+                let entry = client.submit(&Statement::new(&k, claim)).await?;
+                println!("set {} anchor(s) (log entry {})", addrs.len(), entry.seq);
+            } else if !addrs.is_empty() {
+                bail!("setting the anchors needs the operator's --key");
+            } else {
+                for a in client.anchors(None).await? {
+                    println!("{a}");
+                }
+            }
         }
         Cmd::Keygen { key } => {
             let path = key_path(key)?;

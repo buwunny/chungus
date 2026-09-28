@@ -114,6 +114,25 @@ Models are announced at two levels. A node with the whole model announces its ro
 
 A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute. There are no public bootstrap nodes yet, so someone has to run the first one.
 
+### Limits and attack resistance
+
+A node is someone's desktop, so it protects its owner. `--max-upload <MB/s>` caps upload bandwidth (on `serve` too), `--max-connections`, `--max-requests-per-peer` and `--max-uploads` bound how many peers and requests it serves at once (a peer over its share is told to come back later), and `--download-only` fetches through the swarm without serving or announcing anything. A one-off `chungus fetch` is always download-only.
+
+Two DHT attacks matter most here. In a **Sybil** attack someone runs thousands of fake nodes; in an **eclipse** attack those nodes surround a model's key, or a victim's routing table, so lookups only ever reach the attacker, who can then hide a model (data is still verified by hash, so it can't be forged). Three defenses are on by default:
+
+- **Disjoint lookup paths.** Each DHT lookup follows several independent paths (S/Kademlia), so one poisoned path doesn't hide a model.
+- **Subnet caps.** At most `--max-peers-per-subnet` (default 2) routing-table entries come from one IPv4 /24 or IPv6 /48, so a single host or small cloud block can't fill a routing table cheaply.
+- **Anchor nodes.** The registry operator signs a list of anchor nodes (`chungus anchors <addr>... --key operator.key`). Nodes started with `--anchors-from <registry>` keep them in their routing table, exempt from the limits above, and ask them directly for every model alongside the DHT. `chungus fetch --swarm` joins through them, so fetching needs nothing but the registry.
+
+```sh
+# The operator publishes the anchor list
+chungus anchors /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... --key .chungus/registry/operator.key
+
+# Nodes and fetchers use it
+chungus node --anchors-from http://registry.example:7450 --operator chungus1<operator key> --max-upload 20
+chungus fetch acme/tiny-llama@v1 --swarm -o model/
+```
+
 ## The registry: names, search and the blocklist
 
 Peers move bytes; a registry gives models names. `acme/tiny-llama@v1` points at a manifest root, signed by the publisher's key. The first key to publish under an org owns it, and only its owners (see `chungus grant`) can publish there after that. Every change goes into an append-only, hash-chained log whose head the registry signs, so anyone can download the log and check that no name was rewritten.
@@ -150,6 +169,7 @@ A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatu
 | **M2** (done) | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
 | **M4** (done) | Signed models, internet swarm over libp2p with 64 MB block announcements, registry with a transparency log, search and blocklist |
+| Node limits (done) | Upload caps, connection and request limits, download-only mode, disjoint DHT lookups, subnet caps, registry-signed anchor nodes |
 | Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 
 The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.
