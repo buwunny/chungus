@@ -240,8 +240,10 @@ docker compose cp registry:/data/registry/operator.key ./chungus-root.key
 # 3. From your machine: let the online key act as the operator for 90 days
 chungus delegate chungus1<online key> --key ./chungus-root.key --registry https://chungus.example.com
 
-# 4. Remove the root key from the server and restart
-docker compose exec registry rm /data/registry/operator.key && docker compose restart registry
+# 4. Remove the root key from the server and restart (the container has no shell, so
+#    borrow one that mounts its volume)
+docker run --rm --volumes-from "$(docker compose ps -q registry)" alpine rm /data/registry/operator.key
+docker compose restart registry
 ```
 
 The registry keeps `operator.pub` so it still knows which key nodes pin. Renew before the 90 days are up by running step 3 again (the registry's log warns two weeks ahead); block, unblock and anchors commands work with either key. If the server may be compromised, `chungus delegate --revoke --key ./chungus-root.key` ends the delegation at once, and to rotate the online key, delete `online.key`, restart, and delegate to the new one. Operator commands run inside the container, e.g. `docker compose exec registry chungus block <hash> --key /data/registry/operator.key`.
