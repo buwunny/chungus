@@ -30,6 +30,8 @@ zstd = "0.14.0"
 [dev-dependencies]
 tempfile = "3.27.0"
 
-[target.'cfg(unix)'.dependencies]
+# Lazy mounting. Linux only for now: on macOS fuser has to link against macFUSE's
+# libfuse, which every user would then need installed just to run chungus.
+[target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18.0", default-features = false }
 libc = "0.2"

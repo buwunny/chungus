@@ -115,7 +115,8 @@ enum Cmd {
         from: FromArgs,
     },
     /// Mount a model as a read-only directory that works before the download finishes:
-    /// reads fetch what they need, and the rest is prefetched in layer order.
+    /// reads fetch what they need, and the rest is prefetched in layer order. Linux only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Mount {
         /// A manifest root, or a registry name (org/model[@rev]).
         model: String,
@@ -444,6 +445,7 @@ impl FromArgs {
         Ok(peers)
     }
 
+    #[cfg(target_os = "linux")]
     fn origin(&self) -> Vec<String> {
         self.origin.iter().cloned().collect()
     }
@@ -692,7 +694,7 @@ async fn main() -> Result<()> {
                 println!("unpacked, all chunks verified");
             }
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         Cmd::Mount {
             model,
             dir,
@@ -774,8 +776,11 @@ async fn main() -> Result<()> {
             mounted.unmount()?;
             println!("unmounted");
         }
-        #[cfg(not(unix))]
-        Cmd::Mount { .. } => bail!("mounting needs FUSE, which this platform doesn't have"),
+        #[cfg(not(target_os = "linux"))]
+        Cmd::Mount { .. } => bail!(
+            "mounting only works on Linux so far; download the whole model with \
+             `chungus fetch <model> -o <dir>` instead"
+        ),
         Cmd::Node {
             store,
             blocklist,

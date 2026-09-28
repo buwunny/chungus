@@ -1,17 +1,22 @@
 # A public chungus node: a bootstrap and anchor for the swarm, and a relay for peers
 # behind NAT. From this directory:
 #   cp node.env.example node.env   # then edit it
-#   docker compose up -d --build
+#   docker compose up -d
 #   docker compose logs node       # shows the peer id and addresses to share
+#
+# The image is the one CI publishes from main (linux/amd64 and arm64). To upgrade:
+#   docker compose pull && docker compose up -d
+# Set CHUNGUS_IMAGE in .env to pin a version (ghcr.io/buwunny/chungus:0.2.0, say), or run
+# `docker compose up -d --build` to build from this checkout instead.
 #
 # The registry and its search site are a separate profile, served over HTTPS by Caddy:
 #   cp .env.example .env           # set CHUNGUS_DOMAIN
-#   docker compose --profile registry up -d --build
+#   docker compose --profile registry up -d
 #   docker compose logs registry   # shows the operator key; back up the registry-data volume
 services:
   node:
     build: ..
-    image: chungus
+    image: ${CHUNGUS_IMAGE:-ghcr.io/buwunny/chungus:latest}
     env_file: node.env
     restart: unless-stopped
     init: true
@@ -34,7 +39,7 @@ services:
   # Model names, the signed log and the blocklist. Only Caddy can reach it.
   registry:
     profiles: [registry]
-    image: chungus
+    image: ${CHUNGUS_IMAGE:-ghcr.io/buwunny/chungus:latest}
     build: ..
     entrypoint: ["chungus", "registry"]
     environment:
