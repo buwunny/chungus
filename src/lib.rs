@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod hub;
 pub mod manifest;
 pub mod net;
+pub mod p2p;
 pub mod safetensors;
 pub mod segment;
 pub mod sign;

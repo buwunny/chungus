@@ -2,7 +2,7 @@
 
 A peer-to-peer network for distributing AI models, their runtimes and Docker AI images. Think of it as a decentralized Hugging Face with its own take on Xet-style storage.
 
-This repository currently holds **milestones 1 to 3** and the first part of milestone 4: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, and signed models.
+This repository currently holds **milestones 1 to 3** and most of milestone 4: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, signed models, and sharing over the internet.
 
 ## The pipeline
 
@@ -93,6 +93,25 @@ chungus fetch <root> --trust chungus1<publisher key>
 
 Signatures travel with the manifest: `fetch` collects them from every peer and keeps only the valid ones, so a peer can't forge or swap one.
 
+## Sharing over the internet
+
+Nodes form a swarm with [libp2p](https://libp2p.io). Each node announces the models in its store on a Kademlia DHT; a fetcher asks the DHT who has a model and downloads chunks from all of them at once, verifying every chunk as it does on a LAN. Connections are encrypted (Noise over TCP, or QUIC).
+
+```sh
+# A public server (a VPS, say) that others join through, and relays for nodes behind NAT
+chungus node --store relay --public --relay-server
+#   prints: address /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW...
+
+# At home, behind NAT: share your store, reachable through the relay
+chungus node --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... \
+             --relay     /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW...
+
+# Anywhere: fetch a model from whoever has it
+chungus fetch <root> --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... -o model/
+```
+
+A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute. There are no public bootstrap nodes yet, so someone has to run the first one.
+
 ## What to expect
 
 On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports zstd alone at 78% of the original size and the full pipeline at 73%. Real models usually compress somewhat better than synthetic ones. Published results (ZipNN, DFloat11) put BF16 near 67–70% of original size. Models already quantized to 4 bits barely compress. Dedup savings depend on how much two models actually share: re-uploads and format copies dedup almost completely, and full fine-tunes dedup very little.
@@ -108,7 +127,7 @@ A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatu
 | **M1** (done) | Storage format, `pack` / `unpack` / `bench` |
 | **M2** (done) | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
-| M4 | Signed models (done); internet swarm over libp2p (Kademlia DHT, NAT traversal); registry and search |
+| M4 | Signed models (done); internet swarm over libp2p (done: Kademlia DHT, relays, hole punching); registry and search |
 | Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 
 The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.

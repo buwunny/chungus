@@ -13,11 +13,13 @@ ed25519-dalek = "3.0.0"
 fastcdc = "5.0.0"
 futures = "0.3.34"
 getrandom = "0.4.3"
+libp2p = { version = "0.57", features = ["tokio", "tcp", "quic", "noise", "yamux", "kad", "identify", "request-response", "cbor", "macros", "relay", "dcutr", "autonat", "ping", "dns"] }
 mdns-sd = "0.21.4"
 memmap2 = "0.9.11"
 rayon = "1.12.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_bytes = "0.11.19"
 serde_json = "1.0.151"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
