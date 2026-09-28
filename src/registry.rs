@@ -441,6 +441,24 @@ impl Log {
     }
 }
 
+impl Log {
+    /// Every published name that isn't blocked, newest first: what a search page needs to
+    /// list and search models on its own.
+    pub fn index(&self) -> Vec<Hit> {
+        let mut hits: Vec<&Entry> = self
+            .names
+            .values()
+            .map(|&i| &self.entries[i])
+            .filter(|e| match &e.statement.claim {
+                Claim::Publish { root, .. } => !self.blocked.contains(root),
+                _ => false,
+            })
+            .collect();
+        hits.sort_by_key(|e| std::cmp::Reverse(e.statement.time));
+        hits.into_iter().map(Hit::from).collect()
+    }
+}
+
 fn words(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -577,7 +595,12 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 }
 
 /// `POST /v1/statements`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
-/// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=` and `GET /v1/owners/{org}`.
+/// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
+/// `GET /v1/owners/{org}` and `GET /v1/anchors`.
+///
+/// Everything it serves is public and signed, so any web page may read it: responses
+/// allow every origin. Browsers can't submit statements, since there is no CORS
+/// preflight answer for the JSON `POST`.
 pub fn router(reg: Arc<Registry>) -> Router {
     Router::new()
         .route("/v1/statements", post(submit))
@@ -585,9 +608,19 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/v1/log", get(log_entries))
         .route("/v1/resolve/{org}/{model}/{rev}", get(resolve))
         .route("/v1/search", get(search))
+        .route("/v1/index", get(index))
         .route("/v1/owners/{org}", get(owners))
         .route("/v1/anchors", get(anchors))
+        .layer(axum::middleware::map_response(allow_any_origin))
         .with_state(reg)
+}
+
+async fn allow_any_origin(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    resp
 }
 
 async fn submit(
@@ -647,6 +680,10 @@ struct SearchQuery {
 
 async fn search(State(reg): State<Arc<Registry>>, Query(q): Query<SearchQuery>) -> Response {
     axum::Json(reg.with_log(|log| log.search(&q.q, 50))).into_response()
+}
+
+async fn index(State(reg): State<Arc<Registry>>) -> Response {
+    axum::Json(reg.with_log(|log| log.index())).into_response()
 }
 
 async fn owners(State(reg): State<Arc<Registry>>, Path(org): Path<String>) -> Response {
@@ -731,6 +768,10 @@ impl Client {
             }
             _ => Err(anyhow!("the registry sent a bad entry for {name}@{rev}")),
         }
+    }
+
+    pub async fn index(&self) -> Result<Vec<Hit>> {
+        self.get("/v1/index").await
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<Hit>> {

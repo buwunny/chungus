@@ -1,0 +1,52 @@
+# Publishes site/ (the landing page and model search) to GitHub Pages. To use it, set
+# Settings > Pages > Source to "GitHub Actions" and tick "Enforce HTTPS", and set the
+# repository variable CHUNGUS_REGISTRY_URL to the public registry (https:// only). The
+# pages then read the live registry, with a snapshot of its index, refreshed every six
+# hours, as a fallback.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths: [site/**, .github/workflows/pages.yml]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: vars.CHUNGUS_REGISTRY_URL != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Point the site at the registry and snapshot its index
+        env:
+          REGISTRY: ${{ vars.CHUNGUS_REGISTRY_URL }}
+        run: |
+          REGISTRY="${REGISTRY%/}"
+          case "$REGISTRY" in
+            https://*) ;;
+            *) echo "::error::CHUNGUS_REGISTRY_URL must start with https://"; exit 1 ;;
+          esac
+          printf 'window.CHUNGUS = { registry: %s };\n' "$(jq -Rn --arg r "$REGISTRY" '$r')" > site/config.js
+          curl -fsS --proto =https "$REGISTRY/v1/index" -o site/index.json
+          jq -e 'type == "array"' site/index.json > /dev/null
+          curl -fsS --proto =https "$REGISTRY/v1/head" -o site/head.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

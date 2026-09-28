@@ -66,6 +66,12 @@ async fn publish_resolve_search_audit() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].root, root);
     assert!(client.search("mistral").await.unwrap().is_empty());
+    let index = client.index().await.unwrap();
+    assert_eq!(index.len(), 1);
+    assert_eq!(index[0].name, "acme/tiny-llama");
+    // Web pages on other origins, like the search site, may read the registry.
+    let resp = reqwest::get(format!("{url}/v1/index")).await.unwrap();
+    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
 
     let (log, head) = client.audit(Some(&operator)).await.unwrap();
     assert_eq!((log.entries.len(), head.size), (1, 1));

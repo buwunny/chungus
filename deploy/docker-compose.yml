@@ -3,6 +3,11 @@
 #   cp node.env.example node.env   # then edit it
 #   docker compose up -d --build
 #   docker compose logs node       # shows the peer id and addresses to share
+#
+# The registry and its search site are a separate profile, served over HTTPS by Caddy:
+#   cp .env.example .env           # set CHUNGUS_DOMAIN
+#   docker compose --profile registry up -d --build
+#   docker compose logs registry   # shows the operator key; back up the registry-data volume
 services:
   node:
     build: ..
@@ -26,5 +31,61 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # Model names, the signed log and the blocklist. Only Caddy can reach it.
+  registry:
+    profiles: [registry]
+    image: chungus
+    build: ..
+    entrypoint: ["chungus", "registry"]
+    environment:
+      CHUNGUS_REGISTRY_DATA: /data/registry
+    restart: unless-stopped
+    init: true
+    expose:
+      - "7450"
+    volumes:
+      - registry-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # HTTPS for the registry API and the site (landing page and search) from ../site.
+  web:
+    profiles: [registry]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [registry]
+    environment:
+      CHUNGUS_DOMAIN: ${CHUNGUS_DOMAIN:-localhost}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../site:/srv/site:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
 volumes:
   chungus-data:
+  registry-data:
+  caddy-data:
+  caddy-config:
