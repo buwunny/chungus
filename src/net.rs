@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::manifest::{ChunkRef, Manifest};
+use crate::sign::{self, Signature};
 use crate::store::{self, Store};
+use ed25519_dalek::VerifyingKey;
 
 pub const SERVICE: &str = "_chungus._tcp.local.";
 pub const DEFAULT_PORT: u16 = 7447;
@@ -32,11 +34,12 @@ const CONCURRENCY: usize = 32;
 // ---------- server ----------
 
 /// HTTP routes for serving a store: `GET /v1/manifests`, `GET /v1/manifests/{root}`,
-/// `GET /v1/chunks/{hash}` and `GET /v1/meta/{key}`.
+/// `GET /v1/signatures/{root}`, `GET /v1/chunks/{hash}` and `GET /v1/meta/{key}`.
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/v1/manifests", get(list_manifests))
         .route("/v1/manifests/{root}", get(get_manifest))
+        .route("/v1/signatures/{root}", get(get_signatures))
         .route("/v1/chunks/{hash}", get(get_chunk))
         .route("/v1/meta/{*key}", get(get_meta))
         .with_state(store)
@@ -57,6 +60,16 @@ async fn get_manifest(State(store): State<Arc<Store>>, Path(root): Path<String>)
     match tokio::task::spawn_blocking(move || store.get_manifest_bytes(&root)).await {
         Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn get_signatures(State(store): State<Arc<Store>>, Path(root): Path<String>) -> Response {
+    if !store::is_hash(&root) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match tokio::task::spawn_blocking(move || store.signatures(&root)).await {
+        Ok(Ok(sigs)) => axum::Json(sigs).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -186,11 +199,16 @@ enum Attempt {
 /// `peers` are tried first, with chunks spread across them; `origin`, if given, is the
 /// last resort for each chunk. Chunks already in the store are skipped, so an interrupted
 /// fetch resumes where it stopped.
+///
+/// Signatures on the manifest are collected from every source and kept if valid. When
+/// `trust` is non-empty, the fetch stops before downloading any chunk unless one of those
+/// keys has signed the manifest.
 pub async fn fetch(
     root: &str,
     store: Arc<Store>,
     peers: &[String],
     origin: Option<&str>,
+    trust: &[VerifyingKey],
 ) -> Result<(Manifest, FetchStats)> {
     if !store::is_hash(root) {
         bail!("{root:?} is not a manifest root hash");
@@ -208,6 +226,11 @@ pub async fn fetch(
         Err(_) => fetch_manifest(&client, root, &all).await?,
     };
     store.put_manifest(&manifest)?;
+    let sigs = fetch_signatures(&client, root, &all).await;
+    store.add_signatures(root, &sigs)?;
+    if !trust.is_empty() && !sign::trusted_by(&store.signatures(root)?, root, trust) {
+        bail!("no trusted key has signed {root}; refusing to download it");
+    }
 
     let mut stats = fetch_chunks(
         &client,
@@ -290,6 +313,33 @@ pub async fn fetch_chunks<'a>(
         stats.rejected += rejected;
     }
     Ok(stats)
+}
+
+/// Every signature any source has for `root`. Unverified; the store keeps only valid ones.
+async fn fetch_signatures(
+    client: &reqwest::Client,
+    root: &str,
+    sources: &[&String],
+) -> Vec<Signature> {
+    let mut out = Vec::new();
+    for source in sources {
+        let Ok(resp) = client
+            .get(format!("{source}/v1/signatures/{root}"))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        if let Ok(bytes) = resp.bytes().await
+            && let Ok(sigs) = serde_json::from_slice::<Vec<Signature>>(&bytes)
+        {
+            out.extend(sigs);
+        }
+    }
+    out
 }
 
 async fn fetch_manifest(
