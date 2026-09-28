@@ -13,11 +13,11 @@ use chungus::hashing::{self, LayerDigests};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let [cmd, dir] = args.as_slice() {
-        if cmd == "verify" {
-            let ok = verify(Path::new(dir))?;
-            std::process::exit(if ok { 0 } else { 1 });
-        }
+    if let [cmd, dir] = args.as_slice()
+        && cmd == "verify"
+    {
+        let ok = verify(Path::new(dir))?;
+        std::process::exit(if ok { 0 } else { 1 });
     }
 
     let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();

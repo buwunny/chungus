@@ -5,6 +5,11 @@ use std::fmt;
 pub struct Sha256Digest(pub [u8; 32]);
 
 impl Sha256Digest {
+    /// Returns the underlying digest as a byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
