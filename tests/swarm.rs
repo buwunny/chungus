@@ -166,6 +166,60 @@ async fn fetch_from_a_node_reachable_only_through_a_relay() {
     chungus::unpack(&got, &local, &tmp.path().join("out")).unwrap();
 }
 
+/// A peer behind NAT is only reachable through its relay, and a fetcher that learns of
+/// it from a provider lookup gets a bare peer id, or at best a private address. Requests
+/// then try reaching it through the nodes this one joined through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_reaches_a_nat_peer_through_a_known_relay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let model = tmp.path().join("model");
+    write_model(&model);
+    let seed_store = store(&tmp.path().join("seed"));
+    let (m, _) = chungus::pack(&model, &seed_store).unwrap();
+    seed_store.put_manifest(&m).unwrap();
+
+    let (_relay, relay_addrs) = node(
+        &store(&tmp.path().join("relay")),
+        Config {
+            listen: tcp(),
+            public: true,
+            relay_server: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    // Behind NAT: no direct listen address, only the relayed one.
+    let (seed, _) = node(
+        &seed_store,
+        Config {
+            bootstrap: relay_addrs.clone(),
+            relays: relay_addrs.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The fetcher knows the relay but runs no DHT lookup, so it has no address for the
+    // seed at all: only its peer id, as a provider lookup leaves it.
+    let (fetcher, _) = node(
+        &store(&tmp.path().join("local")),
+        Config {
+            relays: relay_addrs,
+            limits: Limits {
+                download_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let resp = fetcher
+        .request(seed.peer_id, p2p::Request::Manifest(m.root.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(resp, p2p::Response::Manifest(Some(_))), "{resp:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_with_part_of_a_model_serves_its_blocks() {
     let tmp = tempfile::tempdir().unwrap();

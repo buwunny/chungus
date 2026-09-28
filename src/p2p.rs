@@ -333,6 +333,13 @@ impl Node {
         } else {
             cfg.block_bytes
         };
+        let mut via: Vec<Multiaddr> = Vec::new();
+        for addr in cfg.relays.iter().chain(&cfg.bootstrap).chain(&cfg.anchors) {
+            let relayed = addr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+            if !relayed && !via.contains(addr) {
+                via.push(addr.clone());
+            }
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let runner = Runner {
             swarm,
@@ -340,6 +347,7 @@ impl Node {
             public: cfg.public,
             rx,
             addrs: HashMap::new(),
+            via,
             providers: HashMap::new(),
             requests: HashMap::new(),
             provided: HashSet::new(),
@@ -425,6 +433,8 @@ struct Runner {
     rx: mpsc::UnboundedReceiver<Command>,
     /// Addresses learned for peers, used when a request needs a new connection.
     addrs: HashMap<PeerId, HashSet<Multiaddr>>,
+    /// Bootstrap, relay and anchor addresses: possible relays to reach a peer through.
+    via: Vec<Multiaddr>,
     providers: HashMap<kad::QueryId, (HashSet<PeerId>, oneshot::Sender<Vec<PeerId>>)>,
     requests: HashMap<OutboundRequestId, oneshot::Sender<Result<Response>>>,
     /// DHT keys this node currently announces.
@@ -565,11 +575,27 @@ impl Runner {
                 self.providers.insert(id, (HashSet::new(), tx));
             }
             Command::Request(peer, req, tx) => {
-                let addrs = self
+                let mut addrs: Vec<Multiaddr> = self
                     .addrs
                     .get(&peer)
                     .map(|a| a.iter().cloned().collect())
                     .unwrap_or_default();
+                // A peer behind NAT is reachable only through a relay, and what we know of
+                // it may be a private address or nothing at all (provider lookups return
+                // bare peer ids). So also try reaching it through each node we joined
+                // through; one that isn't its relay just refuses.
+                if !self.swarm.is_connected(&peer) {
+                    addrs.extend(
+                        self.via
+                            .iter()
+                            .filter(|a| peer_of(a) != Some(peer))
+                            .map(|a| {
+                                a.clone()
+                                    .with(Protocol::P2pCircuit)
+                                    .with(Protocol::P2p(peer))
+                            }),
+                    );
+                }
                 let id = self
                     .swarm
                     .behaviour_mut()
@@ -983,22 +1009,45 @@ pub async fn prepare(
     let manifest = match store.get_manifest(root) {
         Ok(m) => m,
         Err(_) => {
+            if peers.is_empty() {
+                bail!("nobody on the network is sharing {root}");
+            }
+            // Two rounds: a peer behind NAT may still be connecting through its relay.
             let mut found = None;
-            for &p in &peers {
-                if let Ok(Response::Manifest(Some(bytes))) =
-                    node.request(p, Request::Manifest(root.to_string())).await
-                    && let Ok(m) = serde_json::from_slice::<Manifest>(&bytes)
-                    && m.root == root
-                    && m.verify_root()
-                {
-                    found = Some(m);
+            let mut why = Vec::new();
+            for round in 0..2 {
+                if round > 0 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                why.clear();
+                for &p in &peers {
+                    let problem = match node.request(p, Request::Manifest(root.to_string())).await {
+                        Ok(Response::Manifest(Some(bytes))) => {
+                            match serde_json::from_slice::<Manifest>(&bytes) {
+                                Ok(m) if m.root == root && m.verify_root() => {
+                                    found = Some(m);
+                                    break;
+                                }
+                                _ => "sent an invalid manifest".to_string(),
+                            }
+                        }
+                        Ok(Response::Manifest(None)) => "doesn't have it".to_string(),
+                        Ok(Response::Busy) => "busy".to_string(),
+                        Ok(_) => "sent an unexpected answer".to_string(),
+                        Err(e) => format!("{e:#}"),
+                    };
+                    why.push(format!("{p}: {problem}"));
+                }
+                if found.is_some() {
                     break;
                 }
             }
             match found {
                 Some(m) => m,
-                None if peers.is_empty() => bail!("nobody on the network is sharing {root}"),
-                None => bail!("no peer sent a valid manifest for {root}"),
+                None => bail!(
+                    "no peer sent a valid manifest for {root}:\n  {}",
+                    why.join("\n  ")
+                ),
             }
         }
     };
