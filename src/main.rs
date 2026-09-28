@@ -9,6 +9,7 @@ use std::time::Duration;
 use chungus::hub;
 use chungus::manifest::Manifest;
 use chungus::net;
+use chungus::sign;
 use chungus::store::{self, Store};
 
 #[derive(Parser)]
@@ -100,7 +101,48 @@ enum Cmd {
         /// How long to listen for peers on the LAN, in seconds.
         #[arg(long, default_value_t = 2.0)]
         discover_secs: f64,
+        /// Only download if this public key (chungus1...) has signed the manifest. Repeatable.
+        #[arg(long)]
+        trust: Vec<String>,
     },
+    /// Create a signing key and print its public key.
+    Keygen {
+        /// Where to write the key (default: ~/.chungus/key).
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Sign a model in the store, so others can check it came from you.
+    Sign {
+        root: String,
+        #[arg(long, default_value = DEFAULT_STORE)]
+        store: PathBuf,
+        /// Signing key (default: ~/.chungus/key).
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Show who has signed a model, or check that a given key has.
+    Verify {
+        root: String,
+        #[arg(long, default_value = DEFAULT_STORE)]
+        store: PathBuf,
+        /// Fail unless this public key (chungus1...) has signed it. Repeatable.
+        #[arg(long)]
+        trust: Vec<String>,
+    },
+}
+
+fn key_path(key: Option<PathBuf>) -> Result<PathBuf> {
+    match key {
+        Some(k) => Ok(k),
+        None => Ok(
+            PathBuf::from(std::env::var_os("HOME").context("HOME is not set; pass --key")?)
+                .join(".chungus/key"),
+        ),
+    }
+}
+
+fn parse_keys(keys: &[String]) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
+    keys.iter().map(|k| sign::parse_public_key(k)).collect()
 }
 
 fn mb(bytes: u64) -> f64 {
@@ -277,7 +319,9 @@ async fn main() -> Result<()> {
             origin,
             no_mdns,
             discover_secs,
+            trust,
         } => {
+            let trust = parse_keys(&trust)?;
             let store = Arc::new(Store::open(&store)?);
             let mut peers = peer;
             if !no_mdns {
@@ -289,7 +333,8 @@ async fn main() -> Result<()> {
             }
             peers.sort();
             peers.dedup();
-            let (manifest, s) = net::fetch(&root, store.clone(), &peers, origin.as_deref()).await?;
+            let (manifest, s) =
+                net::fetch(&root, store.clone(), &peers, origin.as_deref(), &trust).await?;
             let received: u64 = s.bytes_by_source.values().sum();
             println!(
                 "{} chunks: {} already local, {} fetched ({:.1} MB) in {:.1}s",
@@ -309,6 +354,38 @@ async fn main() -> Result<()> {
                 tokio::task::spawn_blocking(move || chungus::unpack(&manifest, &store, &output))
                     .await??;
                 println!("unpacked, all chunks verified");
+            }
+        }
+        Cmd::Keygen { key } => {
+            let path = key_path(key)?;
+            let k = sign::generate_key(&path)?;
+            println!("wrote {}", path.display());
+            println!("public key {}", sign::public_key_string(&k.verifying_key()));
+        }
+        Cmd::Sign { root, store, key } => {
+            let store = Store::open(&store)?;
+            store.get_manifest(&root)?;
+            let k = sign::load_key(&key_path(key)?)?;
+            let s = sign::sign(&k, &root);
+            store.add_signatures(&root, std::slice::from_ref(&s))?;
+            println!("signed {root} as {}", s.key);
+        }
+        Cmd::Verify { root, store, trust } => {
+            let trust = parse_keys(&trust)?;
+            let store = Store::open(&store)?;
+            let m = store.get_manifest(&root)?;
+            if !m.verify_root() {
+                anyhow::bail!("manifest {root} does not match its root hash");
+            }
+            let sigs = store.signatures(&root)?;
+            for s in sigs.iter().filter(|s| sign::verify(s, &root)) {
+                println!("signed by {}", s.key);
+            }
+            if sigs.is_empty() {
+                println!("no signatures");
+            }
+            if !trust.is_empty() && !sign::trusted_by(&sigs, &root, &trust) {
+                anyhow::bail!("no trusted key has signed {root}");
             }
         }
     }

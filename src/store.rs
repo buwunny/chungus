@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::Manifest;
 use crate::segment::Dtype;
+use crate::sign::{self, Signature};
 use crate::transform::{self, FloatKind};
 
 const VERSION: u8 = 1;
@@ -133,8 +134,20 @@ impl Store {
         if path.exists() {
             return Ok(false);
         }
-        write_atomic(&path, blob)?;
-        Ok(true)
+        // Several threads may store the same chunk at once (a file that repeats itself);
+        // exactly one of them wins, and the rest see it already there.
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(blob)?;
+        match tmp.persist_noclobber(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if path.exists() => {
+                drop(e);
+                Ok(false)
+            }
+            Err(e) => Err(e.error.into()),
+        }
     }
 
     pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
@@ -164,6 +177,43 @@ impl Store {
 
     pub fn get_manifest(&self, root: &str) -> Result<Manifest> {
         Ok(serde_json::from_slice(&self.get_manifest_bytes(root)?)?)
+    }
+
+    fn signatures_path(&self, root: &str) -> PathBuf {
+        self.root
+            .join("manifests")
+            .join(format!("{root}.sigs.json"))
+    }
+
+    /// Signatures on manifest `root` held by this store.
+    pub fn signatures(&self, root: &str) -> Result<Vec<Signature>> {
+        if !is_hash(root) {
+            bail!("invalid manifest root {root:?}");
+        }
+        match fs::read(self.signatures_path(root)) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Add signatures to manifest `root`, keeping only valid ones and one per key.
+    /// Returns how many were new.
+    pub fn add_signatures(&self, root: &str, new: &[Signature]) -> Result<usize> {
+        let mut all = self.signatures(root)?;
+        let before = all.len();
+        for s in new {
+            if sign::verify(s, root) && !all.iter().any(|a| a.key == s.key) {
+                all.push(s.clone());
+            }
+        }
+        if all.len() > before {
+            write_atomic(
+                &self.signatures_path(root),
+                &serde_json::to_vec_pretty(&all)?,
+            )?;
+        }
+        Ok(all.len() - before)
     }
 
     /// Roots of every manifest in the store, sorted.
@@ -225,8 +275,10 @@ impl Store {
 /// Write via a temp file and rename, so a crash never leaves a truncated file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::File::create(&tmp)?.write_all(bytes)?;
-    fs::rename(&tmp, path)?;
+    let dir = path.parent().unwrap();
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
