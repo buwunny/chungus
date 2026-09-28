@@ -66,15 +66,15 @@ pub fn split_exponent(src: &[u8], kind: FloatKind) -> Vec<u8> {
     let mut out = vec![0u8; src.len()];
     match kind {
         FloatKind::Bf16 => {
-            for (i, e) in src[..n * 2].chunks_exact(2).enumerate() {
-                let v = u16::from_le_bytes([e[0], e[1]]);
+            for (i, e) in src[..n * 2].as_chunks::<2>().0.iter().enumerate() {
+                let v = u16::from_le_bytes(*e);
                 out[i] = (v >> 7) as u8;
                 out[n + i] = ((v >> 15) << 7) as u8 | (v & 0x7f) as u8;
             }
         }
         FloatKind::F32 => {
-            for (i, e) in src[..n * 4].chunks_exact(4).enumerate() {
-                let v = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+            for (i, e) in src[..n * 4].as_chunks::<4>().0.iter().enumerate() {
+                let v = u32::from_le_bytes(*e);
                 let sm = ((v >> 31) << 23) | (v & 0x7f_ffff);
                 out[i] = (v >> 23) as u8;
                 out[n + i] = sm as u8;
@@ -94,14 +94,14 @@ pub fn join_exponent(src: &[u8], kind: FloatKind) -> Vec<u8> {
     let mut out = vec![0u8; src.len()];
     match kind {
         FloatKind::Bf16 => {
-            for (i, e) in out[..n * 2].chunks_exact_mut(2).enumerate() {
+            for (i, e) in out[..n * 2].as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 let (exp, sm) = (src[i] as u16, src[n + i] as u16);
                 let v = ((sm >> 7) << 15) | ((exp & 0xff) << 7) | (sm & 0x7f);
                 e.copy_from_slice(&v.to_le_bytes());
             }
         }
         FloatKind::F32 => {
-            for (i, e) in out[..n * 4].chunks_exact_mut(4).enumerate() {
+            for (i, e) in out[..n * 4].as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let sm = src[n + i] as u32
                     | (src[2 * n + i] as u32) << 8
                     | (src[3 * n + i] as u32) << 16;
