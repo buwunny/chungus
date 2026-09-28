@@ -19,7 +19,7 @@ model files ─► segments ─► FastCDC chunks ─► BLAKE3 ─► float tra
 
 ## Install
 
-Each release has prebuilt binaries for Linux (x86_64, aarch64; glibc 2.35 or newer) and macOS (Apple silicon, Intel) on the [releases page](https://github.com/buwunny/chungus/releases):
+Each release has prebuilt binaries for Linux (x86_64, aarch64; glibc 2.39 or newer, e.g. Ubuntu 24.04, Debian 13) and macOS (Apple silicon, Intel) on the [releases page](https://github.com/buwunny/chungus/releases):
 
 ```sh
 # Pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,

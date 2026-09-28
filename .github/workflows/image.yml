@@ -1,6 +1,7 @@
 # The node container, published to GHCR for linux/amd64 and linux/arm64: `latest` and
 # `sha-<commit>` on every push to main, `<version>` on v* tags. Each architecture builds
-# on its own native runner (emulating arm64 makes a Rust build take hours), then one job
+# on its own native runner (emulating arm64 makes a Rust build take hours; arm64 has
+# no -latest label, so it names the newest Ubuntu), then one job
 # joins them under a multi-arch tag. Pull requests that touch the image build it without
 # publishing.
 name: Image
@@ -20,13 +21,18 @@ permissions:
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
+# A new push to a pull request cancels its older runs; main and tags always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     strategy:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -64,7 +70,7 @@ jobs:
   publish:
     if: github.event_name != 'pull_request'
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
