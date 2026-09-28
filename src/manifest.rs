@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::segment::Dtype;
 
-pub const FORMAT: &str = "chungus/manifest/v1";
+/// The current format. Its root also commits to every file's chunk list, so a single
+/// chunk can be trusted before the rest of its file arrives (see [`crate::lazy`]).
+pub const FORMAT: &str = "chungus/manifest/v2";
+/// The first format, whose root covers only whole-file hashes. Still read and verified,
+/// but its files can only be trusted once complete.
+pub const FORMAT_V1: &str = "chungus/manifest/v1";
 /// Raw bytes per block, the unit announced on the DHT. Every node in a swarm must agree on
 /// it, since block ids depend on it.
 pub const BLOCK_BYTES: u64 = 64 << 20;
@@ -43,7 +48,7 @@ pub struct ChunkRef {
 
 impl Manifest {
     pub fn new(files: Vec<FileEntry>) -> Self {
-        let root = compute_root(&files);
+        let root = compute_root(FORMAT, &files).expect("current format");
         Manifest {
             format: FORMAT.into(),
             files,
@@ -52,7 +57,12 @@ impl Manifest {
     }
 
     pub fn verify_root(&self) -> bool {
-        compute_root(&self.files) == self.root
+        compute_root(&self.format, &self.files).is_some_and(|r| r == self.root)
+    }
+
+    /// Whether the root commits to each chunk, so chunks can be used as they arrive.
+    pub fn commits_to_chunks(&self) -> bool {
+        self.format == FORMAT
     }
 
     /// The model's unique chunks in order of first use, cut into blocks of at least `size`
@@ -92,14 +102,31 @@ impl Manifest {
     }
 }
 
-fn compute_root(files: &[FileEntry]) -> String {
+/// The root of `files` in `format`, or None for a format this version doesn't know.
+fn compute_root(format: &str, files: &[FileEntry]) -> Option<String> {
+    let chunks = match format {
+        FORMAT => true,
+        FORMAT_V1 => false,
+        _ => return None,
+    };
     let mut h = blake3::Hasher::new();
+    if chunks {
+        h.update(b"chungus/manifest/v2\0");
+    }
     for f in files {
-        // Each chunk hash is covered by the file hash, so the root commits to them too.
         h.update(f.path.as_bytes());
         h.update(&[0]);
         h.update(&f.size.to_le_bytes());
         h.update(f.hash.as_bytes());
+        // v1 relied on the file hash to cover its chunks, which holds only once the
+        // whole file is downloaded. v2 commits to each chunk directly.
+        if chunks {
+            h.update(&(f.chunks.len() as u64).to_le_bytes());
+            for c in &f.chunks {
+                h.update(c.hash.as_bytes());
+                h.update(&c.len.to_le_bytes());
+            }
+        }
     }
-    h.finalize().to_hex().to_string()
+    Some(h.finalize().to_hex().to_string())
 }

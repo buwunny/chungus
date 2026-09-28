@@ -133,6 +133,20 @@ chungus node --anchors-from http://registry.example:7450 --operator chungus1<ope
 chungus fetch acme/tiny-llama@v1 --swarm -o model/
 ```
 
+## Lazy loading
+
+`chungus mount` makes a model's files appear at once, before any weights have downloaded. Reads fetch the chunks they need on demand, verifying each against its hash, while a prefetcher fills in the rest in the order a loader wants it: config and tokenizer files first, then every safetensors header, then tensors layer by layer across all shards (embeddings, `layers.0`, `layers.1`, ..., then the output head). Each read also moves the chunks right after it to the front of the queue. Loaders that `mmap` safetensors, as transformers and vLLM do, work unchanged, so inference can start before the download finishes.
+
+```sh
+mkdir llama
+chungus mount acme/tiny-llama@v1 llama/          # or a root; --swarm or --bootstrap for the internet
+python -c "from transformers import AutoModelForCausalLM as M; M.from_pretrained('llama')"
+```
+
+Everything fetched lands in the store, so once prefetching finishes the model is complete and is shared like any other. `--prefetch 0` fetches only what is read. Mounting uses FUSE: install `fuse3` on Linux, or macFUSE on macOS (untested so far).
+
+Lazy reads need a manifest whose root commits to each file's chunk list (format v2, what `pack` writes now). Older v1 manifests only committed to whole-file hashes, which can't be checked until a file is complete, so they can still be fetched but not mounted; re-pack to upgrade.
+
 ## The registry: names, search and the blocklist
 
 Peers move bytes; a registry gives models names. `acme/tiny-llama@v1` points at a manifest root, signed by the publisher's key. The first key to publish under an org owns it, and only its owners (see `chungus grant`) can publish there after that. Every change goes into an append-only, hash-chained log whose head the registry signs, so anyone can download the log and check that no name was rewritten.
@@ -159,7 +173,7 @@ On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports
 
 ## Manifest and store layout
 
-A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatures in `manifests/<root>.sigs.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that and is the value a publisher signs.
+A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatures in `manifests/<root>.sigs.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that, including each chunk's hash and length, and is the value a publisher signs.
 
 ## Roadmap
 
@@ -170,6 +184,7 @@ A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatu
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
 | **M4** (done) | Signed models, internet swarm over libp2p with 64 MB block announcements, registry with a transparency log, search and blocklist |
 | Node limits (done) | Upload caps, connection and request limits, download-only mode, disjoint DHT lookups, subnet caps, registry-signed anchor nodes |
-| Later | OCI images, lazy layer loading, dedicated nodes, voting, optional GPU-side decode straight into VRAM (in addition to the CPU SIMD path) |
+| Lazy loading (done) | `chungus mount`: read models before they finish downloading, with layer-order prefetch |
+| Later | OCI images, dedicated nodes, voting, optional GPU-side decode straight into VRAM (in addition to the CPU SIMD path) |
 
 The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.

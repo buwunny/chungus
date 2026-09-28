@@ -7,8 +7,11 @@
 
 pub mod chunk;
 pub mod hub;
+pub mod lazy;
 pub mod limits;
 pub mod manifest;
+#[cfg(unix)]
+pub mod mount;
 pub mod net;
 pub mod p2p;
 pub mod registry;

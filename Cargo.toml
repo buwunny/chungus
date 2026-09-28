@@ -24,8 +24,12 @@ serde_json = "1.0.151"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "fs", "time", "sync", "io-util", "signal"] }
 zstd = "0.14.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.18.0", default-features = false }
+libc = "0.2"
