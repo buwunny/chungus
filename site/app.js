@@ -2,22 +2,11 @@
 // searches it in the browser, ranking results the same way `chungus search` does.
 "use strict";
 
-const config = window.CHUNGUS || {};
-const registry = (config.registry || "").replace(/\/+$/, "");
+const { el, ago, short, command, logLine, loadIndex, registryUrl } = window.chungus;
 const $ = (id) => document.getElementById(id);
 
 let models = []; // one per name: { name, revs: [hit...] } with revs newest first
 let head = null;
-
-function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "text") node.textContent = v;
-    else node.setAttribute(k, v);
-  }
-  for (const c of children) if (c) node.append(c);
-  return node;
-}
 
 function words(s) {
   return s.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
@@ -44,46 +33,6 @@ function search(query) {
   }
   hits.sort((a, b) => b[0] - a[0] || b[1].revs[0].time - a[1].revs[0].time);
   return hits.map((h) => h[1]);
-}
-
-function ago(secs) {
-  const d = Date.now() / 1000 - secs;
-  const units = [[31536000, "year"], [2592000, "month"], [86400, "day"], [3600, "hour"], [60, "minute"]];
-  for (const [n, name] of units) {
-    const v = Math.floor(d / n);
-    if (v >= 1) return `${v} ${name}${v > 1 ? "s" : ""} ago`;
-  }
-  return "just now";
-}
-
-function short(key) {
-  return key.length > 20 ? key.slice(0, 16) + "…" + key.slice(-4) : key;
-}
-
-async function getJSON(url) {
-  const resp = await fetch(url, { cache: "no-cache" });
-  if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
-  return resp.json();
-}
-
-async function load() {
-  let index;
-  try {
-    index = await getJSON(`${registry}/v1/index`);
-    head = await getJSON(`${registry}/v1/head`).catch(() => null);
-  } catch (e) {
-    // No registry on this origin, or it is down: use the snapshot.
-    index = await getJSON("index.json");
-    head = await getJSON("head.json").catch(() => null);
-  }
-  const byName = new Map();
-  for (const hit of index) {
-    if (!byName.has(hit.name)) byName.set(hit.name, { name: hit.name, revs: [] });
-    byName.get(hit.name).revs.push(hit);
-  }
-  models = [...byName.values()];
-  for (const m of models) m.revs.sort((a, b) => b.time - a.time);
-  models.sort((a, b) => b.revs[0].time - a.revs[0].time);
 }
 
 function renderList(query) {
@@ -113,20 +62,6 @@ function renderList(query) {
   $("model").hidden = true;
 }
 
-function command(text) {
-  const button = el("button", { type: "button", text: "Copy" });
-  button.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      button.textContent = "Copied";
-    } catch {
-      button.textContent = "Select it";
-    }
-    setTimeout(() => (button.textContent = "Copy"), 1500);
-  });
-  return el("div", { class: "cmd" }, el("pre", {}, el("code", { text: text })), button);
-}
-
 function renderModel(name) {
   const m = models.find((x) => x.name === name);
   const view = $("model");
@@ -140,7 +75,6 @@ function renderModel(name) {
   }
   const latest = m.revs[0];
   const ref = `${m.name}@${latest.rev}`;
-  const registryUrl = registry || location.origin;
   const setup = `export CHUNGUS_REGISTRY=${registryUrl}`;
   $("status").textContent = "";
   view.append(
@@ -183,24 +117,17 @@ function route() {
   }
 }
 
-function renderLog() {
-  if (!head) return;
-  $("log").textContent =
-    `The log has ${head.size} entr${head.size === 1 ? "y" : "ies"}, signed by operator ${head.signature.key}. ` +
-    `Check it yourself with: chungus audit --operator ${head.signature.key}`;
-}
-
 async function main() {
   const params = new URLSearchParams(location.search);
   $("q").value = params.get("q") || "";
   try {
-    await load();
+    ({ models, head } = await loadIndex());
   } catch (e) {
     $("status").textContent = "Couldn't reach the registry. Try again in a minute.";
     console.error(e);
     return;
   }
-  renderLog();
+  $("log").textContent = logLine(head);
   $("q").addEventListener("input", () => {
     const q = $("q").value;
     const url = new URL(location.href);

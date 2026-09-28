@@ -1,6 +1,12 @@
-# The registry and the search site on one HTTPS domain. Caddy gets and renews the
-# certificate itself; set CHUNGUS_DOMAIN in .env and point the domain's DNS at the server.
-{$CHUNGUS_DOMAIN} {
+# The site (landing page and model search) and the registry API on one domain, HTTPS
+# only. Caddy gets and renews the certificate itself, answers plain HTTP on port 80 only
+# with a permanent redirect to HTTPS, and HSTS tells browsers never to try HTTP again.
+# Set CHUNGUS_DOMAIN in .env and point the domain's DNS at the server.
+http://{$CHUNGUS_DOMAIN} {
+	redir https://{host}{uri} permanent
+}
+
+https://{$CHUNGUS_DOMAIN} {
 	encode zstd gzip
 
 	# The registry API. Statements are small; refuse anything bigger.
@@ -11,14 +17,14 @@
 		reverse_proxy registry:7450
 	}
 
-	# The search site.
+	# The landing page and search.
 	handle {
 		root * /srv/site
 		file_server
 	}
 
 	header {
-		Strict-Transport-Security "max-age=31536000"
+		Strict-Transport-Security "max-age=63072000"
 		X-Content-Type-Options nosniff
 		Referrer-Policy no-referrer
 		Content-Security-Policy "default-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"

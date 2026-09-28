@@ -56,7 +56,7 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
-  # HTTPS in front of the registry, and the search site from ../site.
+  # HTTPS for the registry API and the site (landing page and search) from ../site.
   web:
     profiles: [registry]
     image: caddy:2-alpine

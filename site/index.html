@@ -3,28 +3,84 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>chungus models</title>
-<meta name="description" content="Search models shared on the chungus network.">
+<title>chungus</title>
+<meta name="description" content="A peer-to-peer network for AI models: smaller downloads, shared by peers, signed by publishers.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; connect-src 'self' https: http://localhost:*">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23c2410c'/><rect x='3' y='3' width='4' height='4' fill='white'/><rect x='9' y='3' width='4' height='4' fill='white' opacity='.7'/><rect x='3' y='9' width='4' height='4' fill='white' opacity='.7'/><rect x='9' y='9' width='4' height='4' fill='white' opacity='.4'/></svg>">
 <link rel="stylesheet" href="style.css">
 <script src="config.js"></script>
-<script src="app.js" defer></script>
+<script src="common.js"></script>
+<script src="home.js" defer></script>
 </head>
 <body>
 <header>
-  <a class="brand" href="#">chungus</a>
-  <form id="search" role="search">
-    <input id="q" type="search" placeholder="Search models" aria-label="Search models" autocomplete="off" spellcheck="false">
-  </form>
+  <a class="brand" href="./">chungus</a>
+  <nav class="links top">
+    <a href="search.html">Models</a>
+    <a href="https://github.com/buwunny/chungus#readme">Docs</a>
+    <a href="https://github.com/buwunny/chungus">GitHub</a>
+  </nav>
 </header>
 <main>
-  <p id="status" class="muted" aria-live="polite">Loading models…</p>
-  <section id="list" hidden></section>
-  <section id="model" hidden></section>
+  <section class="hero">
+    <h1>AI models, shared peer to peer.</h1>
+    <p class="lede">chungus splits models into deduplicated, compressed chunks and moves them between peers, on your LAN or across the internet. Every model is signed by its publisher, and every name is recorded in a public log anyone can check.</p>
+    <form class="hero-search" action="search.html" method="get" role="search">
+      <input name="q" type="search" placeholder="Search models" aria-label="Search models" autocomplete="off" spellcheck="false">
+      <button type="submit">Search</button>
+    </form>
+    <p id="stats" class="muted" aria-live="polite"></p>
+  </section>
+
+  <section>
+    <h2>Get started</h2>
+    <div id="start"></div>
+  </section>
+
+  <section class="features">
+    <div>
+      <h3>Smaller downloads</h3>
+      <p>Content-defined chunks are stored once across files and models, and a lossless float transform helps zstd on BF16 and F32 weights. Every chunk is checked against its hash.</p>
+    </div>
+    <div>
+      <h3>Shared by peers</h3>
+      <p>Machines on your LAN find each other on their own. Over the internet, peers find models on a DHT and connect through relays when behind NAT. Mount a model and start loading it before the download finishes.</p>
+    </div>
+    <div>
+      <h3>Signed and auditable</h3>
+      <p>Publishers sign what they publish, and the registry keeps an append-only, hash-chained log of every name and block. Nodes refuse blocked models and chunks.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Recently published</h2>
+      <a href="search.html">All models</a>
+    </div>
+    <div id="recent"><p class="muted">Loading…</p></div>
+  </section>
+
+  <section>
+    <h2>Take part</h2>
+    <div class="cards">
+      <a class="hit" href="https://github.com/buwunny/chungus#the-registry-names-search-and-the-blocklist">
+        <div class="name">Publish a model</div>
+        <div class="desc">Pack it, sign it, give it a name like acme/tiny-llama.</div>
+      </a>
+      <a class="hit" href="https://github.com/buwunny/chungus#running-a-public-node">
+        <div class="name">Run a public node</div>
+        <div class="desc">Help seed models and relay for peers behind NAT, from a small VPS.</div>
+      </a>
+      <a class="hit" href="https://github.com/buwunny/chungus#drop-in-hugging-face-cache">
+        <div class="name">Use it with Hugging Face</div>
+        <div class="desc">Point HF_ENDPOINT at a local chungus hub and keep your tools unchanged.</div>
+      </a>
+    </div>
+  </section>
 </main>
 <footer>
   <p id="log" class="muted"></p>
-  <p class="muted">Every name is signed by its publisher and recorded in the registry's public log. <a href="https://github.com/buwunny/chungus">Source and docs</a></p>
+  <nav class="links"><a href="./">Home</a> <a href="search.html">Models</a> <a href="https://github.com/buwunny/chungus#readme">Docs</a> <a href="https://github.com/buwunny/chungus">GitHub</a></nav>
 </footer>
 </body>
 </html>

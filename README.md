@@ -129,7 +129,7 @@ Two DHT attacks matter most here. In a **Sybil** attack someone runs thousands o
 chungus anchors /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... --key .chungus/registry/operator.key
 
 # Nodes and fetchers use it
-chungus node --anchors-from http://registry.example:7450 --operator chungus1<operator key> --max-upload 20
+chungus node --anchors-from https://chungus.example.com --operator chungus1<operator key> --max-upload 20
 chungus fetch acme/tiny-llama@v1 --swarm -o model/
 ```
 
@@ -173,7 +173,7 @@ Peers move bytes; a registry gives models names. `acme/tiny-llama@v1` points at 
 ```sh
 # Run a registry (it creates an operator key in its data directory)
 chungus registry --data .chungus/registry
-export CHUNGUS_REGISTRY=http://registry.example:7450
+export CHUNGUS_REGISTRY=https://chungus.example.com
 
 # Publish a packed model under a name, then find and fetch it anywhere
 chungus publish <root> --name acme/tiny-llama@v1 --description "A tiny Llama for tests"
@@ -186,11 +186,11 @@ chungus audit --operator chungus1<operator key>
 
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
-### A public registry and search site
+### A public registry and website
 
-`site/` is a static search page for a registry: it downloads the list of published models (`GET /v1/index`) and searches it in the browser, and each model's page shows its revisions and the commands to fetch or mount it. The registry allows cross-origin reads, so the page can live anywhere.
+`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its revisions and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
 
-To run a public registry on the same server as the public node, with HTTPS from Caddy and the search site on the same domain:
+To run a public registry on the same server as the public node, with the website on the same domain, HTTPS only (Caddy gets the certificate, redirects HTTP to HTTPS and sends HSTS):
 
 ```sh
 cd chungus/deploy
@@ -201,7 +201,7 @@ docker compose logs registry   # the operator key: nodes pin it with --operator
 
 Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and operator key live in the `registry-data` volume, so back it up: the operator key signs the log head, the blocklist and the anchor list, and a new key means every node has to pin a new one. Operator commands run inside the container, e.g. `docker compose exec registry chungus block <hash> --key /data/registry/operator.key`.
 
-The site can also be published to GitHub Pages: set the repository variable `CHUNGUS_REGISTRY_URL` to the registry's HTTPS address and Settings > Pages > Source to "GitHub Actions". The Pages workflow points the page at the live registry and bundles a snapshot of its index, refreshed every six hours, for when the registry is down.
+The site can also be published to GitHub Pages: set the repository variable `CHUNGUS_REGISTRY_URL` to the registry's HTTPS address (the workflow refuses anything else), set Settings > Pages > Source to "GitHub Actions" and tick "Enforce HTTPS". The Pages workflow points the page at the live registry and bundles a snapshot of its index, refreshed every six hours, for when the registry is down.
 
 ## What to expect
 
