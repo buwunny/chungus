@@ -75,6 +75,13 @@ pub fn encode(raw: &[u8], dtype: Dtype) -> Result<Vec<u8>> {
 
 /// Decode a blob back to the raw chunk. `len` is the expected raw length.
 pub fn decode(blob: &[u8], len: usize) -> Result<Vec<u8>> {
+    // `len` comes from a manifest, which anyone can write; don't let it size a buffer.
+    if len > crate::chunk::MAX_SIZE {
+        bail!(
+            "chunk length {len} is over the {} byte maximum",
+            crate::chunk::MAX_SIZE
+        );
+    }
     if blob.len() < 3 || blob[0] != VERSION {
         bail!("bad blob header");
     }
@@ -322,4 +329,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp.write_all(bytes)?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_refuses_oversized_lengths() {
+        // Found by fuzzing: a claimed length of ~4 GB was allocated before decompressing.
+        let blob = encode(b"hello", Dtype::Raw).unwrap();
+        assert!(decode(&blob, 4_096_293_148).is_err());
+        assert_eq!(decode(&blob, 5).unwrap(), b"hello");
+    }
 }

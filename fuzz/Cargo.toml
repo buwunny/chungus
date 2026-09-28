@@ -1,0 +1,54 @@
+[package]
+name = "chungus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+# The CBOR library libp2p's request-response codec uses, so peer messages are decoded
+# exactly as a node decodes them.
+cbor4ii = { version = "1.2", features = ["serde1", "use_std"] }
+
+[dependencies.chungus]
+path = ".."
+
+# Run with `cargo +nightly fuzz run <target>`; see README.md.
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_message"
+path = "fuzz_targets/peer_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob"
+path = "fuzz_targets/blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safetensors"
+path = "fuzz_targets/safetensors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_log"
+path = "fuzz_targets/registry_log.rs"
+test = false
+doc = false
+bench = false
