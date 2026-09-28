@@ -40,6 +40,13 @@ use crate::store::{self, Store};
 pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/chungus/1");
 pub const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/chungus/kad/1");
 pub const DEFAULT_PORT: u16 = 4001;
+/// The project's public node. Nodes and swarm fetches join through it unless told
+/// otherwise, and nodes behind NAT use it as their relay.
+const DEFAULT_NODE: &str = "12D3KooWRaVx8DKtusbdVeThtaFxqR7C8jgSvz6fArBwh52SCAeR";
+const DEFAULT_NODE_ADDRS: &[&str] = &[
+    "/ip4/40.160.91.185/tcp/4001",
+    "/ip4/40.160.91.185/udp/4001/quic-v1",
+];
 /// Largest response a peer may send: a manifest of a very large model, or one chunk.
 const MAX_RESPONSE: u64 = 256 << 20;
 /// How often a node looks for newly added models to announce.
@@ -149,6 +156,30 @@ fn peer_of(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
+/// Where to join the swarm when no bootstrap node is given: the project's public node,
+/// over TCP and QUIC.
+pub fn default_bootstrap() -> Vec<Multiaddr> {
+    DEFAULT_NODE_ADDRS
+        .iter()
+        .map(|a| {
+            format!("{a}/p2p/{DEFAULT_NODE}")
+                .parse()
+                .expect("valid multiaddr")
+        })
+        .collect()
+}
+
+/// The relay to use behind NAT when none is given: the project's public node, over TCP.
+pub fn default_relays() -> Vec<Multiaddr> {
+    default_bootstrap().into_iter().take(1).collect()
+}
+
+/// `addrs` without those of `me`, so a node never bootstraps or relays through itself
+/// (the public node runs with the same defaults as everyone else).
+fn without_self(addrs: &mut Vec<Multiaddr>, me: PeerId) {
+    addrs.retain(|a| peer_of(a) != Some(me));
+}
+
 /// DHT keys. A model's root is announced by nodes that hold all of it, `manifest/<root>`
 /// by any node with its manifest, and each block id by nodes that hold that block.
 fn dht_key(key: &str) -> kad::RecordKey {
@@ -169,8 +200,11 @@ struct Held {
 impl Node {
     /// Start a node serving `store`. It announces every model already in the store and
     /// any added later.
-    pub async fn start(store: Arc<Store>, key: Keypair, cfg: Config) -> Result<Node> {
+    pub async fn start(store: Arc<Store>, key: Keypair, mut cfg: Config) -> Result<Node> {
         let peer_id = key.public().to_peer_id();
+        without_self(&mut cfg.bootstrap, peer_id);
+        without_self(&mut cfg.relays, peer_id);
+        without_self(&mut cfg.anchors, peer_id);
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
             .with_tokio()
             .with_tcp(
@@ -1107,5 +1141,25 @@ impl crate::lazy::ChunkSource for ModelSources {
             }
             false
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_nodes_parse_and_skip_self() {
+        let boot = default_bootstrap();
+        assert_eq!(boot.len(), 2);
+        let me: PeerId = DEFAULT_NODE.parse().unwrap();
+        assert!(boot.iter().all(|a| peer_of(a) == Some(me)));
+        assert_eq!(default_relays().len(), 1);
+
+        let mut addrs = boot.clone();
+        without_self(&mut addrs, PeerId::random());
+        assert_eq!(addrs, boot);
+        without_self(&mut addrs, me);
+        assert!(addrs.is_empty());
     }
 }
