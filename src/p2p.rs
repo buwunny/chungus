@@ -98,6 +98,8 @@ pub struct Config {
     pub limits: Limits,
     /// Caps on relaying, when `relay_server` is set.
     pub relay: crate::limits::RelayLimits,
+    /// Print connections, bootstrap progress and relay reservations as they happen.
+    pub log: bool,
 }
 
 enum Command {
@@ -270,11 +272,19 @@ impl Node {
             }
         }
         let mut anchors = Vec::new();
+        let mut known: HashMap<PeerId, &'static str> = HashMap::new();
+        for addr in &cfg.bootstrap {
+            known.extend(peer_of(addr).map(|p| (p, "bootstrap")));
+        }
+        for addr in &cfg.relays {
+            known.extend(peer_of(addr).map(|p| (p, "relay")));
+        }
         for addr in &cfg.anchors {
             let peer = peer_of(addr)
                 .with_context(|| format!("anchor address {addr} must end in /p2p/<peer id>"))?;
             swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
             swarm.behaviour_mut().limits.bypass_peer_id(&peer);
+            known.entry(peer).or_insert("anchor");
             if !relays.contains_key(&peer) {
                 swarm.dial(addr.clone())?;
             }
@@ -310,6 +320,10 @@ impl Node {
             serving: HashMap::new(),
             anchor_set: anchors.iter().copied().collect(),
             limits: cfg.limits.clone(),
+            log: cfg.log,
+            known,
+            observed: HashSet::new(),
+            joined: false,
         };
         tokio::spawn(runner.run());
         Ok(Node {
@@ -391,6 +405,13 @@ struct Runner {
     serving: HashMap<PeerId, usize>,
     anchor_set: HashSet<PeerId>,
     limits: Limits,
+    log: bool,
+    /// Peers the operator named, and what as ("bootstrap", "relay"), for clearer logs.
+    known: HashMap<PeerId, &'static str>,
+    /// Named peers that have told us which address they see us at.
+    observed: HashSet<PeerId>,
+    /// Whether a DHT bootstrap has succeeded yet.
+    joined: bool,
 }
 
 type Reply = (PeerId, ResponseChannel<Response>, Response);
@@ -544,6 +565,24 @@ impl Runner {
         }
     }
 
+    fn say(&self, msg: impl std::fmt::Display) {
+        if self.log {
+            println!("{msg}");
+        }
+    }
+
+    /// How to name `peer` in logs: "bootstrap 12D3…" for peers the operator named.
+    fn who(&self, peer: &PeerId) -> String {
+        match self.known.get(peer) {
+            Some(role) => format!("{role} {peer}"),
+            None => format!("peer {peer}"),
+        }
+    }
+
+    fn peers(&self) -> usize {
+        self.swarm.connected_peers().count()
+    }
+
     fn learn(&mut self, peer: PeerId, addr: Multiaddr) {
         self.addrs.entry(peer).or_default().insert(addr);
     }
@@ -571,29 +610,143 @@ impl Runner {
                 }
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
-            } if !endpoint.is_relayed() => {
-                if let Some((addr, listener @ None)) = self.relays.get_mut(&peer_id) {
+                peer_id,
+                endpoint,
+                num_established,
+                ..
+            } => {
+                if num_established.get() == 1 {
+                    let how = if endpoint.is_relayed() {
+                        "through a relay"
+                    } else if endpoint.is_dialer() {
+                        "outbound"
+                    } else {
+                        "inbound"
+                    };
+                    let addr = endpoint.get_remote_address();
+                    self.say(format_args!(
+                        "connected to {} ({how}, {addr}); {} peer(s) connected",
+                        self.who(&peer_id),
+                        self.peers()
+                    ));
+                }
+                if !endpoint.is_relayed()
+                    && let Some((addr, listener @ None)) = self.relays.get_mut(&peer_id)
+                {
                     *listener = self
                         .swarm
                         .listen_on(addr.clone().with(Protocol::P2pCircuit))
                         .ok();
-                }
-            }
-            SwarmEvent::ListenerClosed { listener_id, .. } => {
-                // Lost a relay reservation: ask again when next connected, and reconnect.
-                for (addr, listener) in self.relays.values_mut() {
-                    if *listener == Some(listener_id) {
-                        *listener = None;
-                        let _ = self.swarm.dial(addr.clone());
+                    if self.log {
+                        println!("asking relay {peer_id} for a reservation");
                     }
                 }
             }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established: 0,
+                cause,
+                ..
+            } => {
+                let why = cause.map(|c| format!(": {c}")).unwrap_or_default();
+                self.say(format_args!(
+                    "disconnected from {}{why}; {} peer(s) connected",
+                    self.who(&peer_id),
+                    self.peers()
+                ));
+            }
+            SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(peer),
+                error,
+                ..
+            } if self.known.contains_key(&peer) => {
+                // Dial errors nest across several lines; keep the log to one.
+                let error = error.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+                self.say(format_args!("could not reach {}: {error}", self.who(&peer)));
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                reason,
+                ..
+            } => {
+                // Lost a relay reservation: ask again when next connected, and reconnect.
+                let mut lost = Vec::new();
+                for (peer, (addr, listener)) in self.relays.iter_mut() {
+                    if *listener == Some(listener_id) {
+                        *listener = None;
+                        let _ = self.swarm.dial(addr.clone());
+                        lost.push(*peer);
+                    }
+                }
+                for peer in lost {
+                    let why = reason.as_ref().err().map(|e| format!(": {e}")).unwrap_or_default();
+                    self.say(format_args!("lost the reservation on relay {peer}{why}; retrying"));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(ev)) => match ev {
+                relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal: false,
+                    ..
+                } => self.say(format_args!(
+                    "relay reservation accepted by {relay_peer_id}; others can now reach this node through it"
+                )),
+                relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => self.say(
+                    format_args!("peer {src_peer_id} connected to us through a relay"),
+                ),
+                _ => {}
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Relay(ev)) => match ev {
+                relay::Event::ReservationReqAccepted {
+                    src_peer_id,
+                    renewed: false,
+                } => self.say(format_args!("relaying for {src_peer_id} (reservation accepted)")),
+                relay::Event::ReservationReqDenied {
+                    src_peer_id,
+                    status,
+                } => self.say(format_args!(
+                    "refused a relay reservation from {src_peer_id}: {status:?}"
+                )),
+                relay::Event::ReservationTimedOut { src_peer_id } => {
+                    self.say(format_args!("relay reservation for {src_peer_id} expired"))
+                }
+                relay::Event::CircuitReqAccepted {
+                    src_peer_id,
+                    dst_peer_id,
+                } => self.say(format_args!(
+                    "relaying a connection from {src_peer_id} to {dst_peer_id}"
+                )),
+                relay::Event::CircuitReqDenied {
+                    src_peer_id,
+                    dst_peer_id,
+                    status,
+                } => self.say(format_args!(
+                    "refused to relay {src_peer_id} to {dst_peer_id}: {status:?}"
+                )),
+                _ => {}
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr::Event {
+                remote_peer_id,
+                result,
+            })) => match result {
+                Ok(_) => self.say(format_args!(
+                    "hole punch to {remote_peer_id} worked; now connected directly"
+                )),
+                Err(e) => self.say(format_args!("hole punch to {remote_peer_id} failed: {e}")),
+            },
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
                 ..
             })) => {
+                // What a named peer sees tells the operator whether they're behind NAT.
+                if self.known.contains_key(&peer_id) && self.observed.insert(peer_id) {
+                    self.say(format_args!(
+                        "{} sees this node at {}",
+                        self.who(&peer_id),
+                        info.observed_addr
+                    ));
+                }
                 let dht = info.protocols.contains(&KAD_PROTOCOL);
                 for addr in info.listen_addrs {
                     if dht {
@@ -612,6 +765,37 @@ impl Runner {
                     old_peer: Some(old),
                     ..
                 } => self.caps.remove(&old),
+                kad::Event::OutboundQueryProgressed {
+                    result: kad::QueryResult::Bootstrap(res),
+                    step,
+                    ..
+                } => {
+                    // Kademlia bootstraps again every few minutes; report the first join,
+                    // and failures until then.
+                    if step.last && !self.joined {
+                        // The bootstrap query succeeds on the seed addresses alone, even
+                        // when none of them answer, so also require a live connection.
+                        self.joined = res.is_ok() && self.peers() > 0;
+                        let table: usize = self
+                            .swarm
+                            .behaviour_mut()
+                            .kad
+                            .kbuckets()
+                            .map(|b| b.num_entries())
+                            .sum();
+                        match res {
+                            Ok(_) if !self.joined => self.say(
+                                "DHT bootstrap found no reachable peers yet; still trying",
+                            ),
+                            Ok(_) => self.say(format_args!(
+                                "joined the DHT: {table} peer(s) in the routing table"
+                            )),
+                            Err(e) => self.say(format_args!(
+                                "DHT bootstrap did not finish ({e:?}); {table} peer(s) in the routing table"
+                            )),
+                        }
+                    }
+                }
                 kad::Event::OutboundQueryProgressed {
                     id, result, step, ..
                 } => {

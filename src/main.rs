@@ -818,6 +818,7 @@ async fn main() -> Result<()> {
                     max_reservations: relay_max_reservations,
                     ..Default::default()
                 },
+                log: true,
                 ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key, config).await?;

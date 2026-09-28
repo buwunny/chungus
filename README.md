@@ -114,6 +114,8 @@ Models are announced at two levels. A node with the whole model announces its ro
 
 A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute. There are no public bootstrap nodes yet, so someone has to run the first one.
 
+`node` logs what it connects to, so you can tell it joined: `connected to bootstrap <peer>`, `joined the DHT`, and with `--relay`, `relay reservation accepted by <peer>` followed by a `/p2p-circuit` address that others can reach you at. `could not reach bootstrap <peer>: <error>` means the bootstrap node's port is closed or the address is wrong. The public node logs a line for each peer that connects to it.
+
 ### Limits and attack resistance
 
 A node is someone's desktop, so it protects its owner. `--max-upload <MB/s>` caps upload bandwidth (on `serve` too), `--max-connections`, `--max-requests-per-peer` and `--max-uploads` bound how many peers and requests it serves at once (a peer over its share is told to come back later), and `--download-only` fetches through the swarm without serving or announcing anything. A one-off `chungus fetch` is always download-only.
