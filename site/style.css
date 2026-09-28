@@ -1,0 +1,89 @@
+:root {
+  --bg: #fbfaf8;
+  --fg: #1c1917;
+  --muted: #6b645e;
+  --line: #e7e2dc;
+  --card: #ffffff;
+  --accent: #c2410c;
+  --code: #f3f0ec;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161412;
+    --fg: #ece8e4;
+    --muted: #a39b93;
+    --line: #2f2b27;
+    --card: #1e1b18;
+    --accent: #fb923c;
+    --code: #26221f;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+a { color: var(--accent); }
+header, main, footer { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+header { display: flex; gap: 16px; align-items: center; padding-top: 24px; padding-bottom: 16px; }
+.brand { font-weight: 700; font-size: 20px; text-decoration: none; color: var(--fg); }
+#search { flex: 1; }
+#q {
+  width: 100%;
+  padding: 10px 14px;
+  font: inherit;
+  color: inherit;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+#q:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.muted { color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+main, footer { min-width: 0; }
+.cmd, #model { min-width: 0; max-width: 100%; }
+.hit {
+  display: block;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  text-decoration: none;
+  color: inherit;
+}
+.hit:hover { border-color: var(--accent); }
+.hit .name { font-weight: 600; overflow-wrap: anywhere; }
+.hit .desc { margin: 4px 0; }
+.meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+h1 { font-size: 24px; margin: 8px 0; overflow-wrap: anywhere; }
+h2 { font-size: 16px; margin: 24px 0 8px; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+pre {
+  background: var(--code);
+  padding: 12px 14px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 0;
+}
+.cmd { position: relative; margin-bottom: 8px; }
+.cmd pre { padding-right: 64px; }
+.cmd button {
+  position: absolute; top: 6px; right: 6px;
+  font: inherit; font-size: 12px;
+  padding: 2px 8px;
+  color: var(--muted);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; }
+td code { overflow-wrap: anywhere; }
+footer { padding-top: 24px; padding-bottom: 32px; }

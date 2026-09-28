@@ -1,0 +1,27 @@
+# The registry and the search site on one HTTPS domain. Caddy gets and renews the
+# certificate itself; set CHUNGUS_DOMAIN in .env and point the domain's DNS at the server.
+{$CHUNGUS_DOMAIN} {
+	encode zstd gzip
+
+	# The registry API. Statements are small; refuse anything bigger.
+	handle /v1/* {
+		request_body {
+			max_size 64KB
+		}
+		reverse_proxy registry:7450
+	}
+
+	# The search site.
+	handle {
+		root * /srv/site
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+		-Server
+	}
+}

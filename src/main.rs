@@ -198,9 +198,13 @@ enum Cmd {
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
         /// Where the log and the operator key live.
-        #[arg(long, default_value = ".chungus/registry")]
+        #[arg(
+            long,
+            env = "CHUNGUS_REGISTRY_DATA",
+            default_value = ".chungus/registry"
+        )]
         data: PathBuf,
-        #[arg(long, default_value_t = registry::DEFAULT_PORT)]
+        #[arg(long, env = "CHUNGUS_REGISTRY_PORT", default_value_t = registry::DEFAULT_PORT)]
         port: u16,
     },
     /// Give a model in the store a name (org/model[@rev]) in the registry, signed by you.

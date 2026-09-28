@@ -186,6 +186,23 @@ chungus audit --operator chungus1<operator key>
 
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
+### A public registry and search site
+
+`site/` is a static search page for a registry: it downloads the list of published models (`GET /v1/index`) and searches it in the browser, and each model's page shows its revisions and the commands to fetch or mount it. The registry allows cross-origin reads, so the page can live anywhere.
+
+To run a public registry on the same server as the public node, with HTTPS from Caddy and the search site on the same domain:
+
+```sh
+cd chungus/deploy
+cp .env.example .env           # set CHUNGUS_DOMAIN, with its DNS pointing at the server
+docker compose --profile registry up -d --build
+docker compose logs registry   # the operator key: nodes pin it with --operator
+```
+
+Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and operator key live in the `registry-data` volume, so back it up: the operator key signs the log head, the blocklist and the anchor list, and a new key means every node has to pin a new one. Operator commands run inside the container, e.g. `docker compose exec registry chungus block <hash> --key /data/registry/operator.key`.
+
+The site can also be published to GitHub Pages: set the repository variable `CHUNGUS_REGISTRY_URL` to the registry's HTTPS address and Settings > Pages > Source to "GitHub Actions". The Pages workflow points the page at the live registry and bundles a snapshot of its index, refreshed every six hours, for when the registry is down.
+
 ## What to expect
 
 On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports zstd alone at 78% of the original size and the full pipeline at 73%. Real models usually compress somewhat better than synthetic ones. Published results (ZipNN, DFloat11) put BF16 near 67–70% of original size. Models already quantized to 4 bits barely compress. Dedup savings depend on how much two models actually share: re-uploads and format copies dedup almost completely, and full fine-tunes dedup very little.

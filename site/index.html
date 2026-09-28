@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chungus models</title>
+<meta name="description" content="Search models shared on the chungus network.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23c2410c'/><rect x='3' y='3' width='4' height='4' fill='white'/><rect x='9' y='3' width='4' height='4' fill='white' opacity='.7'/><rect x='3' y='9' width='4' height='4' fill='white' opacity='.7'/><rect x='9' y='9' width='4' height='4' fill='white' opacity='.4'/></svg>">
+<link rel="stylesheet" href="style.css">
+<script src="config.js"></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <a class="brand" href="#">chungus</a>
+  <form id="search" role="search">
+    <input id="q" type="search" placeholder="Search models" aria-label="Search models" autocomplete="off" spellcheck="false">
+  </form>
+</header>
+<main>
+  <p id="status" class="muted" aria-live="polite">Loading models…</p>
+  <section id="list" hidden></section>
+  <section id="model" hidden></section>
+</main>
+<footer>
+  <p id="log" class="muted"></p>
+  <p class="muted">Every name is signed by its publisher and recorded in the registry's public log. <a href="https://github.com/buwunny/chungus">Source and docs</a></p>
+</footer>
+</body>
+</html>
