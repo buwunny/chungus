@@ -2,7 +2,7 @@
 
 A peer-to-peer network for distributing AI models, their runtimes and Docker AI images. Think of it as a decentralized Hugging Face with its own take on Xet-style storage.
 
-This repository currently holds **milestones 1 to 3** and most of milestone 4: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, signed models, and sharing over the internet.
+This repository currently holds **milestones 1 to 3** and most of milestone 4: the storage format, a benchmark tool, sharing models between machines on a LAN, a drop-in Hugging Face cache, signed models, sharing over the internet, and a registry for names, search and blocklists.
 
 ## The pipeline
 
@@ -112,6 +112,26 @@ chungus fetch <root> --bootstrap /ip4/203.0.113.7/tcp/4001/p2p/12D3KooW... -o mo
 
 A node behind NAT is reached through its relay, and the two ends then try to hole-punch a direct connection (DCUtR). A node's identity lives in `node.key` in its store. `node` announces models added to the store while it runs within a minute. There are no public bootstrap nodes yet, so someone has to run the first one.
 
+## The registry: names, search and the blocklist
+
+Peers move bytes; a registry gives models names. `acme/tiny-llama@v1` points at a manifest root, signed by the publisher's key. The first key to publish under an org owns it, and only its owners (see `chungus grant`) can publish there after that. Every change goes into an append-only, hash-chained log whose head the registry signs, so anyone can download the log and check that no name was rewritten.
+
+```sh
+# Run a registry (it creates an operator key in its data directory)
+chungus registry --data .chungus/registry
+export CHUNGUS_REGISTRY=http://registry.example:7450
+
+# Publish a packed model under a name, then find and fetch it anywhere
+chungus publish <root> --name acme/tiny-llama@v1 --description "A tiny Llama for tests"
+chungus search tiny llama
+chungus fetch acme/tiny-llama@v1 -o model/     # requires the publisher's signature
+
+# Check the whole log against the registry's signed head
+chungus audit --operator chungus1<operator key>
+```
+
+The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
+
 ## What to expect
 
 On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports zstd alone at 78% of the original size and the full pipeline at 73%. Real models usually compress somewhat better than synthetic ones. Published results (ZipNN, DFloat11) put BF16 near 67–70% of original size. Models already quantized to 4 bits barely compress. Dedup savings depend on how much two models actually share: re-uploads and format copies dedup almost completely, and full fine-tunes dedup very little.
@@ -127,7 +147,7 @@ A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatu
 | **M1** (done) | Storage format, `pack` / `unpack` / `bench` |
 | **M2** (done) | Share models between machines on a LAN (mDNS discovery, verified transfer, origin fallback) |
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
-| M4 | Signed models (done); internet swarm over libp2p (done: Kademlia DHT, relays, hole punching); registry and search |
+| M4 | Signed models, internet swarm over libp2p, registry with a transparency log, search and blocklist (done); 64 MB block announcements |
 | Later | OCI images, lazy layer loading, dedicated nodes, voting, GPU-side decode |
 
 The earlier OCI registry proxy design is kept in [docs/archive/oci-proxy-design.md](docs/archive/oci-proxy-design.md) for the Docker image work.
