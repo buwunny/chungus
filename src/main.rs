@@ -10,15 +10,24 @@ use libp2p::Multiaddr;
 
 use chungus::hub;
 use chungus::limits::{Limits, RateLimiter, RelayLimits};
-use chungus::manifest::Manifest;
+use chungus::manifest::{self, Manifest};
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
 use chungus::registry::{self, Claim, Statement};
 use chungus::sign;
 use chungus::store::{self, Store};
 
+/// `chungus --version` also names every format it speaks (see docs/formats.md). A test
+/// keeps this in step with the constants.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nmanifest: chungus/manifest/v2 (also reads v1)",
+    "\nstore: v1, chunk blobs: v1",
+    "\nwire: /chungus/1, /chungus/kad/1, HTTP /v1",
+);
+
 #[derive(Parser)]
-#[command(version, about = "Chunk, compress, deduplicate and share model files")]
+#[command(version, long_version = LONG_VERSION, about = "Chunk, compress, deduplicate and share model files")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -521,9 +530,7 @@ fn load_manifest(arg: &str, store: &Store) -> Result<Manifest> {
     if store::is_hash(arg) && !Path::new(arg).exists() {
         return store.get_manifest(arg);
     }
-    Ok(serde_json::from_slice(
-        &fs::read(arg).with_context(|| format!("read {arg}"))?,
-    )?)
+    manifest::parse(&fs::read(arg).with_context(|| format!("read {arg}"))?)
 }
 
 #[tokio::main]
@@ -1106,4 +1113,18 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_version_matches_formats() {
+        assert!(LONG_VERSION.contains(manifest::FORMAT));
+        assert!(LONG_VERSION.contains(&format!("store: v{}", store::STORE_VERSION)));
+        assert!(LONG_VERSION.contains(&format!("chunk blobs: v{}", store::BLOB_VERSION)));
+        assert!(LONG_VERSION.contains(p2p::PROTOCOL.as_ref()));
+        assert!(LONG_VERSION.contains(p2p::KAD_PROTOCOL.as_ref()));
+    }
 }

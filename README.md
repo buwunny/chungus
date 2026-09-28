@@ -248,6 +248,8 @@ On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports
 
 A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatures in `manifests/<root>.sigs.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that, including each chunk's hash and length, and is the value a publisher signs.
 
+Every format is versioned: manifests name theirs in `format`, a store records its layout in `VERSION`, each chunk blob starts with a version byte, and the swarm protocols carry a version in their ids. A newer chungus keeps reading older data, and an older one refuses newer data with a message to upgrade rather than misreading it. [docs/formats.md](docs/formats.md) lists every version and the rules for changing one; `chungus --version` shows what a binary speaks.
+
 ## Roadmap
 
 | Milestone | Scope |

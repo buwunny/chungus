@@ -251,10 +251,10 @@ impl Node {
                 });
                 Behaviour {
                     kad,
-                    identify: identify::Behaviour::new(identify::Config::new(
-                        "/chungus/1.0.0".into(),
-                        key.public(),
-                    )),
+                    identify: identify::Behaviour::new(
+                        identify::Config::new("/chungus/1.0.0".into(), key.public())
+                            .with_agent_version(format!("chungus/{}", env!("CARGO_PKG_VERSION"))),
+                    ),
                     ping: ping::Behaviour::default(),
                     rr: request_response::cbor::Behaviour::with_codec(
                         request_response::cbor::codec::Codec::default()
@@ -366,6 +366,7 @@ impl Node {
             known,
             observed: HashSet::new(),
             refused: HashSet::new(),
+            mismatched: HashSet::new(),
             joined: false,
         };
         tokio::spawn(runner.run());
@@ -457,6 +458,8 @@ struct Runner {
     observed: HashSet<PeerId>,
     /// Models in the store that list unsafe files, so are never announced.
     refused: HashSet<String>,
+    /// chungus peers on an incompatible protocol version, reported once each.
+    mismatched: HashSet<PeerId>,
     /// Whether a DHT bootstrap has succeeded yet.
     joined: bool,
 }
@@ -819,6 +822,18 @@ impl Runner {
                     ));
                 }
                 let dht = info.protocols.contains(&KAD_PROTOCOL);
+                // A peer that speaks none of our protocols is usually a chungus from after
+                // a wire change; say so once rather than failing requests silently.
+                if info.agent_version.starts_with("chungus/")
+                    && !info.protocols.contains(&PROTOCOL)
+                    && self.mismatched.insert(peer_id)
+                {
+                    self.say(format_args!(
+                        "{peer_id} runs {} and speaks no protocol this node does; one of you \
+                         needs to upgrade",
+                        info.agent_version
+                    ));
+                }
                 for addr in info.listen_addrs {
                     if dht {
                         self.route(peer_id, addr.clone());
@@ -1031,12 +1046,13 @@ pub async fn prepare(
                 for &p in &peers {
                     let problem = match node.request(p, Request::Manifest(root.to_string())).await {
                         Ok(Response::Manifest(Some(bytes))) => {
-                            match serde_json::from_slice::<Manifest>(&bytes) {
+                            match crate::manifest::parse(&bytes) {
                                 Ok(m) if m.root == root && m.verify_root() => {
                                     found = Some(m);
                                     break;
                                 }
-                                _ => "sent an invalid manifest".to_string(),
+                                Ok(_) => "sent an invalid manifest".to_string(),
+                                Err(e) => format!("{e:#}"),
                             }
                         }
                         Ok(Response::Manifest(None)) => "doesn't have it".to_string(),

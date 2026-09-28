@@ -602,8 +602,7 @@ impl Registry {
         let Claim::Publish { root, .. } = &st.claim else {
             bail!("not a publish statement");
         };
-        let m: crate::manifest::Manifest =
-            serde_json::from_slice(manifest).context("malformed manifest")?;
+        let m = crate::manifest::parse(manifest)?;
         if &m.root != root || !m.verify_root() {
             bail!("the manifest doesn't match the published root {root}");
         }
