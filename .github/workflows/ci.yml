@@ -18,7 +18,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Only main saves a cache; pull requests reuse it, so each branch doesn't
+      # add its own copy to the repository's 10 GB cache.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # For the mount test.
       - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: cargo fmt --check
@@ -33,5 +37,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Only main saves a cache; pull requests reuse it, so each branch doesn't
+      # add its own copy to the repository's 10 GB cache.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --all-targets --locked -- -D warnings

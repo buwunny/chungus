@@ -39,9 +39,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       - run: cargo build --release --locked --bin chungus --target ${{ matrix.target }}
       - name: Package
         shell: bash
