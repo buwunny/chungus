@@ -19,7 +19,11 @@ use crate::segment::Dtype;
 use crate::sign::{self, Signature};
 use crate::transform::{self, FloatKind};
 
-const VERSION: u8 = 1;
+/// Version byte at the start of every chunk blob.
+pub const BLOB_VERSION: u8 = 1;
+/// Version of the on-disk layout, kept in `<store>/VERSION`. Stores made before the file
+/// existed are version 1.
+pub const STORE_VERSION: u32 = 1;
 pub const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +72,7 @@ pub fn encode(raw: &[u8], dtype: Dtype) -> Result<Vec<u8>> {
         }
     }
     let mut blob = Vec::with_capacity(3 + best.2.len());
-    blob.extend_from_slice(&[VERSION, best.0 as u8, best.1]);
+    blob.extend_from_slice(&[BLOB_VERSION, best.0 as u8, best.1]);
     blob.extend_from_slice(&best.2);
     Ok(blob)
 }
@@ -82,7 +86,16 @@ pub fn decode(blob: &[u8], len: usize) -> Result<Vec<u8>> {
             crate::chunk::MAX_SIZE
         );
     }
-    if blob.len() < 3 || blob[0] != VERSION {
+    if blob.len() < 3 {
+        bail!("bad blob header");
+    }
+    if blob[0] != BLOB_VERSION {
+        if blob[0] > BLOB_VERSION {
+            bail!(
+                "chunk encoded by a newer chungus (blob v{}); upgrade chungus",
+                blob[0]
+            );
+        }
         bail!("bad blob header");
     }
     let (codec, param, payload) = (Codec::from_u8(blob[1])?, blob[2], &blob[3..]);
@@ -123,6 +136,7 @@ impl Store {
         fs::create_dir_all(root.join("chunks"))
             .with_context(|| format!("create store {}", root.display()))?;
         fs::create_dir_all(root.join("manifests"))?;
+        check_version(root)?;
         Ok(Store {
             root: root.to_path_buf(),
             blocked: Default::default(),
@@ -210,6 +224,7 @@ impl Store {
         if !is_hash(&m.root) || !m.verify_root() {
             bail!("refusing to store a manifest whose root doesn't verify");
         }
+        crate::safety::check_manifest(m)?;
         self.check_allowed(&m.root)?;
         write_atomic(&self.manifest_path(&m.root), &serde_json::to_vec_pretty(m)?)
     }
@@ -222,8 +237,16 @@ impl Store {
         fs::read(self.manifest_path(root)).with_context(|| format!("no manifest {root}"))
     }
 
+    /// A manifest's bytes, to hand to someone else: refused if it lists unsafe files (it
+    /// may predate the check in [`Store::put_manifest`]).
+    pub fn get_safe_manifest_bytes(&self, root: &str) -> Result<Vec<u8>> {
+        let bytes = self.get_manifest_bytes(root)?;
+        crate::safety::check_manifest(&crate::manifest::parse(&bytes)?)?;
+        Ok(bytes)
+    }
+
     pub fn get_manifest(&self, root: &str) -> Result<Manifest> {
-        Ok(serde_json::from_slice(&self.get_manifest_bytes(root)?)?)
+        crate::manifest::parse(&self.get_manifest_bytes(root)?)
     }
 
     fn signatures_path(&self, root: &str) -> PathBuf {
@@ -320,6 +343,32 @@ impl Store {
     }
 }
 
+/// Refuse a store laid out by a newer chungus, and stamp older or new stores with the
+/// current version. A future layout change bumps [`STORE_VERSION`] and migrates here.
+fn check_version(root: &Path) -> Result<()> {
+    let path = root.join("VERSION");
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let v: u32 = s
+                .trim()
+                .parse()
+                .with_context(|| format!("{} is not a store version", path.display()))?;
+            if v > STORE_VERSION {
+                bail!(
+                    "store {} was written by a newer chungus (store v{v}, this one reads up to \
+                     v{STORE_VERSION}); upgrade chungus",
+                    root.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_atomic(&path, format!("{STORE_VERSION}\n").as_bytes())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Write via a temp file and rename, so a crash never leaves a truncated file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
@@ -341,5 +390,26 @@ mod tests {
         let blob = encode(b"hello", Dtype::Raw).unwrap();
         assert!(decode(&blob, 4_096_293_148).is_err());
         assert_eq!(decode(&blob, 5).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn store_version_is_stamped_and_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        Store::open(dir.path()).unwrap();
+        let v = fs::read_to_string(dir.path().join("VERSION")).unwrap();
+        assert_eq!(v.trim(), STORE_VERSION.to_string());
+        // Reopening a current store is fine; a newer one is refused with a clear message.
+        Store::open(dir.path()).unwrap();
+        fs::write(dir.path().join("VERSION"), "99\n").unwrap();
+        let e = Store::open(dir.path()).err().unwrap().to_string();
+        assert!(e.contains("newer chungus"), "{e}");
+    }
+
+    #[test]
+    fn newer_blob_is_named() {
+        let mut blob = encode(b"hello", Dtype::Raw).unwrap();
+        assert_eq!(decode(&blob, 5).unwrap(), b"hello");
+        blob[0] = BLOB_VERSION + 1;
+        assert!(decode(&blob, 5).unwrap_err().to_string().contains("newer"));
     }
 }

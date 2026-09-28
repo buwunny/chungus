@@ -10,15 +10,24 @@ use libp2p::Multiaddr;
 
 use chungus::hub;
 use chungus::limits::{Limits, RateLimiter, RelayLimits};
-use chungus::manifest::Manifest;
+use chungus::manifest::{self, Manifest};
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
 use chungus::registry::{self, Claim, Statement};
 use chungus::sign;
 use chungus::store::{self, Store};
 
+/// `chungus --version` also names every format it speaks (see docs/formats.md). A test
+/// keeps this in step with the constants.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nmanifest: chungus/manifest/v2 (also reads v1)",
+    "\nstore: v1, chunk blobs: v1",
+    "\nwire: /chungus/1, /chungus/kad/1, HTTP /v1",
+);
+
 #[derive(Parser)]
-#[command(version, about = "Chunk, compress, deduplicate and share model files")]
+#[command(version, long_version = LONG_VERSION, about = "Chunk, compress, deduplicate and share model files")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -521,9 +530,7 @@ fn load_manifest(arg: &str, store: &Store) -> Result<Manifest> {
     if store::is_hash(arg) && !Path::new(arg).exists() {
         return store.get_manifest(arg);
     }
-    Ok(serde_json::from_slice(
-        &fs::read(arg).with_context(|| format!("read {arg}"))?,
-    )?)
+    manifest::parse(&fs::read(arg).with_context(|| format!("read {arg}"))?)
 }
 
 #[tokio::main]
@@ -540,6 +547,9 @@ async fn main() -> Result<()> {
             if let Some(output) = output {
                 fs::write(&output, serde_json::to_vec_pretty(&manifest)?)
                     .with_context(|| format!("write {}", output.display()))?;
+            }
+            for why in &s.skipped {
+                eprintln!("skipped {why}");
             }
             println!("packed {:.1} MB in {} chunks", mb(s.raw_bytes), s.chunks);
             println!(
@@ -933,8 +943,8 @@ async fn main() -> Result<()> {
         } => {
             let (name, rev) = registry::parse_ref(&name)?;
             let store = Store::open(&store)?;
-            store
-                .get_manifest(&root)
+            let manifest = store
+                .get_manifest_bytes(&root)
                 .context("publish a model that is in your store (see `chungus list`)")?;
             let k = sign::load_key(&key_path(key)?)?;
             // Sign the manifest too, so peers can prove it came from the name's owner.
@@ -948,7 +958,9 @@ async fn main() -> Result<()> {
                     description,
                 },
             );
-            let entry = registry::Client::new(&registry)?.submit(&st).await?;
+            let entry = registry::Client::new(&registry)?
+                .publish(&st, &manifest)
+                .await?;
             println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
         }
         Cmd::Resolve { name, registry } => {
@@ -1101,4 +1113,18 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_version_matches_formats() {
+        assert!(LONG_VERSION.contains(manifest::FORMAT));
+        assert!(LONG_VERSION.contains(&format!("store: v{}", store::STORE_VERSION)));
+        assert!(LONG_VERSION.contains(&format!("chunk blobs: v{}", store::BLOB_VERSION)));
+        assert!(LONG_VERSION.contains(p2p::PROTOCOL.as_ref()));
+        assert!(LONG_VERSION.contains(p2p::KAD_PROTOCOL.as_ref()));
+    }
 }

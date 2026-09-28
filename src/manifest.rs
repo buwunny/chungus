@@ -1,5 +1,6 @@
 //! A manifest lists every file in a model and the chunks that rebuild it.
 
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::segment::Dtype;
@@ -10,6 +11,8 @@ pub const FORMAT: &str = "chungus/manifest/v2";
 /// The first format, whose root covers only whole-file hashes. Still read and verified,
 /// but its files can only be trusted once complete.
 pub const FORMAT_V1: &str = "chungus/manifest/v1";
+/// Every format this version reads, newest first. See docs/formats.md for the policy.
+pub const KNOWN_FORMATS: &[&str] = &[FORMAT, FORMAT_V1];
 /// Raw bytes per block, the unit announced on the DHT. Every node in a swarm must agree on
 /// it, since block ids depend on it.
 pub const BLOCK_BYTES: u64 = 64 << 20;
@@ -110,6 +113,27 @@ impl Manifest {
     }
 }
 
+/// Parse a manifest, saying plainly when it was written by a newer chungus rather than
+/// failing on a field or root this version doesn't understand.
+pub fn parse(bytes: &[u8]) -> Result<Manifest> {
+    #[derive(Deserialize)]
+    struct Head {
+        format: String,
+    }
+    let head: Head = serde_json::from_slice(bytes).context("not a chungus manifest")?;
+    if !KNOWN_FORMATS.contains(&head.format.as_str()) {
+        if head.format.starts_with("chungus/manifest/") {
+            bail!(
+                "manifest format {} is newer than this chungus reads ({}); upgrade chungus",
+                head.format,
+                KNOWN_FORMATS.join(", ")
+            );
+        }
+        bail!("not a chungus manifest (format {:?})", head.format);
+    }
+    serde_json::from_slice(bytes).context("malformed manifest")
+}
+
 /// The root of `files` in `format`, or None for a format this version doesn't know.
 fn compute_root(format: &str, files: &[FileEntry]) -> Option<String> {
     let chunks = match format {
@@ -166,5 +190,27 @@ mod tests {
         // it allocated the claimed length) or lengths that don't add up is refused.
         assert!(!Manifest::new(vec![file(&[u32::MAX], u32::MAX as u64)]).verify_root());
         assert!(!Manifest::new(vec![file(&[1000], 1024)]).verify_root());
+    }
+
+    #[test]
+    fn parse_names_newer_formats() {
+        let m = Manifest::new(Vec::new());
+        let bytes = serde_json::to_vec(&m).unwrap();
+        assert_eq!(parse(&bytes).unwrap().root, m.root);
+
+        let newer = String::from_utf8(bytes)
+            .unwrap()
+            .replace(FORMAT, "chungus/manifest/v9");
+        let e = parse(newer.as_bytes()).err().unwrap().to_string();
+        assert!(e.contains("newer") && e.contains("upgrade"), "{e}");
+
+        let other = br#"{"format":"something/else","files":[],"root":""}"#;
+        assert!(
+            parse(other)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a chungus manifest")
+        );
     }
 }
