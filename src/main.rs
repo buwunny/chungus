@@ -145,8 +145,9 @@ enum Cmd {
     Node {
         #[arg(long, env = "CHUNGUS_STORE", default_value = DEFAULT_STORE)]
         store: PathBuf,
-        /// Follow this registry's blocklist: refuse to hold or serve blocked models and
-        /// chunks, and delete any already stored.
+        /// Follow this registry's blocklist and gates: refuse to hold or serve blocked
+        /// models and chunks, delete any already stored, and serve gated models only to
+        /// peers with an access ticket.
         #[arg(long, env = "CHUNGUS_BLOCKLIST")]
         blocklist: Option<String>,
         /// The registry operator's public key, to pin when following its blocklist.
@@ -236,6 +237,11 @@ enum Cmd {
         name: String,
         #[arg(long, default_value = "")]
         description: String,
+        /// The Hugging Face repo (org/name) whose license gate covers this model, e.g.
+        /// meta-llama/Llama-3.2-1B. Peers then need their own accepted token to download
+        /// it. Required for anything that is gated on Hugging Face.
+        #[arg(long)]
+        gated_by: Option<String>,
         #[arg(long, default_value = DEFAULT_STORE)]
         store: PathBuf,
         /// Signing key (default: ~/.chungus/key).
@@ -323,6 +329,19 @@ enum Cmd {
         #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
         registry: String,
     },
+    /// Put a model behind a Hugging Face repo's gate (or lift it with no repo). Operator
+    /// only.
+    Gate {
+        root: String,
+        /// The Hugging Face repo, e.g. meta-llama/Llama-3.2-1B. Omit to lift the gate.
+        repo: Option<String>,
+        /// The operator's root key, or the registry's online key (online.key) while
+        /// delegated.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
     /// Create a signing key and print its public key.
     Keygen {
         /// Where to write the key (default: ~/.chungus/key).
@@ -374,7 +393,7 @@ fn follow_blocklist(
     if let Some(url) = url {
         let follower = registry::Follower::new(&url, operator)?;
         registry::follow(store.clone(), follower, Duration::from_secs(60));
-        println!("following the blocklist of {url}");
+        println!("following the blocklist and gates of {url}");
     }
     Ok(())
 }
@@ -395,6 +414,27 @@ fn report_fetch(s: &FetchStats) {
     if s.rejected > 0 {
         println!("  rejected {} bad chunk(s) and refetched them", s.rejected);
     }
+}
+
+/// The user's Hugging Face token, found where `huggingface_hub` looks: `HF_TOKEN`, then
+/// the file `huggingface-cli login` writes.
+fn hf_token() -> Option<String> {
+    let non_empty = |s: String| {
+        let s = s.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    if let Some(t) = std::env::var("HF_TOKEN").ok().and_then(non_empty) {
+        return Some(t);
+    }
+    let path = match (
+        std::env::var_os("HF_TOKEN_PATH"),
+        std::env::var_os("HF_HOME"),
+    ) {
+        (Some(p), _) => PathBuf::from(p),
+        (None, Some(home)) => PathBuf::from(home).join("token"),
+        (None, None) => PathBuf::from(std::env::var_os("HOME")?).join(".cache/huggingface/token"),
+    };
+    fs::read_to_string(path).ok().and_then(non_empty)
 }
 
 /// Where to get a model from, shared by `fetch` and `mount`.
@@ -435,6 +475,15 @@ struct FromArgs {
 impl FromArgs {
     fn over_swarm(&self) -> bool {
         self.swarm || !self.bootstrap.is_empty()
+    }
+
+    /// What to show peers of a gated model: a ticket from the registry, got with the
+    /// user's Hugging Face token (used only if a peer says a model is gated).
+    fn access(&self) -> Option<p2p::Access> {
+        hf_token().map(|hf_token| p2p::Access {
+            registry: self.registry.clone(),
+            hf_token,
+        })
     }
 
     /// The manifest root for `model` (a root or a registry name) and the keys that must
@@ -746,7 +795,7 @@ async fn main() -> Result<()> {
             let (root, trust) = from.resolve(&root, &store).await?;
             let (manifest, s) = if from.over_swarm() {
                 let node = from.swarm_node(&store).await?;
-                p2p::fetch(&node, &root, store.clone(), &trust).await?
+                p2p::fetch(&node, &root, store.clone(), &trust, from.access()).await?
             } else {
                 let peers = from.lan_peers().await?;
                 net::fetch(&root, store.clone(), &peers, from.origin.as_deref(), &trust).await?
@@ -770,7 +819,7 @@ async fn main() -> Result<()> {
             let (manifest, source): (Manifest, Arc<dyn chungus::lazy::ChunkSource>) =
                 if from.over_swarm() {
                     let node = from.swarm_node(&store).await?;
-                    let (m, s) = p2p::prepare(&node, &root, &store, &trust).await?;
+                    let (m, s) = p2p::prepare(&node, &root, &store, &trust, from.access()).await?;
                     (m, Arc::new(s))
                 } else {
                     let client = net::client()?;
@@ -977,6 +1026,7 @@ async fn main() -> Result<()> {
             root,
             name,
             description,
+            gated_by,
             store,
             key,
             registry,
@@ -996,6 +1046,7 @@ async fn main() -> Result<()> {
                     rev: rev.clone(),
                     root: root.clone(),
                     description,
+                    gated: gated_by,
                 },
             );
             let entry = registry::Client::new(&registry)?
@@ -1129,6 +1180,25 @@ async fn main() -> Result<()> {
                 .await?;
             let verb = if unblock { "unblocked" } else { "blocked" };
             println!("{verb} {hash} (log entry {})", entry.seq);
+        }
+        Cmd::Gate {
+            root,
+            repo,
+            key,
+            registry,
+        } => {
+            let k = sign::load_key(&key)?;
+            let claim = Claim::Gate {
+                root: root.clone(),
+                repo: repo.clone().unwrap_or_default(),
+            };
+            let entry = registry::Client::new(&registry)?
+                .submit(&Statement::new(&k, claim))
+                .await?;
+            match repo {
+                Some(r) => println!("{root} is gated by {r} (log entry {})", entry.seq),
+                None => println!("lifted the gate on {root} (log entry {})", entry.seq),
+            }
         }
         Cmd::Anchors {
             addrs,

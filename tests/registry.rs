@@ -20,6 +20,7 @@ fn publish(k: &ed25519_dalek::SigningKey, name: &str, root: &str, desc: &str) ->
             rev: "main".into(),
             root: root.into(),
             description: desc.into(),
+            gated: None,
         },
     )
 }

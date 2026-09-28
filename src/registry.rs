@@ -10,6 +10,8 @@
 //!   enforce.
 //! - `delegate` (operator root key only) lets an online key act as the operator until a
 //!   given time, so the root key can stay offline. See [`Registry::open`].
+//! - `gate` (registry operator only) puts a model behind a Hugging Face repo's gate, as
+//!   a publisher can when publishing. See [`AccessTicket`].
 //!
 //! The registry appends each accepted statement to a hash-chained log and signs the head.
 //! Anyone can download the log and replay it with [`Log::replay`] to check that every
@@ -38,6 +40,10 @@ pub const DEFAULT_PORT: u16 = 7450;
 pub const DEFAULT_URL: &str = "http://localhost:7450";
 const STATEMENT_DOMAIN: &[u8] = b"chungus/registry-statement/v1\0";
 const HEAD_DOMAIN: &[u8] = b"chungus/registry-head/v1\0";
+const TICKET_DOMAIN: &[u8] = b"chungus/access-ticket/v1\0";
+/// How long an access ticket lasts. Hugging Face doesn't tell anyone when access is
+/// revoked, so this bounds how long a revoked user keeps downloading.
+pub const TICKET_SECS: u64 = 24 * 3600;
 /// How far a statement's time may be from the registry's clock when it is submitted.
 const MAX_SKEW_SECS: u64 = 600;
 const MAX_DESCRIPTION: usize = 2000;
@@ -52,6 +58,11 @@ pub enum Claim {
         root: String,
         #[serde(default)]
         description: String,
+        /// A Hugging Face repo (`org/name`) whose gate this model is behind, e.g. Llama
+        /// weights. Nodes following the registry only serve its chunks to peers holding
+        /// an [`AccessTicket`], which requires a Hugging Face token the repo accepts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gated: Option<String>,
     },
     Grant {
         org: String,
@@ -68,6 +79,13 @@ pub enum Claim {
     },
     Unblock {
         hash: String,
+    },
+    /// Put `root` behind the gate of Hugging Face repo `repo` (operator only), for models
+    /// published without saying so. An empty `repo` lifts the gate.
+    Gate {
+        root: String,
+        #[serde(default)]
+        repo: String,
     },
     /// The operator's list of anchor nodes (multiaddrs ending in `/p2p/<peer id>`), which
     /// replaces any earlier list. Nodes ask anchors alongside the DHT, so an attacker who
@@ -158,6 +176,49 @@ impl Statement {
     }
 }
 
+/// The registry operator's permission for one peer to download models behind one Hugging
+/// Face repo's gate, for a day. The registry issues it after checking the peer's own
+/// Hugging Face token against the repo; nodes check it before serving gated chunks.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccessTicket {
+    pub repo: String,
+    /// The libp2p peer id the ticket was issued to. Nodes only honour it from that peer.
+    pub peer: String,
+    /// Unix seconds.
+    pub expires: u64,
+    pub signature: Signature,
+}
+
+fn ticket_message(repo: &str, peer: &str, expires: u64) -> Vec<u8> {
+    [
+        TICKET_DOMAIN,
+        format!("{repo}\0{peer}\0{expires}").as_bytes(),
+    ]
+    .concat()
+}
+
+impl AccessTicket {
+    pub fn new(key: &SigningKey, repo: &str, peer: &str, expires: u64) -> AccessTicket {
+        AccessTicket {
+            repo: repo.into(),
+            peer: peer.into(),
+            expires,
+            signature: sign::sign_message(key, &ticket_message(repo, peer, expires)),
+        }
+    }
+
+    /// Whether `operator` issued this ticket to `peer` and it hasn't expired.
+    pub fn valid_for(&self, operator: &str, peer: &str) -> bool {
+        self.signature.key == operator
+            && self.peer == peer
+            && self.expires > now()
+            && sign::verify_message(
+                &self.signature,
+                &ticket_message(&self.repo, &self.peer, self.expires),
+            )
+    }
+}
+
 impl Entry {
     pub fn hash(&self) -> String {
         blake3::hash(&serde_json::to_vec(self).expect("entries serialize"))
@@ -181,6 +242,11 @@ fn valid_part(s: &str, max: usize) -> bool {
         && !s.starts_with('.')
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A Hugging Face repo id, `org/name`.
+pub fn valid_hf_repo(repo: &str) -> bool {
+    matches!(repo.split_once('/'), Some((org, name)) if valid_part(org, 96) && valid_part(name, 96))
 }
 
 /// `org/model`, each part of letters, digits, `-`, `_` and `.`.
@@ -229,6 +295,8 @@ pub struct Log {
     /// (name, rev) -> index of the publish entry that currently defines it.
     names: BTreeMap<(String, String), usize>,
     blocked: HashSet<String>,
+    /// Manifest root -> the Hugging Face repo whose gate it is behind.
+    gated: HashMap<String, String>,
     /// Index of the latest anchors entry.
     anchors: Option<usize>,
     /// The online key currently acting for the operator, and when that ends.
@@ -260,7 +328,11 @@ impl Log {
                 rev,
                 root,
                 description,
+                gated,
             } => {
+                if gated.as_deref().is_some_and(|r| !valid_hf_repo(r)) {
+                    bail!("gated must be a Hugging Face repo like org/name");
+                }
                 if !valid_name(name) || !valid_rev(rev) {
                     bail!("invalid name or rev");
                 }
@@ -307,6 +379,17 @@ impl Log {
                 }
                 if !store::is_hash(hash) {
                     bail!("invalid hash");
+                }
+            }
+            Claim::Gate { root, repo } => {
+                if !self.acts_as_operator(key, st.time) {
+                    bail!("only the registry operator can gate a model");
+                }
+                if !store::is_hash(root) {
+                    bail!("invalid manifest root");
+                }
+                if !repo.is_empty() && !valid_hf_repo(repo) {
+                    bail!("{repo:?} is not a Hugging Face repo like org/name");
                 }
             }
             Claim::Delegate {
@@ -358,7 +441,17 @@ impl Log {
         let key = st.key().to_string();
         let idx = self.entries.len();
         match &st.claim {
-            Claim::Publish { name, rev, .. } => {
+            Claim::Publish {
+                name,
+                rev,
+                root,
+                gated,
+                ..
+            } => {
+                // A publisher can add a gate but not lift one: only the operator can.
+                if let Some(repo) = gated {
+                    self.gated.insert(root.clone(), repo.clone());
+                }
                 self.owners
                     .entry(org_of(name).to_string())
                     .or_insert_with(|| vec![key.clone()]);
@@ -375,6 +468,13 @@ impl Log {
             }
             Claim::Unblock { hash } => {
                 self.blocked.remove(hash);
+            }
+            Claim::Gate { root, repo } => {
+                if repo.is_empty() {
+                    self.gated.remove(root);
+                } else {
+                    self.gated.insert(root.clone(), repo.clone());
+                }
             }
             Claim::Anchors { .. } => {
                 self.anchors = Some(idx);
@@ -434,7 +534,6 @@ impl Log {
         self.blocked.iter()
     }
 
-    /// The entry holding the current anchor list, if the operator has set one.
     /// Whether `key` may act as the operator at `time`: the root key always, the delegated
     /// online key until its delegation expires.
     pub fn acts_as_operator(&self, key: &str, time: u64) -> bool {
@@ -455,6 +554,25 @@ impl Log {
         head.verify() && self.acts_as_operator(&head.signature.key, head.time)
     }
 
+    /// The Hugging Face repo whose gate `root` is behind, if any.
+    pub fn gate(&self, root: &str) -> Option<&str> {
+        self.gated.get(root).map(String::as_str)
+    }
+
+    /// Every gated root and its repo.
+    pub fn gates(&self) -> &HashMap<String, String> {
+        &self.gated
+    }
+
+    /// The keys whose access tickets nodes accept, each with when it stops being accepted:
+    /// the root key, and the delegated online key until its delegation ends.
+    pub fn ticket_issuers(&self) -> Vec<(String, u64)> {
+        let mut keys = vec![(self.operator.clone(), u64::MAX)];
+        keys.extend(self.delegate.clone());
+        keys
+    }
+
+    /// The entry holding the current anchor list, if the operator has set one.
     pub fn anchors(&self) -> Option<&Entry> {
         self.anchors.map(|i| &self.entries[i])
     }
@@ -494,7 +612,7 @@ impl Log {
         });
         hits.into_iter()
             .take(limit)
-            .map(|(_, e)| Hit::from(e))
+            .map(|(_, e)| Hit::from(e, self))
             .collect()
     }
 }
@@ -513,7 +631,7 @@ impl Log {
             })
             .collect();
         hits.sort_by_key(|e| std::cmp::Reverse(e.statement.time));
-        hits.into_iter().map(Hit::from).collect()
+        hits.into_iter().map(|e| Hit::from(e, self)).collect()
     }
 }
 
@@ -533,15 +651,19 @@ pub struct Hit {
     pub description: String,
     pub publisher: String,
     pub time: u64,
+    /// The Hugging Face repo whose gate the model is behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated: Option<String>,
 }
 
 impl Hit {
-    fn from(e: &Entry) -> Hit {
+    fn from(e: &Entry, log: &Log) -> Hit {
         let Claim::Publish {
             name,
             rev,
             root,
             description,
+            ..
         } = &e.statement.claim
         else {
             unreachable!("search only returns publishes")
@@ -553,6 +675,7 @@ impl Hit {
             description: description.clone(),
             publisher: e.statement.key().to_string(),
             time: e.statement.time,
+            gated: log.gate(root).map(str::to_string),
         }
     }
 }
@@ -574,6 +697,20 @@ pub struct Registry {
     /// Roots whose manifest the registry holds and has checked (see [`crate::safety`]).
     /// Only these are listed in search and the index.
     checked: RwLock<HashSet<String>>,
+    /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
+    hf: String,
+    http: reqwest::Client,
+}
+
+pub const DEFAULT_HF: &str = "https://huggingface.co";
+
+/// A request for an [`AccessTicket`]: the model, the peer that will download it, and the
+/// requester's own Hugging Face token, which the registry only sends to Hugging Face.
+#[derive(Serialize, Deserialize)]
+pub struct AccessRequest {
+    pub root: String,
+    pub peer: String,
+    pub token: String,
 }
 
 /// How long `chungus delegate` delegates for by default. Renew before it runs out.
@@ -660,6 +797,10 @@ impl Registry {
             file: Mutex::new(file),
             manifests,
             checked: RwLock::new(checked),
+            hf: DEFAULT_HF.into(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
         })
     }
 
@@ -672,6 +813,68 @@ impl Registry {
             return Some(&self.online);
         }
         self.root.as_ref()
+    }
+
+    /// Check gated access against `url` instead of huggingface.co.
+    pub fn with_hf(mut self, url: &str) -> Registry {
+        self.hf = url.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Issue a ticket for `req.peer` to download `req.root`, if Hugging Face says the
+    /// requester's token may access the repo the model is gated by. The token is used
+    /// for that one check and never stored or logged.
+    pub async fn access(&self, req: &AccessRequest) -> Result<AccessTicket, (StatusCode, String)> {
+        let bad = |s: &str| (StatusCode::BAD_REQUEST, s.to_string());
+        if req.peer.parse::<libp2p::PeerId>().is_err() {
+            return Err(bad("peer must be a libp2p peer id"));
+        }
+        let Some(repo) = self.with_log(|log| log.gate(&req.root).map(str::to_string)) else {
+            return Err(bad("that model isn't gated"));
+        };
+        // Hugging Face's own check for "may this token download from this repo".
+        let resp = self
+            .http
+            .get(format!("{}/api/models/{repo}/auth-check", self.hf))
+            .bearer_auth(&req.token)
+            .send()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("can't reach Hugging Face: {e}"),
+                )
+            })?;
+        match resp.status().as_u16() {
+            200..=299 => {}
+            401 | 403 | 404 => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "your Hugging Face token doesn't have access to {repo}; accept its \
+                         license at https://huggingface.co/{repo} and try again"
+                    ),
+                ));
+            }
+            s => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Hugging Face answered {s} when checking access to {repo}"),
+                ));
+            }
+        }
+        let Some(key) = self.operator_key() else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this registry's online key isn't delegated to, so it can't issue tickets".into(),
+            ));
+        };
+        Ok(AccessTicket::new(
+            key,
+            &repo,
+            &req.peer,
+            now() + TICKET_SECS,
+        ))
     }
 
     /// The operator's root public key, the one nodes pin.
@@ -781,7 +984,7 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 
 /// `POST /v1/statements`, `POST /v1/publish`, `GET /v1/manifests/{root}`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
 /// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
-/// `GET /v1/owners/{org}` and `GET /v1/anchors`.
+/// `GET /v1/owners/{org}`, `GET /v1/anchors` and `POST /v1/access`.
 ///
 /// Everything it serves is public and signed, so any web page may read it: responses
 /// allow every origin. Browsers can't submit statements, since there is no CORS
@@ -803,6 +1006,7 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/v1/index", get(index))
         .route("/v1/owners/{org}", get(owners))
         .route("/v1/anchors", get(anchors))
+        .route("/v1/access", post(access))
         .layer(axum::middleware::map_response(allow_any_origin))
         .with_state(reg)
 }
@@ -860,6 +1064,16 @@ async fn manifest(State(reg): State<Arc<Registry>>, Path(root): Path<String>) ->
         )
             .into_response(),
         None => err(StatusCode::NOT_FOUND, format!("no manifest for {root}")),
+    }
+}
+
+async fn access(
+    State(reg): State<Arc<Registry>>,
+    axum::Json(req): axum::Json<AccessRequest>,
+) -> Response {
+    match reg.access(&req).await {
+        Ok(ticket) => axum::Json(ticket).into_response(),
+        Err((code, e)) => err(code, e),
     }
 }
 
@@ -983,6 +1197,30 @@ impl Client {
         let body = resp.bytes().await?;
         if !status.is_success() {
             bail!("registry refused: {}", String::from_utf8_lossy(&body));
+        }
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Ask for a ticket to download gated model `root` as `peer`, proving access with
+    /// the user's Hugging Face `token`.
+    pub async fn access(&self, root: &str, peer: &str, token: &str) -> Result<AccessTicket> {
+        let body = AccessRequest {
+            root: root.into(),
+            peer: peer.into(),
+            token: token.into(),
+        };
+        let resp = self
+            .http
+            .post(format!("{}/v1/access", self.base))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body)?)
+            .send()
+            .await
+            .with_context(|| format!("reach the registry at {}", self.base))?;
+        let status = resp.status();
+        let body = resp.bytes().await?;
+        if !status.is_success() {
+            bail!("{}", String::from_utf8_lossy(&body));
         }
         Ok(serde_json::from_slice(&body)?)
     }
@@ -1135,7 +1373,7 @@ impl Client {
     }
 }
 
-/// Keeps a store's blocklist in step with a registry's log.
+/// Keeps a store's blocklist and gates in step with a registry's log.
 pub struct Follower {
     client: Client,
     operator: Option<String>,
@@ -1178,6 +1416,7 @@ impl Follower {
                 log.operator
             );
         }
+        store.set_gates(log.ticket_issuers(), log.gates().clone());
         Ok(store.set_blocked(log.blocked().cloned().collect()))
     }
 
@@ -1220,6 +1459,7 @@ mod tests {
                 rev: rev.into(),
                 root: root.into(),
                 description: "a small test model".into(),
+                gated: None,
             },
         )
     }
@@ -1270,6 +1510,15 @@ mod tests {
         assert!(reg.with_log(|log| log.signs_head(&head)));
         reg.submit(Statement::new(reg.operator_key().unwrap(), block))
             .unwrap();
+        // Tickets the online key issues are accepted while the delegation lasts.
+        let peer = libp2p::PeerId::random().to_string();
+        let t = AccessTicket::new(reg.operator_key().unwrap(), "x/y", &peer, now() + 60);
+        let issuers = reg.with_log(|log| log.ticket_issuers());
+        assert!(
+            issuers
+                .iter()
+                .any(|(k, until)| t.valid_for(k, &peer) && now() < *until)
+        );
         // Delegations end when they expire, and the root can revoke one early.
         reg.with_log(|log| {
             assert!(log.acts_as_operator(&online, now()));
@@ -1281,6 +1530,62 @@ mod tests {
         // The whole log still replays for an auditor who pinned the root key.
         let entries = reg.with_log(|log| log.entries.clone());
         Log::replay(operator, entries).unwrap();
+    }
+
+    #[test]
+    fn gates_and_tickets() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::open(&dir.path().join("reg")).unwrap();
+        let alice = key(dir.path(), "alice");
+        let (r1, r2) = ("aa".repeat(32), "bb".repeat(32));
+
+        // Statements without a gate sign the same bytes as before gates existed.
+        let st = publish(&alice, "acme/tiny", "main", &r1);
+        assert!(!serde_json::to_string(&st).unwrap().contains("gated"));
+
+        // A publisher can gate their own model; only the operator can gate others'.
+        let mut gated = publish(&alice, "acme/llama", "main", &r2);
+        if let Claim::Publish { gated: g, .. } = &mut gated.claim {
+            *g = Some("meta-llama/Llama-3.2-1B".into());
+        }
+        gated = Statement::new(&alice, gated.claim);
+        reg.submit(gated).unwrap();
+        let gate = |root: &str, repo: &str| Claim::Gate {
+            root: root.into(),
+            repo: repo.into(),
+        };
+        assert!(
+            reg.submit(Statement::new(&alice, gate(&r1, "x/y")))
+                .is_err()
+        );
+        reg.submit(Statement::new(
+            reg.operator_key().unwrap(),
+            gate(&r1, "x/y"),
+        ))
+        .unwrap();
+        reg.with_log(|log| {
+            assert_eq!(log.gate(&r1), Some("x/y"));
+            assert_eq!(log.gate(&r2), Some("meta-llama/Llama-3.2-1B"));
+        });
+        // Re-publishing without a gate doesn't lift it; the operator can.
+        reg.submit(publish(&alice, "acme/llama", "v2", &r2))
+            .unwrap();
+        assert!(reg.with_log(|log| log.gate(&r2).is_some()));
+        reg.submit(Statement::new(reg.operator_key().unwrap(), gate(&r2, "")))
+            .unwrap();
+        assert!(reg.with_log(|log| log.gate(&r2).is_none()));
+
+        // Tickets are bound to the operator, the peer and the clock.
+        let peer = libp2p::PeerId::random().to_string();
+        let t = AccessTicket::new(reg.operator_key().unwrap(), "x/y", &peer, now() + 60);
+        assert!(t.valid_for(&reg.operator(), &peer));
+        assert!(!t.valid_for(&reg.operator(), &libp2p::PeerId::random().to_string()));
+        assert!(!t.valid_for(&sign::public_key_string(&alice.verifying_key()), &peer));
+        let old = AccessTicket::new(reg.operator_key().unwrap(), "x/y", &peer, now() - 1);
+        assert!(!old.valid_for(&reg.operator(), &peer));
+        let mut forged = t.clone();
+        forged.repo = "other/repo".into();
+        assert!(!forged.valid_for(&reg.operator(), &peer));
     }
 
     #[test]

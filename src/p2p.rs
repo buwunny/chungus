@@ -5,6 +5,10 @@
 //! then requests the manifest, its signatures and the chunks from those providers over
 //! `/chungus/1`, spreading chunks across them and verifying each one against its hash.
 //!
+//! Models the registry marks as gated (see [`crate::registry::AccessTicket`]) are only
+//! served to peers that first present a ticket for the gate's Hugging Face repo. A node
+//! learns which models are gated, and whose tickets to accept, by following a registry.
+//!
 //! Connections are encrypted (Noise over TCP, TLS inside QUIC). A node behind NAT listens
 //! through a relay (circuit relay v2) so others can reach it, and DCUtR then tries to
 //! upgrade relayed connections to direct ones by hole punching. Any public node can offer
@@ -34,6 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::limits::{Limits, RateLimiter, SubnetCaps};
 use crate::manifest::{BLOCK_BYTES, Manifest};
 use crate::net::{self, FetchStats};
+use crate::registry::{self, AccessTicket};
 use crate::sign::{self, Signature};
 use crate::store::{self, Store};
 
@@ -57,6 +62,9 @@ pub enum Request {
     Manifest(String),
     Signatures(String),
     Chunk(String),
+    /// Present an access ticket, so later chunk requests for its repo are served. Added
+    /// after the first release; older nodes don't gate anything and fail the request.
+    Access(AccessTicket),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -66,6 +74,11 @@ pub enum Response {
     Chunk(Option<ByteBuf>),
     /// The node is serving as much as its limits allow; try another peer.
     Busy,
+    /// The chunk belongs to a model behind this Hugging Face repo's gate: present an
+    /// access ticket first.
+    Gated(String),
+    /// Whether an access ticket was accepted.
+    Granted(bool),
 }
 
 #[derive(NetworkBehaviour)]
@@ -368,6 +381,7 @@ impl Node {
             refused: HashSet::new(),
             mismatched: HashSet::new(),
             joined: false,
+            granted: HashMap::new(),
         };
         tokio::spawn(runner.run());
         Ok(Node {
@@ -462,6 +476,8 @@ struct Runner {
     mismatched: HashSet<PeerId>,
     /// Whether a DHT bootstrap has succeeded yet.
     joined: bool,
+    /// Gated repos each peer has shown a valid ticket for, and when each ticket expires.
+    granted: HashMap<PeerId, HashMap<String, u64>>,
 }
 
 type Reply = (PeerId, ResponseChannel<Response>, Response);
@@ -916,10 +932,35 @@ impl Runner {
                             let _ = resp_tx.send((peer, channel, Response::Busy));
                             return;
                         }
+                        if let Request::Access(ticket) = &request {
+                            let ok = self.store.ticket_issuers().iter().any(|op| {
+                                ticket.valid_for(op, &peer.to_string())
+                            });
+                            if ok {
+                                self.granted
+                                    .entry(peer)
+                                    .or_default()
+                                    .insert(ticket.repo.clone(), ticket.expires);
+                            }
+                            let _ = resp_tx.send((peer, channel, Response::Granted(ok)));
+                            return;
+                        }
+                        let now = registry::now();
+                        let granted: HashSet<String> = self
+                            .granted
+                            .get(&peer)
+                            .map(|g| {
+                                g.iter()
+                                    .filter(|(_, exp)| **exp > now)
+                                    .map(|(r, _)| r.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let (store, resp_tx) = (self.store.clone(), resp_tx.clone());
                         let limiter = self.limiter.clone();
                         tokio::spawn(async move {
-                            let resp = tokio::task::spawn_blocking(move || answer(&store, request))
+                            let resp =
+                                tokio::task::spawn_blocking(move || answer(&store, request, &granted))
                                 .await
                                 .unwrap_or(Response::Busy);
                             if let Some(lim) = limiter {
@@ -963,7 +1004,8 @@ impl Response {
 }
 
 /// Answer a peer's request from the store. Anything missing or malformed is `None`.
-fn answer(store: &Store, req: Request) -> Response {
+/// `granted` holds the gated repos the peer has a valid ticket for.
+fn answer(store: &Store, req: Request, granted: &HashSet<String>) -> Response {
     match req {
         Request::Manifest(root) => {
             Response::Manifest(store.get_safe_manifest_bytes(&root).ok().map(ByteBuf::from))
@@ -971,12 +1013,19 @@ fn answer(store: &Store, req: Request) -> Response {
         Request::Signatures(root) => {
             Response::Signatures(store.signatures(&root).unwrap_or_default())
         }
-        Request::Chunk(hash) => Response::Chunk(
-            store::is_hash(&hash)
-                .then(|| store.get(&hash).ok())
-                .flatten()
-                .map(ByteBuf::from),
-        ),
+        Request::Chunk(hash) => {
+            let gates = store.gates_of(&hash);
+            if !gates.is_empty() && !gates.iter().any(|g| granted.contains(g)) {
+                return Response::Gated(gates[0].clone());
+            }
+            Response::Chunk(
+                store::is_hash(&hash)
+                    .then(|| store.get(&hash).ok())
+                    .flatten()
+                    .map(ByteBuf::from),
+            )
+        }
+        Request::Access(_) => Response::Granted(false),
     }
 }
 
@@ -995,16 +1044,18 @@ pub async fn fetch(
     root: &str,
     store: Arc<Store>,
     trust: &[ed25519_dalek::VerifyingKey],
+    access: Option<Access>,
 ) -> Result<(Manifest, FetchStats)> {
     let started = Instant::now();
-    let (manifest, sources) = prepare(node, root, &store, trust).await?;
+    let (manifest, sources) = prepare(node, root, &store, trust, access).await?;
     let mut stats = net::fetch_chunks_from(
         &store,
         manifest.files.iter().flat_map(|f| &f.chunks),
         |hash| sources.sources(hash),
         |peer, hash| sources.get(peer, hash),
     )
-    .await?;
+    .await
+    .map_err(|e| sources.explain(e))?;
     stats.secs = started.elapsed().as_secs_f64();
     Ok((manifest, stats))
 }
@@ -1016,6 +1067,7 @@ pub async fn prepare(
     root: &str,
     store: &Arc<Store>,
     trust: &[ed25519_dalek::VerifyingKey],
+    access: Option<Access>,
 ) -> Result<(Manifest, ModelSources)> {
     if !store::is_hash(root) {
         bail!("{root:?} is not a manifest root hash");
@@ -1122,23 +1174,45 @@ pub async fn prepare(
     }
     let sources = ModelSources {
         node: node.clone(),
+        root: root.to_string(),
         complete,
         block_of,
         block_peers,
         slots: Default::default(),
+        access,
+        tickets: Default::default(),
+        presented: Default::default(),
+        gated_by: Default::default(),
     };
     Ok((manifest, sources))
+}
+
+/// How to get past a gate: the registry that issues access tickets, and the user's own
+/// Hugging Face token to prove access with. The token goes only to the registry, which
+/// checks it with Hugging Face; peers only ever see the ticket.
+#[derive(Clone)]
+pub struct Access {
+    pub registry: String,
+    pub hf_token: String,
 }
 
 /// Who to ask for each chunk of one model, from [`prepare`].
 pub struct ModelSources {
     node: Node,
+    root: String,
     complete: Vec<PeerId>,
     block_of: HashMap<String, usize>,
     block_peers: Vec<Vec<PeerId>>,
     /// Stay under a peer's default request limit, so a well-behaved fetch rarely hears
     /// "busy" even when one peer is its only source.
     slots: std::sync::Mutex<HashMap<PeerId, Arc<tokio::sync::Semaphore>>>,
+    access: Option<Access>,
+    /// Tickets by repo; None once the registry has refused one.
+    tickets: tokio::sync::Mutex<HashMap<String, Option<AccessTicket>>>,
+    /// (peer, repo) pairs a ticket has been accepted for.
+    presented: std::sync::Mutex<HashSet<(PeerId, String)>>,
+    /// Why gated chunks couldn't be had, for the error message.
+    gated_by: std::sync::Mutex<Option<String>>,
 }
 
 impl ModelSources {
@@ -1162,8 +1236,100 @@ impl ModelSources {
         order
     }
 
-    /// Ask `peer` for chunk `hash`. Unverified.
-    pub fn get(&self, peer: PeerId, hash: String) -> impl Future<Output = Option<Bytes>> + use<> {
+    /// Turn a failed download into a clearer error when gates were in the way.
+    pub fn explain(&self, e: anyhow::Error) -> anyhow::Error {
+        match self.gated_by.lock().unwrap().clone() {
+            Some(why) => anyhow!("{e:#}\n{why}"),
+            None => e,
+        }
+    }
+
+    /// A ticket for `repo`, asking the registry the first time.
+    async fn ticket(&self, repo: &str) -> Option<AccessTicket> {
+        let mut tickets = self.tickets.lock().await;
+        if let Some(t) = tickets.get(repo) {
+            return t.clone();
+        }
+        let got = match &self.access {
+            None => Err(anyhow!(
+                "set HF_TOKEN to a Hugging Face token that has accepted its license"
+            )),
+            Some(a) => match registry::Client::new(&a.registry) {
+                Ok(c) => {
+                    c.access(&self.root, &self.node.peer_id.to_string(), &a.hf_token)
+                        .await
+                }
+                Err(e) => Err(e),
+            },
+        };
+        let t = match got {
+            Ok(t) if t.repo == repo => Some(t),
+            Ok(t) => {
+                self.note_gate(
+                    repo,
+                    &format!("the registry gates it by {} instead", t.repo),
+                );
+                None
+            }
+            Err(e) => {
+                self.note_gate(repo, &format!("{e:#}"));
+                None
+            }
+        };
+        tickets.insert(repo.to_string(), t.clone());
+        t
+    }
+
+    fn note_gate(&self, repo: &str, why: &str) {
+        *self.gated_by.lock().unwrap() = Some(format!(
+            "this model is gated by https://huggingface.co/{repo}: {why}"
+        ));
+    }
+
+    /// Show `peer` our ticket for `repo`. True if it accepted.
+    async fn present(&self, peer: PeerId, repo: &str) -> bool {
+        if self
+            .presented
+            .lock()
+            .unwrap()
+            .contains(&(peer, repo.to_string()))
+        {
+            return true;
+        }
+        let Some(t) = self.ticket(repo).await else {
+            return false;
+        };
+        let ok = matches!(
+            self.node.request(peer, Request::Access(t)).await,
+            Ok(Response::Granted(true))
+        );
+        if ok {
+            self.presented
+                .lock()
+                .unwrap()
+                .insert((peer, repo.to_string()));
+        }
+        ok
+    }
+
+    /// Ask `peer` for chunk `hash`, showing it a ticket first if the chunk is gated.
+    /// Unverified.
+    pub async fn get(&self, peer: PeerId, hash: String) -> Option<Bytes> {
+        match self.get_once(peer, hash.clone()).await {
+            Err(repo) if self.present(peer, &repo).await => {
+                self.get_once(peer, hash).await.ok().flatten()
+            }
+            other => other.ok().flatten(),
+        }
+    }
+
+    /// Ask `peer` for chunk `hash` once (retrying while it's busy). Err(repo) if the
+    /// chunk is gated and we haven't shown this peer a ticket.
+    fn get_once(
+        &self,
+        peer: PeerId,
+        hash: String,
+    ) -> impl Future<Output = Result<Option<Bytes>, String>> + use<> {
         let node = self.node.clone();
         let slot = self
             .slots
@@ -1173,14 +1339,15 @@ impl ModelSources {
             .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PER_PEER_REQUESTS)))
             .clone();
         async move {
-            let _permit = slot.acquire_owned().await.ok()?;
+            let _permit = slot.acquire_owned().await.map_err(|_| String::new())?;
             // A busy peer is at its upload limits but alive; keep asking for a while
             // rather than moving on, since it may be the only one with this chunk.
             let give_up = tokio::time::Instant::now() + BUSY_PATIENCE;
             let mut attempt = 0u32;
             loop {
                 match node.request(peer, Request::Chunk(hash.clone())).await {
-                    Ok(Response::Chunk(Some(b))) => return Some(Bytes::from(b.into_vec())),
+                    Ok(Response::Chunk(Some(b))) => return Ok(Some(Bytes::from(b.into_vec()))),
+                    Ok(Response::Gated(repo)) => return Err(repo),
                     Ok(Response::Busy) if tokio::time::Instant::now() < give_up => {
                         // Spread retries out so waiting requests don't all return at once.
                         let jitter = u64::from(hash.as_bytes()[attempt as usize % 64]) % 50;
@@ -1188,7 +1355,7 @@ impl ModelSources {
                         tokio::time::sleep(Duration::from_millis(wait)).await;
                         attempt += 1;
                     }
-                    _ => return None,
+                    _ => return Ok(None),
                 }
             }
         }
