@@ -8,7 +8,7 @@
 //! width for `PlaneZstd` and the float kind for `ExponentZstd`.
 
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -122,6 +122,18 @@ pub struct Store {
     root: PathBuf,
     /// Manifest roots and chunk hashes this store refuses to hold or hand out.
     blocked: RwLock<HashSet<String>>,
+    gates: RwLock<Gates>,
+}
+
+/// Models behind a Hugging Face repo's gate, from a registry this store follows.
+#[derive(Default)]
+struct Gates {
+    /// The registry operator key that signs access tickets.
+    operator: String,
+    /// Manifest root -> Hugging Face repo.
+    roots: HashMap<String, String>,
+    /// Chunk hash -> repos of the gated models in this store that contain it.
+    chunks: HashMap<String, Vec<String>>,
 }
 
 impl Store {
@@ -133,6 +145,7 @@ impl Store {
         Ok(Store {
             root: root.to_path_buf(),
             blocked: Default::default(),
+            gates: Default::default(),
         })
     }
 
@@ -149,6 +162,39 @@ impl Store {
         }
         *self.blocked.write().unwrap() = hashes;
         removed
+    }
+
+    /// Replace the gated models (root -> Hugging Face repo) and the operator key whose
+    /// access tickets open them.
+    pub fn set_gates(&self, operator: &str, roots: HashMap<String, String>) {
+        let mut chunks: HashMap<String, Vec<String>> = HashMap::new();
+        for (root, repo) in &roots {
+            if let Ok(m) = self.get_manifest(root) {
+                add_gated_chunks(&mut chunks, &m, repo);
+            }
+        }
+        *self.gates.write().unwrap() = Gates {
+            operator: operator.to_string(),
+            roots,
+            chunks,
+        };
+    }
+
+    /// The Hugging Face repos whose gates cover chunk `hash`; empty if it's free to share.
+    pub fn gates_of(&self, hash: &str) -> Vec<String> {
+        self.gates
+            .read()
+            .unwrap()
+            .chunks
+            .get(hash)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The operator key that signs access tickets, once a registry has been followed.
+    pub fn gate_operator(&self) -> Option<String> {
+        let g = self.gates.read().unwrap();
+        (!g.operator.is_empty()).then(|| g.operator.clone())
     }
 
     pub fn is_blocked(&self, hash: &str) -> bool {
@@ -219,7 +265,12 @@ impl Store {
         }
         crate::safety::check_manifest(m)?;
         self.check_allowed(&m.root)?;
-        write_atomic(&self.manifest_path(&m.root), &serde_json::to_vec_pretty(m)?)
+        write_atomic(&self.manifest_path(&m.root), &serde_json::to_vec_pretty(m)?)?;
+        let mut gates = self.gates.write().unwrap();
+        if let Some(repo) = gates.roots.get(&m.root).cloned() {
+            add_gated_chunks(&mut gates.chunks, m, &repo);
+        }
+        Ok(())
     }
 
     pub fn get_manifest_bytes(&self, root: &str) -> Result<Vec<u8>> {
@@ -293,6 +344,15 @@ impl Store {
         }
         roots.sort();
         Ok(roots)
+    }
+}
+
+fn add_gated_chunks(chunks: &mut HashMap<String, Vec<String>>, m: &Manifest, repo: &str) {
+    for c in m.files.iter().flat_map(|f| &f.chunks) {
+        let repos = chunks.entry(c.hash.clone()).or_default();
+        if !repos.iter().any(|r| r == repo) {
+            repos.push(repo.to_string());
+        }
     }
 }
 
