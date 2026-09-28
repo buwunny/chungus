@@ -491,7 +491,7 @@ async fn fetch_manifest(
             continue;
         };
         // A manifest is only trusted if it hashes to the root we asked for.
-        if let Ok(m) = serde_json::from_slice::<Manifest>(&bytes)
+        if let Ok(m) = crate::manifest::parse(&bytes)
             && m.root == root
             && m.verify_root()
         {
