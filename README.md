@@ -178,7 +178,7 @@ chungus mount acme/tiny-llama@v1 llama/          # or a root; --swarm or --boots
 python -c "from transformers import AutoModelForCausalLM as M; M.from_pretrained('llama')"
 ```
 
-Everything fetched lands in the store, so once prefetching finishes the model is complete and is shared like any other. `--prefetch 0` fetches only what is read. Mounting uses FUSE: install `fuse3` on Linux, or macFUSE on macOS (untested so far).
+Everything fetched lands in the store, so once prefetching finishes the model is complete and is shared like any other. `--prefetch 0` fetches only what is read. Mounting uses FUSE and works on Linux only so far (install `fuse3`). On macOS, `chungus fetch <model> -o <dir>` downloads the whole model instead; mounting there would mean linking against macFUSE, which every macOS user would then need installed.
 
 Lazy reads need a manifest whose root commits to each file's chunk list (format v2, what `pack` writes now). Older v1 manifests only committed to whole-file hashes, which can't be checked until a file is complete, so they can still be fetched but not mounted; re-pack to upgrade.
 

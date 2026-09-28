@@ -10,7 +10,7 @@ pub mod hub;
 pub mod lazy;
 pub mod limits;
 pub mod manifest;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod mount;
 pub mod net;
 pub mod p2p;
