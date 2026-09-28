@@ -38,6 +38,37 @@ impl Default for Limits {
     }
 }
 
+/// Limits on relaying for nodes behind NAT (see `Config::relay_server`). A relay only
+/// carries libp2p traffic between two peers that both asked for it, never arbitrary
+/// connections; these caps bound how much of that it does.
+#[derive(Clone, Debug)]
+pub struct RelayLimits {
+    /// Relayed connections open at once.
+    pub max_circuits: usize,
+    /// Relayed connections open at once for one peer.
+    pub max_circuits_per_peer: usize,
+    /// Bytes one relayed connection may carry before it is closed.
+    pub circuit_bytes: u64,
+    /// How long one relayed connection may stay open.
+    pub circuit_duration: Duration,
+    /// Peers that may be reachable through this relay at once.
+    pub max_reservations: usize,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        RelayLimits {
+            max_circuits: 16,
+            max_circuits_per_peer: 4,
+            // Relayed peers usually hole-punch to a direct connection within seconds, but
+            // a model download can run through the relay when that fails.
+            circuit_bytes: 64_000_000_000,
+            circuit_duration: Duration::from_secs(3600),
+            max_reservations: 128,
+        }
+    }
+}
+
 /// A token bucket shared by everything a node uploads. Callers reserve bytes before
 /// sending and wait for the bucket to refill; reservations queue in order, so one large
 /// burst can't starve the rest.

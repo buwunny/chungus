@@ -133,6 +133,25 @@ chungus node --anchors-from http://registry.example:7450 --operator chungus1<ope
 chungus fetch acme/tiny-llama@v1 --swarm -o model/
 ```
 
+### Running a public node
+
+Every swarm needs a few public nodes for others to join through and to relay for peers behind NAT. The repository has a container for one, with limits suited to a small VPS: 20 MB/s upload, 400 connections, and at most 32 relayed connections of 1 GB and 10 minutes each. On a server with a public IP and Docker:
+
+```sh
+git clone https://github.com/buwunny/chungus && cd chungus/deploy
+cp node.env.example node.env   # set CHUNGUS_EXTERNAL to the server's IP, adjust the limits
+docker compose up -d --build
+docker compose logs node       # the addresses to share, ending in /p2p/<peer id>
+```
+
+Open TCP and UDP port 4001 in the provider's firewall. The node runs as a non-root user in a read-only container with no shell, restarts on failure, and keeps its store and identity key in the `chungus-data` volume, so its peer id survives upgrades (`git pull && docker compose up -d --build`). Every `chungus node` flag can be set in `node.env` as a `CHUNGUS_*` variable: set `CHUNGUS_BLOCKLIST` and `CHUNGUS_OPERATOR` to follow a registry's blocklist, and `CHUNGUS_BOOTSTRAP` to join an existing swarm.
+
+The relay only carries connections between two chungus peers that both asked for it, and only until they hole-punch a direct one. The node seeds nothing until you pin a model into its store:
+
+```sh
+docker compose exec node chungus fetch acme/tiny-llama@v1 --swarm --store /data/store
+```
+
 ## Lazy loading
 
 `chungus mount` makes a model's files appear at once, before any weights have downloaded. Reads fetch the chunks they need on demand, verifying each against its hash, while a prefetcher fills in the rest in the order a loader wants it: config and tokenizer files first, then every safetensors header, then tensors layer by layer across all shards (embeddings, `layers.0`, `layers.1`, ..., then the output head). Each read also moves the chunks right after it to the front of the queue. Loaders that `mmap` safetensors, as transformers and vLLM do, work unchanged, so inference can start before the download finishes.

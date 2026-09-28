@@ -96,6 +96,8 @@ pub struct Config {
     /// during every fetch alongside the DHT.
     pub anchors: Vec<Multiaddr>,
     pub limits: Limits,
+    /// Caps on relaying, when `relay_server` is set.
+    pub relay: crate::limits::RelayLimits,
 }
 
 enum Command {
@@ -202,10 +204,11 @@ impl Node {
                     relay::Behaviour::new(
                         id,
                         relay::Config {
-                            // Model downloads are long and large; the defaults suit only
-                            // hole-punch coordination.
-                            max_circuit_duration: Duration::from_secs(3600),
-                            max_circuit_bytes: 64 << 30,
+                            max_circuits: cfg.relay.max_circuits,
+                            max_circuits_per_peer: cfg.relay.max_circuits_per_peer,
+                            max_circuit_duration: cfg.relay.circuit_duration,
+                            max_circuit_bytes: cfg.relay.circuit_bytes,
+                            max_reservations: cfg.relay.max_reservations,
                             ..Default::default()
                         },
                     )
