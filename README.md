@@ -272,7 +272,29 @@ docker compose --profile registry up -d
 docker compose logs registry   # the operator key: nodes pin it with --operator
 ```
 
-Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and operator key live in the `registry-data` volume, so back it up: the operator key signs the log head, the blocklist and the anchor list, and a new key means every node has to pin a new one. Operator commands run inside the container, e.g. `docker compose exec registry chungus block <hash> --key /data/registry/operator.key`.
+Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and keys live in the `registry-data` volume.
+
+### Keeping the operator key offline
+
+The operator key signs the log head, the blocklist and the anchor list, and every node pins it, so whoever steals it can block models and point nodes at their own anchors. It doesn't need to live on the server. The registry has two keys: the **root key** (`operator.key`), which nodes pin, and an **online key** (`online.key`), which the root key delegates to for a limited time. With the root key offline, a stolen online key works only until its delegation expires or you revoke it, and it can never delegate to itself or to another key.
+
+```sh
+# 1. Start the registry once; it creates online.key and prints it
+docker compose logs registry            # "online key chungus1... is not delegated" (or signing with the root key)
+
+# 2. Copy the root key to your own machine, and keep a backup of it somewhere offline
+docker compose cp registry:/data/registry/operator.key ./chungus-root.key
+
+# 3. From your machine: let the online key act as the operator for 90 days
+chungus delegate chungus1<online key> --key ./chungus-root.key --registry https://chungus.example.com
+
+# 4. Remove the root key from the server and restart (the container has no shell, so
+#    borrow one that mounts its volume)
+docker run --rm --volumes-from "$(docker compose ps -q registry)" alpine rm /data/registry/operator.key
+docker compose restart registry
+```
+
+The registry keeps `operator.pub` so it still knows which key nodes pin. Renew before the 90 days are up by running step 3 again (the registry's log warns two weeks ahead); block, unblock and anchors commands work with either key. If the server may be compromised, `chungus delegate --revoke --key ./chungus-root.key` ends the delegation at once, and to rotate the online key, delete `online.key`, restart, and delegate to the new one. Operator commands run inside the container, e.g. `docker compose exec registry chungus block <hash> --key /data/registry/operator.key`.
 
 The site can also be published to GitHub Pages: set the repository variable `CHUNGUS_REGISTRY_URL` to the registry's HTTPS address (the workflow refuses anything else), set Settings > Pages > Source to "GitHub Actions" and tick "Enforce HTTPS". The Pages workflow points the page at the live registry and bundles a snapshot of its index, refreshed every six hours, for when the registry is down.
 

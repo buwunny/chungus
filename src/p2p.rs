@@ -933,8 +933,8 @@ impl Runner {
                             return;
                         }
                         if let Request::Access(ticket) = &request {
-                            let ok = self.store.gate_operator().is_some_and(|op| {
-                                ticket.valid_for(&op, &peer.to_string())
+                            let ok = self.store.ticket_issuers().iter().any(|op| {
+                                ticket.valid_for(op, &peer.to_string())
                             });
                             if ok {
                                 self.granted

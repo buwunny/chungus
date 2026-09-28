@@ -135,8 +135,8 @@ pub struct Store {
 /// Models behind a Hugging Face repo's gate, from a registry this store follows.
 #[derive(Default)]
 struct Gates {
-    /// The registry operator key that signs access tickets.
-    operator: String,
+    /// The registry keys that sign access tickets, and when each stops being accepted.
+    issuers: Vec<(String, u64)>,
     /// Manifest root -> Hugging Face repo.
     roots: HashMap<String, String>,
     /// Chunk hash -> repos of the gated models in this store that contain it.
@@ -171,9 +171,9 @@ impl Store {
         removed
     }
 
-    /// Replace the gated models (root -> Hugging Face repo) and the operator key whose
-    /// access tickets open them.
-    pub fn set_gates(&self, operator: &str, roots: HashMap<String, String>) {
+    /// Replace the gated models (root -> Hugging Face repo) and the registry keys whose
+    /// access tickets open them (with when each stops being accepted).
+    pub fn set_gates(&self, issuers: Vec<(String, u64)>, roots: HashMap<String, String>) {
         let mut chunks: HashMap<String, Vec<String>> = HashMap::new();
         for (root, repo) in &roots {
             if let Ok(m) = self.get_manifest(root) {
@@ -181,7 +181,7 @@ impl Store {
             }
         }
         *self.gates.write().unwrap() = Gates {
-            operator: operator.to_string(),
+            issuers,
             roots,
             chunks,
         };
@@ -198,10 +198,16 @@ impl Store {
             .unwrap_or_default()
     }
 
-    /// The operator key that signs access tickets, once a registry has been followed.
-    pub fn gate_operator(&self) -> Option<String> {
+    /// The registry keys whose access tickets are accepted now; none until a registry has
+    /// been followed.
+    pub fn ticket_issuers(&self) -> Vec<String> {
+        let now = crate::registry::now();
         let g = self.gates.read().unwrap();
-        (!g.operator.is_empty()).then(|| g.operator.clone())
+        g.issuers
+            .iter()
+            .filter(|(_, until)| now < *until)
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     pub fn is_blocked(&self, hash: &str) -> bool {

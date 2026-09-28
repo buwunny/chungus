@@ -8,6 +8,8 @@
 //! - `grant` and `revoke` add and remove an org's owner keys.
 //! - `block` and `unblock` (registry operator only) maintain the blocklist that nodes
 //!   enforce.
+//! - `delegate` (operator root key only) lets an online key act as the operator until a
+//!   given time, so the root key can stay offline. See [`Registry::open`].
 //! - `gate` (registry operator only) puts a model behind a Hugging Face repo's gate, as
 //!   a publisher can when publishing. See [`AccessTicket`].
 //!
@@ -91,6 +93,15 @@ pub enum Claim {
     Anchors {
         addrs: Vec<String>,
     },
+    /// Let `key` act as the operator (sign heads, blocks and anchors) until `expires`
+    /// (Unix seconds), replacing any earlier delegation. Only the operator's root key may
+    /// make this statement, so a stolen online key can't extend itself. An empty `key`
+    /// revokes the delegation.
+    Delegate {
+        key: String,
+        #[serde(default)]
+        expires: u64,
+    },
 }
 
 /// A claim, when it was made, and the signature of the key that made it.
@@ -112,12 +123,17 @@ pub struct Entry {
 }
 
 /// The registry's signed summary of the log: its length and the hash of its last entry.
+/// It is signed by the operator's root key, or by the online key the log delegates to.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Head {
     pub size: u64,
     pub hash: String,
     pub time: u64,
     pub signature: Signature,
+    /// The operator's root key. Informational: clients that pin a key check against the
+    /// pin, and everyone checks the signature against the replayed log.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operator: String,
 }
 
 pub fn now() -> u64 {
@@ -283,6 +299,8 @@ pub struct Log {
     gated: HashMap<String, String>,
     /// Index of the latest anchors entry.
     anchors: Option<usize>,
+    /// The online key currently acting for the operator, and when that ends.
+    delegate: Option<(String, u64)>,
     seen: HashSet<String>,
 }
 
@@ -356,7 +374,7 @@ impl Log {
                 }
             }
             Claim::Block { hash, .. } | Claim::Unblock { hash } => {
-                if key != self.operator {
+                if !self.acts_as_operator(key, st.time) {
                     bail!("only the registry operator can change the blocklist");
                 }
                 if !store::is_hash(hash) {
@@ -364,7 +382,7 @@ impl Log {
                 }
             }
             Claim::Gate { root, repo } => {
-                if key != self.operator {
+                if !self.acts_as_operator(key, st.time) {
                     bail!("only the registry operator can gate a model");
                 }
                 if !store::is_hash(root) {
@@ -374,8 +392,25 @@ impl Log {
                     bail!("{repo:?} is not a Hugging Face repo like org/name");
                 }
             }
-            Claim::Anchors { addrs } => {
+            Claim::Delegate {
+                key: online,
+                expires,
+            } => {
                 if key != self.operator {
+                    bail!("only the operator's root key can delegate");
+                }
+                if !online.is_empty() {
+                    sign::parse_public_key(online)?;
+                    if *expires <= st.time {
+                        bail!("the delegation has already expired");
+                    }
+                    if online == &self.operator {
+                        bail!("the root key can't delegate to itself");
+                    }
+                }
+            }
+            Claim::Anchors { addrs } => {
+                if !self.acts_as_operator(key, st.time) {
                     bail!("only the registry operator can set the anchors");
                 }
                 if addrs.len() > MAX_ANCHORS {
@@ -444,6 +479,9 @@ impl Log {
             Claim::Anchors { .. } => {
                 self.anchors = Some(idx);
             }
+            Claim::Delegate { key, expires } => {
+                self.delegate = (!key.is_empty()).then(|| (key.clone(), *expires));
+            }
         }
         self.seen.insert(st.signature.sig.clone());
         self.head_hash = entry.hash();
@@ -496,7 +534,26 @@ impl Log {
         self.blocked.iter()
     }
 
-    /// The entry holding the current anchor list, if the operator has set one.
+    /// Whether `key` may act as the operator at `time`: the root key always, the delegated
+    /// online key until its delegation expires.
+    pub fn acts_as_operator(&self, key: &str, time: u64) -> bool {
+        key == self.operator
+            || self
+                .delegate
+                .as_ref()
+                .is_some_and(|(k, exp)| k == key && time < *exp)
+    }
+
+    /// The delegated online key and when its delegation expires.
+    pub fn delegate(&self) -> Option<(&str, u64)> {
+        self.delegate.as_ref().map(|(k, e)| (k.as_str(), *e))
+    }
+
+    /// Whether `head` is signed by a key the log allows to sign it.
+    pub fn signs_head(&self, head: &Head) -> bool {
+        head.verify() && self.acts_as_operator(&head.signature.key, head.time)
+    }
+
     /// The Hugging Face repo whose gate `root` is behind, if any.
     pub fn gate(&self, root: &str) -> Option<&str> {
         self.gated.get(root).map(String::as_str)
@@ -507,6 +564,15 @@ impl Log {
         &self.gated
     }
 
+    /// The keys whose access tickets nodes accept, each with when it stops being accepted:
+    /// the root key, and the delegated online key until its delegation ends.
+    pub fn ticket_issuers(&self) -> Vec<(String, u64)> {
+        let mut keys = vec![(self.operator.clone(), u64::MAX)];
+        keys.extend(self.delegate.clone());
+        keys
+    }
+
+    /// The entry holding the current anchor list, if the operator has set one.
     pub fn anchors(&self) -> Option<&Entry> {
         self.anchors.map(|i| &self.entries[i])
     }
@@ -616,11 +682,16 @@ impl Hit {
 
 // ---------- server ----------
 
-/// A registry backed by a directory: `log.jsonl` (one entry per line), `operator.key`,
-/// and `manifests/<root>.json` for every model published through it.
+/// A registry backed by a directory: `log.jsonl` (one entry per line), the operator's
+/// public root key in `operator.pub`, signing keys (see [`Registry::open`]), and
+/// `manifests/<root>.json` for every model published through it.
 pub struct Registry {
     log: Mutex<Log>,
-    key: SigningKey,
+    operator: String,
+    /// The operator's root key, when it is kept here rather than offline.
+    root: Option<SigningKey>,
+    /// The online key, which signs once the log delegates to it.
+    online: SigningKey,
     file: Mutex<fs::File>,
     manifests: PathBuf,
     /// Roots whose manifest the registry holds and has checked (see [`crate::safety`]).
@@ -642,19 +713,51 @@ pub struct AccessRequest {
     pub token: String,
 }
 
+/// How long `chungus delegate` delegates for by default. Renew before it runs out.
+pub const DEFAULT_DELEGATION_DAYS: u64 = 90;
+
 /// Largest manifest the registry accepts: about a 1 TB model.
 pub const MAX_MANIFEST: usize = 256 << 20;
 
 impl Registry {
+    /// Open the registry in `dir`, creating it if new.
+    ///
+    /// The operator is identified by a root key, which nodes pin. For a new registry the
+    /// root key is created in `operator.key`, and the registry works as before. To keep
+    /// the root key offline, move `operator.key` to another machine: the registry then
+    /// signs with `online.key` (created here on first use), once the root key delegates
+    /// to it with `chungus delegate`. A stolen online key can act as the operator only
+    /// until its delegation expires or is revoked, and can never delegate.
     pub fn open(dir: &FsPath) -> Result<Registry> {
         fs::create_dir_all(dir)?;
         let key_path = dir.join("operator.key");
-        let key = if key_path.exists() {
-            sign::load_key(&key_path)?
+        let pub_path = dir.join("operator.pub");
+        let root = if key_path.exists() {
+            Some(sign::load_key(&key_path)?)
+        } else if pub_path.exists() {
+            None
         } else {
-            sign::generate_key(&key_path)?
+            Some(sign::generate_key(&key_path)?)
         };
-        let operator = sign::public_key_string(&key.verifying_key());
+        let operator = match &root {
+            Some(k) => {
+                let op = sign::public_key_string(&k.verifying_key());
+                fs::write(&pub_path, format!("{op}\n"))?;
+                op
+            }
+            None => {
+                let op = fs::read_to_string(&pub_path)?.trim().to_string();
+                sign::parse_public_key(&op)
+                    .with_context(|| format!("{} is not a public key", pub_path.display()))?;
+                op
+            }
+        };
+        let online_path = dir.join("online.key");
+        let online = if online_path.exists() {
+            sign::load_key(&online_path)?
+        } else {
+            sign::generate_key(&online_path)?
+        };
         let path: PathBuf = dir.join("log.jsonl");
         let mut entries = Vec::new();
         if let Ok(text) = fs::read_to_string(&path) {
@@ -668,7 +771,8 @@ impl Registry {
                 );
             }
         }
-        let log = Log::replay(operator, entries).context("the registry's own log is invalid")?;
+        let log =
+            Log::replay(operator.clone(), entries).context("the registry's own log is invalid")?;
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -687,7 +791,9 @@ impl Registry {
         }
         Ok(Registry {
             log: Mutex::new(log),
-            key,
+            operator,
+            root,
+            online,
             file: Mutex::new(file),
             manifests,
             checked: RwLock::new(checked),
@@ -696,6 +802,17 @@ impl Registry {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
         })
+    }
+
+    /// The key that acts as the operator now: the online key while the log delegates to
+    /// it, otherwise the root key if it is here. None means an offline root key has not
+    /// delegated to (or has revoked) this registry's online key.
+    pub fn operator_key(&self) -> Option<&SigningKey> {
+        let online = self.online_public();
+        if self.with_log(|log| log.acts_as_operator(&online, now())) {
+            return Some(&self.online);
+        }
+        self.root.as_ref()
     }
 
     /// Check gated access against `url` instead of huggingface.co.
@@ -746,20 +863,33 @@ impl Registry {
                 ));
             }
         }
+        let Some(key) = self.operator_key() else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this registry's online key isn't delegated to, so it can't issue tickets".into(),
+            ));
+        };
         Ok(AccessTicket::new(
-            &self.key,
+            key,
             &repo,
             &req.peer,
             now() + TICKET_SECS,
         ))
     }
 
-    pub fn operator_key(&self) -> &SigningKey {
-        &self.key
+    /// The operator's root public key, the one nodes pin.
+    pub fn operator(&self) -> String {
+        self.operator.clone()
     }
 
-    pub fn operator(&self) -> String {
-        sign::public_key_string(&self.key.verifying_key())
+    /// The online key's public half, for `chungus delegate`.
+    pub fn online_public(&self) -> String {
+        sign::public_key_string(&self.online.verifying_key())
+    }
+
+    /// Whether the root key is on this machine.
+    pub fn has_root_key(&self) -> bool {
+        self.root.is_some()
     }
 
     /// Accept a statement: check it, write it to disk, then add it to the log.
@@ -828,14 +958,18 @@ impl Registry {
             .collect()
     }
 
+    /// The signed head. Signed by the online key if delegated, else the root key; with
+    /// neither, the online key signs anyway and clients reject it until it is delegated.
     pub fn head(&self) -> Head {
+        let key = self.operator_key().unwrap_or(&self.online).clone();
         let log = self.log.lock().unwrap();
         let (size, hash, time) = (log.entries.len() as u64, log.head_hash().to_string(), now());
         Head {
-            signature: sign::sign_message(&self.key, &head_message(size, &hash, time)),
+            signature: sign::sign_message(&key, &head_message(size, &hash, time)),
             size,
             hash,
             time,
+            operator: self.operator.clone(),
         }
     }
 
@@ -1008,6 +1142,16 @@ async fn anchors(State(reg): State<Arc<Registry>>) -> Response {
     }
 }
 
+/// The root key a head names, for clients that haven't pinned one. Older registries
+/// don't name it, and sign with the root key itself.
+fn head_operator(head: &Head) -> String {
+    if head.operator.is_empty() {
+        head.signature.key.clone()
+    } else {
+        head.operator.clone()
+    }
+}
+
 // ---------- client ----------
 
 pub struct Client {
@@ -1148,7 +1292,7 @@ impl Client {
     pub async fn anchors(&self, operator: Option<&str>) -> Result<Vec<libp2p::Multiaddr>> {
         let operator = match operator {
             Some(op) => op.to_string(),
-            None => self.head().await?.signature.key,
+            None => head_operator(&self.head().await?),
         };
         let resp = self
             .http
@@ -1167,7 +1311,13 @@ impl Client {
         let Claim::Anchors { addrs } = &st.claim else {
             bail!("the registry sent a bad anchors entry");
         };
-        if !st.verify() || st.key() != operator {
+        // Signed by the root key, or by an online key the log delegated to at the time.
+        let allowed = st.key() == operator
+            || self
+                .audit(Some(&operator))
+                .await
+                .is_ok_and(|(log, _)| log.entries.iter().any(|e| e.statement == *st));
+        if !st.verify() || !allowed {
             bail!("the anchor list is not signed by the registry operator {operator}");
         }
         addrs.iter().map(|a| valid_anchor(a)).collect()
@@ -1191,16 +1341,18 @@ impl Client {
     /// pins the registry's key; without it, the key that signed the head is trusted.
     pub async fn audit(&self, operator: Option<&str>) -> Result<(Log, Head)> {
         let head = self.head().await?;
-        if let Some(op) = operator
-            && head.signature.key != op
-        {
+        let op = operator
+            .map(str::to_string)
+            .unwrap_or_else(|| head_operator(&head));
+        let entries = self.entries(0).await?;
+        let log = Log::replay(op.clone(), entries)?;
+        if !log.signs_head(&head) {
             bail!(
-                "the registry's head is signed by {}, not {op}",
+                "the registry's head is signed by {}, which is neither {op} nor a key it \
+                 currently delegates to",
                 head.signature.key
             );
         }
-        let entries = self.entries(0).await?;
-        let log = Log::replay(head.signature.key.clone(), entries)?;
         // The log may have grown since we read the head; the head must match a prefix.
         let size = head.size as usize;
         if size > log.entries.len() {
@@ -1245,23 +1397,26 @@ impl Follower {
     /// Fetch new log entries, check them, and apply the blocklist to `store`. Returns how
     /// many blocked chunks and manifests were deleted from disk.
     pub async fn sync(&mut self, store: &store::Store) -> Result<usize> {
+        let head = self.client.head().await?;
         if self.log.is_none() {
-            let head = self.client.head().await?;
-            let operator = match &self.operator {
-                Some(op) if *op != head.signature.key => {
-                    bail!(
-                        "the registry's head is signed by {}, not {op}",
-                        head.signature.key
-                    )
-                }
-                _ => head.signature.key,
-            };
+            let operator = self
+                .operator
+                .clone()
+                .unwrap_or_else(|| head_operator(&head));
             self.log = Some(Log::new(operator));
         }
         let log = self.log.as_mut().unwrap();
         let new = self.client.entries(log.entries.len() as u64).await?;
         log.extend(new)?;
-        store.set_gates(&log.operator, log.gates().clone());
+        if !log.signs_head(&head) {
+            bail!(
+                "the registry's head is signed by {}, which is neither the operator {} nor a \
+                 key it currently delegates to",
+                head.signature.key,
+                log.operator
+            );
+        }
+        store.set_gates(log.ticket_issuers(), log.gates().clone());
         Ok(store.set_blocked(log.blocked().cloned().collect()))
     }
 
@@ -1310,6 +1465,74 @@ mod tests {
     }
 
     #[test]
+    fn root_key_offline_with_a_delegated_online_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("reg");
+        let operator = Registry::open(&data).unwrap().operator();
+        // Take the root key off the server.
+        let root_path = dir.path().join("root.key");
+        fs::rename(data.join("operator.key"), &root_path).unwrap();
+        let root = sign::load_key(&root_path).unwrap();
+        let reg = Registry::open(&data).unwrap();
+        assert_eq!(reg.operator(), operator);
+        assert!(reg.operator_key().is_none());
+        let online = reg.online_public();
+
+        // Until delegated, the online key's head isn't accepted, nor its blocks.
+        let block = Claim::Block {
+            hash: "aa".repeat(32),
+            reason: String::new(),
+        };
+        let head = reg.head();
+        assert!(!reg.with_log(|log| log.signs_head(&head)));
+        assert!(
+            reg.submit(Statement::new(&reg.online, block.clone()))
+                .is_err()
+        );
+
+        // The root delegates; the online key can't delegate, even to itself.
+        let delegate = |k: &SigningKey, key: &str, expires: u64| {
+            Statement::new(
+                k,
+                Claim::Delegate {
+                    key: key.into(),
+                    expires,
+                },
+            )
+        };
+        assert!(
+            reg.submit(delegate(&reg.online, &online, now() + 3600))
+                .is_err()
+        );
+        reg.submit(delegate(&root, &online, now() + 3600)).unwrap();
+        let head = reg.head();
+        assert_eq!(head.signature.key, online);
+        assert!(reg.with_log(|log| log.signs_head(&head)));
+        reg.submit(Statement::new(reg.operator_key().unwrap(), block))
+            .unwrap();
+        // Tickets the online key issues are accepted while the delegation lasts.
+        let peer = libp2p::PeerId::random().to_string();
+        let t = AccessTicket::new(reg.operator_key().unwrap(), "x/y", &peer, now() + 60);
+        let issuers = reg.with_log(|log| log.ticket_issuers());
+        assert!(
+            issuers
+                .iter()
+                .any(|(k, until)| t.valid_for(k, &peer) && now() < *until)
+        );
+        // Delegations end when they expire, and the root can revoke one early.
+        reg.with_log(|log| {
+            assert!(log.acts_as_operator(&online, now()));
+            assert!(!log.acts_as_operator(&online, now() + 3601));
+        });
+        reg.submit(delegate(&root, "", 0)).unwrap();
+        assert!(reg.operator_key().is_none());
+
+        // The whole log still replays for an auditor who pinned the root key.
+        let entries = reg.with_log(|log| log.entries.clone());
+        Log::replay(operator, entries).unwrap();
+    }
+
+    #[test]
     fn gates_and_tickets() {
         let dir = tempfile::tempdir().unwrap();
         let reg = Registry::open(&dir.path().join("reg")).unwrap();
@@ -1335,8 +1558,11 @@ mod tests {
             reg.submit(Statement::new(&alice, gate(&r1, "x/y")))
                 .is_err()
         );
-        reg.submit(Statement::new(reg.operator_key(), gate(&r1, "x/y")))
-            .unwrap();
+        reg.submit(Statement::new(
+            reg.operator_key().unwrap(),
+            gate(&r1, "x/y"),
+        ))
+        .unwrap();
         reg.with_log(|log| {
             assert_eq!(log.gate(&r1), Some("x/y"));
             assert_eq!(log.gate(&r2), Some("meta-llama/Llama-3.2-1B"));
@@ -1345,17 +1571,17 @@ mod tests {
         reg.submit(publish(&alice, "acme/llama", "v2", &r2))
             .unwrap();
         assert!(reg.with_log(|log| log.gate(&r2).is_some()));
-        reg.submit(Statement::new(reg.operator_key(), gate(&r2, "")))
+        reg.submit(Statement::new(reg.operator_key().unwrap(), gate(&r2, "")))
             .unwrap();
         assert!(reg.with_log(|log| log.gate(&r2).is_none()));
 
         // Tickets are bound to the operator, the peer and the clock.
         let peer = libp2p::PeerId::random().to_string();
-        let t = AccessTicket::new(reg.operator_key(), "x/y", &peer, now() + 60);
+        let t = AccessTicket::new(reg.operator_key().unwrap(), "x/y", &peer, now() + 60);
         assert!(t.valid_for(&reg.operator(), &peer));
         assert!(!t.valid_for(&reg.operator(), &libp2p::PeerId::random().to_string()));
         assert!(!t.valid_for(&sign::public_key_string(&alice.verifying_key()), &peer));
-        let old = AccessTicket::new(reg.operator_key(), "x/y", &peer, now() - 1);
+        let old = AccessTicket::new(reg.operator_key().unwrap(), "x/y", &peer, now() - 1);
         assert!(!old.valid_for(&reg.operator(), &peer));
         let mut forged = t.clone();
         forged.repo = "other/repo".into();
@@ -1394,7 +1620,7 @@ mod tests {
             reason: "test".into(),
         };
         assert!(reg.submit(Statement::new(&alice, block.clone())).is_err());
-        reg.submit(Statement::new(reg.operator_key(), block))
+        reg.submit(Statement::new(reg.operator_key().unwrap(), block))
             .unwrap();
         assert!(reg.submit(publish(&bob, "bob/y", "main", &r1)).is_err());
 

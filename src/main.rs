@@ -307,13 +307,36 @@ enum Cmd {
         #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
         registry: String,
     },
+    /// Let a registry's online key act as the operator for a while, so the root key can
+    /// stay offline (operator root key only). Run it again before it expires to renew, or
+    /// with --revoke if the online key may be stolen.
+    ///
+    /// Moving an existing registry's root key offline: start the upgraded registry once
+    /// (it prints its online key), delegate to that key from here, then move
+    /// operator.key off the server and restart it.
+    Delegate {
+        /// The registry's online key (chungus1...), printed when the registry starts.
+        online_key: Option<String>,
+        /// How many days the delegation lasts.
+        #[arg(long, default_value_t = registry::DEFAULT_DELEGATION_DAYS)]
+        days: u64,
+        /// End the current delegation now.
+        #[arg(long, conflicts_with = "online_key")]
+        revoke: bool,
+        /// The operator's root key.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
     /// Put a model behind a Hugging Face repo's gate (or lift it with no repo). Operator
     /// only.
     Gate {
         root: String,
         /// The Hugging Face repo, e.g. meta-llama/Llama-3.2-1B. Omit to lift the gate.
         repo: Option<String>,
-        /// The registry's operator key (operator.key in its data directory).
+        /// The operator's root key, or the registry's online key (online.key) while
+        /// delegated.
         #[arg(long)]
         key: PathBuf,
         #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
@@ -979,6 +1002,24 @@ async fn main() -> Result<()> {
             println!("registry on http://localhost:{port}");
             println!("operator key {}", reg.operator());
             println!("{} entries in the log", reg.head().size);
+            let online = reg.online_public();
+            match reg.with_log(|log| log.delegate().map(|(k, e)| (k == online, e))) {
+                Some((true, expires)) => {
+                    let days = expires.saturating_sub(registry::now()) / 86400;
+                    println!("signing with online key {online}, delegated for {days} more day(s)");
+                    if days < 14 {
+                        println!("renew it soon: chungus delegate {online} --key <root key>");
+                    }
+                }
+                _ if reg.has_root_key() => println!(
+                    "signing with the root key; to keep it offline, see `chungus delegate --help`"
+                ),
+                _ => println!(
+                    "online key {online} is not delegated, so clients will reject this \
+                     registry's head. From the machine with the root key, run:\n  \
+                     chungus delegate {online} --key <root key> --registry <this registry>"
+                ),
+            }
             axum::serve(listener, registry::router(reg)).await?;
         }
         Cmd::Publish {
@@ -1084,6 +1125,38 @@ async fn main() -> Result<()> {
                     "pass --operator {} to pin this registry",
                     head.signature.key
                 );
+            }
+        }
+        Cmd::Delegate {
+            online_key,
+            days,
+            revoke,
+            key,
+            registry,
+        } => {
+            let k = sign::load_key(&key)?;
+            let claim = match (online_key, revoke) {
+                (_, true) => Claim::Delegate {
+                    key: String::new(),
+                    expires: 0,
+                },
+                (Some(online), false) => Claim::Delegate {
+                    key: online,
+                    expires: registry::now() + days * 86400,
+                },
+                (None, false) => bail!("name the registry's online key, or pass --revoke"),
+            };
+            let entry = registry::Client::new(&registry)?
+                .submit(&Statement::new(&k, claim.clone()))
+                .await?;
+            match claim {
+                Claim::Delegate { key, .. } if !key.is_empty() => {
+                    println!(
+                        "{key} acts as the operator for {days} day(s) (log entry {})",
+                        entry.seq
+                    )
+                }
+                _ => println!("revoked the online key (log entry {})", entry.seq),
             }
         }
         Cmd::Block {
