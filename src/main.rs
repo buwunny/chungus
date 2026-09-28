@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chungus::hub;
 use chungus::manifest::Manifest;
 use chungus::net;
 use chungus::store::{self, Store};
@@ -57,6 +58,25 @@ enum Cmd {
         #[arg(long, default_value_t = net::DEFAULT_PORT)]
         port: u16,
         /// Don't advertise over mDNS; peers must name this node with --peer.
+        #[arg(long)]
+        no_mdns: bool,
+    },
+    /// Run a local Hugging Face cache. Point tools at it with HF_ENDPOINT=http://localhost:8080.
+    Hub {
+        #[arg(long, default_value = DEFAULT_STORE)]
+        store: PathBuf,
+        #[arg(long, default_value_t = hub::DEFAULT_PORT)]
+        port: u16,
+        /// Where to get files no peer has.
+        #[arg(long, default_value = hub::DEFAULT_UPSTREAM)]
+        upstream: String,
+        /// Never contact the upstream; serve only what this hub and its peers have.
+        #[arg(long)]
+        offline: bool,
+        /// A peer to use in addition to discovered ones, e.g. http://192.168.1.20:8080.
+        #[arg(long)]
+        peer: Vec<String>,
+        /// Don't advertise or discover peers over mDNS.
         #[arg(long)]
         no_mdns: bool,
     },
@@ -187,7 +207,7 @@ async fn main() -> Result<()> {
             let _mdns = if no_mdns {
                 None
             } else {
-                Some(net::advertise(port)?)
+                Some(net::advertise(port, &net::node_id())?)
             };
             println!(
                 "serving {} models on port {port}{}",
@@ -199,6 +219,55 @@ async fn main() -> Result<()> {
                 }
             );
             net::serve_on(listener, store).await?;
+        }
+        Cmd::Hub {
+            store,
+            port,
+            upstream,
+            offline,
+            peer,
+            no_mdns,
+        } => {
+            let store = Arc::new(Store::open(&store)?);
+            let upstream = (!offline).then_some(upstream);
+            let hub = Arc::new(hub::Hub::new(store, upstream.clone(), peer.clone())?);
+            let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind {addr}"))?;
+            let id = net::node_id();
+            let _mdns = if no_mdns {
+                None
+            } else {
+                // Keep looking for peers in the background; hubs come and go.
+                let (hub, own_id) = (hub.clone(), id.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let found = {
+                            let id = own_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                net::discover(Duration::from_secs(2), Some(&id))
+                            })
+                            .await
+                        };
+                        if let Ok(Ok(found)) = found {
+                            let mut peers = peer.clone();
+                            peers.extend(found);
+                            peers.sort();
+                            peers.dedup();
+                            hub.set_peers(peers);
+                        }
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                Some(net::advertise(port, &id)?)
+            };
+            println!(
+                "Hugging Face cache on http://localhost:{port} (upstream: {})",
+                upstream.as_deref().unwrap_or("none, offline")
+            );
+            println!("use it with: export HF_ENDPOINT=http://localhost:{port}");
+            axum::serve(listener, hub::router(hub)).await?;
         }
         Cmd::Fetch {
             root,
@@ -213,7 +282,8 @@ async fn main() -> Result<()> {
             let mut peers = peer;
             if !no_mdns {
                 let wait = Duration::from_secs_f64(discover_secs);
-                let found = tokio::task::spawn_blocking(move || net::discover(wait)).await??;
+                let found =
+                    tokio::task::spawn_blocking(move || net::discover(wait, None)).await??;
                 println!("found {} peer(s) on the LAN", found.len());
                 peers.extend(found);
             }

@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::manifest::Manifest;
+use crate::manifest::{ChunkRef, Manifest};
 use crate::store::{self, Store};
 
 pub const SERVICE: &str = "_chungus._tcp.local.";
@@ -31,13 +31,14 @@ const CONCURRENCY: usize = 32;
 
 // ---------- server ----------
 
-/// HTTP routes for serving a store:
-/// `GET /v1/manifests`, `GET /v1/manifests/{root}`, `GET /v1/chunks/{hash}`.
+/// HTTP routes for serving a store: `GET /v1/manifests`, `GET /v1/manifests/{root}`,
+/// `GET /v1/chunks/{hash}` and `GET /v1/meta/{key}`.
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/v1/manifests", get(list_manifests))
         .route("/v1/manifests/{root}", get(get_manifest))
         .route("/v1/chunks/{hash}", get(get_chunk))
+        .route("/v1/meta/{*key}", get(get_meta))
         .with_state(store)
 }
 
@@ -73,15 +74,25 @@ async fn get_chunk(State(store): State<Arc<Store>>, Path(hash): Path<String>) ->
     }
 }
 
+async fn get_meta(State(store): State<Arc<Store>>, Path(key): Path<String>) -> Response {
+    if !store::is_meta_key(&key) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match tokio::task::spawn_blocking(move || store.get_meta(&key)).await {
+        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Serve `store` on an already-bound listener until the process exits.
 pub async fn serve_on(listener: tokio::net::TcpListener, store: Arc<Store>) -> Result<()> {
     axum::serve(listener, router(store)).await?;
     Ok(())
 }
 
-/// Advertise this node on the LAN. Keep the returned daemon alive for as long as the
-/// advert should last.
-pub fn advertise(port: u16) -> Result<mdns_sd::ServiceDaemon> {
+/// Advertise this node on the LAN under instance `id`. Keep the returned daemon alive for
+/// as long as the advert should last.
+pub fn advertise(port: u16, id: &str) -> Result<mdns_sd::ServiceDaemon> {
     let daemon = mdns_sd::ServiceDaemon::new().context("start mDNS")?;
     let host = hostname();
     let instance = format!("{host}-{port}");
@@ -91,7 +102,7 @@ pub fn advertise(port: u16) -> Result<mdns_sd::ServiceDaemon> {
         &format!("{host}.local."),
         "",
         port,
-        &[("v", "1")][..],
+        &[("v", "1"), ("id", id)][..],
     )?
     .enable_addr_auto();
     daemon.register(info).context("register mDNS service")?;
@@ -110,15 +121,25 @@ fn hostname() -> String {
 
 // ---------- discovery ----------
 
-/// Browse mDNS for `wait` and return the base URL of every peer found.
-pub fn discover(wait: Duration) -> Result<Vec<String>> {
+/// A random id for this process, so a node can recognise (and skip) its own advert.
+pub fn node_id() -> String {
+    let seed = format!("{:?}{}", Instant::now(), std::process::id());
+    blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
+}
+
+/// Browse mDNS for `wait` and return the base URL of every peer found, except the one
+/// advertising `exclude_id`.
+pub fn discover(wait: Duration, exclude_id: Option<&str>) -> Result<Vec<String>> {
     let daemon = mdns_sd::ServiceDaemon::new().context("start mDNS")?;
     let rx = daemon.browse(SERVICE)?;
     let deadline = Instant::now() + wait;
     let mut found = BTreeMap::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match rx.recv_timeout(left) {
-            Ok(mdns_sd::ServiceEvent::ServiceResolved(svc)) => {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(svc))
+                if exclude_id.is_none()
+                    || svc.txt_properties.get_property_val_str("id") != exclude_id =>
+            {
                 // Prefer IPv4: link-local IPv6 needs a scope id that URLs handle badly.
                 let mut addrs: Vec<IpAddr> = svc.addresses.iter().map(|a| a.to_ip_addr()).collect();
                 addrs.sort_by_key(|a| !a.is_ipv4());
@@ -175,10 +196,7 @@ pub async fn fetch(
         bail!("{root:?} is not a manifest root hash");
     }
     let started = Instant::now();
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(60))
-        .build()?;
+    let client = client()?;
     let origin: Vec<String> = origin.map(str::to_string).into_iter().collect();
     let all: Vec<&String> = peers.iter().chain(&origin).collect();
     if all.is_empty() {
@@ -191,10 +209,38 @@ pub async fn fetch(
     };
     store.put_manifest(&manifest)?;
 
-    // Unique chunks, in manifest order.
+    let mut stats = fetch_chunks(
+        &client,
+        &store,
+        manifest.files.iter().flat_map(|f| &f.chunks),
+        peers,
+        &origin,
+    )
+    .await?;
+    stats.secs = started.elapsed().as_secs_f64();
+    Ok((manifest, stats))
+}
+
+pub fn client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(60))
+        .build()?)
+}
+
+/// Download every chunk in `chunks` that `store` lacks, trying `peers` (spread by hash)
+/// and then `origin`. Each chunk is verified against its hash before it is stored.
+pub async fn fetch_chunks<'a>(
+    client: &reqwest::Client,
+    store: &Arc<Store>,
+    chunks: impl IntoIterator<Item = &'a ChunkRef>,
+    peers: &[String],
+    origin: &[String],
+) -> Result<FetchStats> {
+    // Unique chunks, in order.
     let mut wanted: Vec<(String, usize)> = Vec::new();
     let mut seen = HashSet::new();
-    for c in manifest.files.iter().flat_map(|f| &f.chunks) {
+    for c in chunks {
         if seen.insert(c.hash.clone()) {
             wanted.push((c.hash.clone(), c.len as usize));
         }
@@ -212,7 +258,6 @@ pub async fn fetch(
     let results = stream::iter(missing)
         .map(|(hash, len)| {
             let (client, store) = (client.clone(), store.clone());
-            let (peers, origin) = (peers, &origin);
             async move {
                 // Spread load: each chunk starts at a different peer, chosen by its hash.
                 let start = if peers.is_empty() {
@@ -244,8 +289,7 @@ pub async fn fetch(
         *stats.bytes_by_source.entry(source).or_default() += bytes;
         stats.rejected += rejected;
     }
-    stats.secs = started.elapsed().as_secs_f64();
-    Ok((manifest, stats))
+    Ok(stats)
 }
 
 async fn fetch_manifest(
@@ -276,6 +320,23 @@ async fn fetch_manifest(
         }
     }
     bail!("no source has a valid manifest for {root}")
+}
+
+/// Fetch one chunk from the first of `sources` that has a valid copy. Returns false if
+/// none did.
+pub async fn fetch_one(
+    client: &reqwest::Client,
+    store: &Arc<Store>,
+    hash: &str,
+    len: usize,
+    sources: &[String],
+) -> bool {
+    for source in sources {
+        if let Attempt::Stored(_) = try_chunk(client, store, source, hash, len).await {
+            return true;
+        }
+    }
+    false
 }
 
 async fn try_chunk(

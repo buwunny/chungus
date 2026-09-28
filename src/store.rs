@@ -182,6 +182,46 @@ impl Store {
     }
 }
 
+/// True if `key` is a safe relative metadata path: segments of `[A-Za-z0-9._%-]`, no
+/// `.` or `..` segments.
+pub fn is_meta_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg != "."
+                && seg != ".."
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'-'))
+        })
+}
+
+impl Store {
+    fn meta_path(&self, key: &str) -> Result<PathBuf> {
+        if !is_meta_key(key) {
+            bail!("invalid metadata key {key:?}");
+        }
+        Ok(self.root.join("meta").join(key))
+    }
+
+    /// Small metadata records (Hub model info, file lists), keyed by relative path.
+    pub fn put_meta(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        write_atomic(&self.meta_path(key)?, bytes)
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Vec<u8>> {
+        let path = self.meta_path(key)?;
+        fs::read(&path).with_context(|| format!("no metadata {key}"))
+    }
+
+    /// Scratch directory inside the store, on the same filesystem as the chunks.
+    pub fn tmp_dir(&self) -> Result<PathBuf> {
+        let dir = self.root.join("tmp");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+}
+
 /// Write via a temp file and rename, so a crash never leaves a truncated file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
