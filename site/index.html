@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>chungus</title>
 <meta name="description" content="A peer-to-peer network for AI models: smaller downloads, shared by peers, signed by publishers.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="chungus">
+<meta property="og:title" content="chungus: big chungus models, small chunk downloads">
+<meta property="og:description" content="Fetch only the chunks of a model you don't already have, from peers on your network or across the internet. Every model is signed by its publisher.">
+<meta property="og:image" content="og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A cartoon bunny sitting on a pile of pastel chunks, next to the words: Big chungus models, small chunk downloads.">
+<meta name="twitter:card" content="summary_large_image">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; connect-src 'self' https: http://localhost:*">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g fill='%23fff' stroke='%234a3b4f' stroke-width='3'><ellipse cx='22' cy='17' rx='7' ry='15' transform='rotate(-12 22 30)'/><ellipse cx='42' cy='17' rx='7' ry='15' transform='rotate(12 42 30)'/><ellipse cx='32' cy='42' rx='20' ry='16'/></g><g fill='%23ffb8d2'><ellipse cx='22' cy='18' rx='3' ry='9' transform='rotate(-12 22 30)'/><ellipse cx='42' cy='18' rx='3' ry='9' transform='rotate(12 42 30)'/></g><g fill='%234a3b4f'><circle cx='24.5' cy='40' r='3'/><circle cx='39.5' cy='40' r='3'/></g><path d='M29.5 44.4h5l-2.5 2.6z' fill='%23ff8db6'/></svg>">
 <link rel="stylesheet" href="style.css">
@@ -60,7 +69,7 @@
       </g>
       <rect class="slot" x="190" y="190" width="80" height="50" rx="10"/>
       <g class="chunk incoming"><rect class="drop" x="195" y="195" width="80" height="50" rx="10"/><rect class="block lav" x="190" y="190" width="80" height="50" rx="10"/><text x="230" y="220" text-anchor="middle">d4e8</text></g>
-      <g transform="translate(102 49) scale(1.5)">
+      <g class="buddy" transform="translate(102 49) scale(1.5)">
       <g class="hopper">
         <g transform="rotate(-12 22 30)"><g class="ear ear-l"><ellipse class="fur" cx="22" cy="17" rx="7" ry="15"/><ellipse class="inner" cx="22" cy="18" rx="3.2" ry="10"/></g></g>
         <g transform="rotate(12 42 30)"><g class="ear ear-r"><ellipse class="fur" cx="42" cy="17" rx="7" ry="15"/><ellipse class="inner" cx="42" cy="18" rx="3.2" ry="10"/></g></g>
@@ -76,6 +85,20 @@
   </section>
 
   <div class="tape" aria-hidden="true"><div class="track"><span>fetch only what you're missing ✿ shared by friends ✿ signed by publishers ✿ checked chunk by chunk ✿ </span><span>fetch only what you're missing ✿ shared by friends ✿ signed by publishers ✿ checked chunk by chunk ✿ </span></div></div>
+
+  <section class="receipts" aria-labelledby="receipts-title">
+    <h2 id="receipts-title">The receipts</h2>
+    <p class="big-stat"><span class="num">15–27%</span> smaller downloads than Hugging Face's Xet storage, on BF16 models.</p>
+    <p class="muted">Bytes to download for the same files. Lower is better.</p>
+    <div class="legend" aria-hidden="true"><span class="key chungus"></span>chungus <span class="key xet"></span>Xet</div>
+    <div id="receipts-chart" class="bars"></div>
+    <p class="callout"><span class="tag">updates</span> Already have Qwen3-0.6B? Its FP8 version shares 59% of its bytes, so chungus fetches <strong>368 MB</strong> of it. Xet fetches 460 MB at best, and the full model is 598 MB.</p>
+    <details class="numbers">
+      <summary>Show the numbers</summary>
+      <div class="table-wrap"><table id="receipts-table"></table></div>
+    </details>
+    <p class="muted fine">Measured 2026-09-28 on 10 public models with <a href="https://github.com/buwunny/chungus/blob/main/docs/benchmarks.md">bench/run.py</a>. Xet sizes come from Hugging Face's own Xet API: the compressed bytes a client downloads. Quantized models (GGUF) barely compress, so the gap there is small. <a href="https://github.com/buwunny/chungus/blob/main/bench/results/2026-09-28-arch.md">Full results</a></p>
+  </section>
 
   <section>
     <h2>Quickstart</h2>
@@ -94,6 +117,32 @@
     <div>
       <h3>Signed and auditable</h3>
       <p>Publishers sign what they publish, and the registry keeps an append-only, hash-chained log of every name and block. Nodes refuse blocked models and chunks.</p>
+    </div>
+  </section>
+
+  <section class="diff">
+    <h2>How is it different?</h2>
+    <div class="qa">
+      <div>
+        <span class="tag">vs Hugging Face</span>
+        <h3>Why not download from the Hub?</h3>
+        <p>Keep doing that: point <code>HF_ENDPOINT</code> at a <code>chungus hub</code> and your tools don't change. The first machine downloads from Hugging Face, and every other machine on your network gets it from that one.</p>
+      </div>
+      <div>
+        <span class="tag">vs BitTorrent</span>
+        <h3>Isn't this just torrents?</h3>
+        <p>A torrent is a fixed set of files, so a new version starts from zero. chungus shares chunks across files, models and versions, and fetches only the ones you're missing.</p>
+      </div>
+      <div>
+        <span class="tag">trust</span>
+        <h3>How do I know it's the real model?</h3>
+        <p>Publishers sign every model, and every name goes in a public, append-only log you can check with <code>chungus audit</code>. Each chunk is checked against its hash, and pickle files are refused.</p>
+      </div>
+      <div>
+        <span class="tag">speed</span>
+        <h3>Do I wait for the whole thing?</h3>
+        <p>On Linux, <code>chungus mount</code> shows the files at once and fetches chunks as they're read, so a model can start loading before the download finishes.</p>
+      </div>
     </div>
   </section>
 
