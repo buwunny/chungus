@@ -1,6 +1,6 @@
 # Benchmarks
 
-`bench/run.py` measures what chungus saves on real models and how fast it downloads them, next to plain Hugging Face. It needs [uv](https://docs.astral.sh/uv/) and a Rust toolchain; uv puts `huggingface_hub` in a throwaway environment, so nothing is installed globally.
+`bench/run.py` measures what chungus saves on real models and how fast it downloads them, next to Hugging Face and its Xet storage. It needs [uv](https://docs.astral.sh/uv/) and a Rust toolchain; uv puts `huggingface_hub` in a throwaway environment, so nothing is installed globally.
 
 ```sh
 uv run bench/run.py               # quick set: about 2 GB of downloads
@@ -13,13 +13,16 @@ It builds `target/release/chungus`, downloads the models once into `bench/.cache
 
 **Storage.** For each model, `chungus bench --json` reports its size as raw files, with zstd on each chunk (the baseline any compressor gets), and with the full chungus pipeline (float transform, zstd, dedup within the model). It also breaks this down by tensor dtype, and reports chunking, encode and decode throughput.
 
-**Dedup between versions.** For a pair such as a base model and its fine-tune, `chungus bench base fine-tune` counts how much of the fine-tune is already in a store that holds the base, and what fetching it would transfer. This is the number that matters for a user who already has one version.
+**Xet.** For the same files, the report shows what Hugging Face's Xet storage sends: its compressed, deduplicated chunks, plus small files that live in git at full size. These numbers come from Xet's reconstruction API, which lists for each file the compressed byte ranges a client downloads, so nothing is modelled or reimplemented. The report opens with a *chungus vs Xet* table that sums this up per model and per update.
 
-**Download time.** Each run downloads into an empty cache with `huggingface_hub.snapshot_download`, timing only the download:
+**Dedup between versions.** For a pair such as a base model and its fine-tune, `chungus bench base fine-tune` counts how much of the fine-tune is already in a store that holds the base, and what fetching it would transfer. This is the number that matters for a user who already has one version. The Xet columns show the same for a Xet client that kept every chunk of the first model, the most Xet's chunk cache could save. Xet only reports the size of a whole fetch range, so each chunk gets an equal share of its range.
+
+**Download time.** Each run downloads into an empty cache, including an empty Xet chunk cache, with `huggingface_hub.snapshot_download`, timing only the download:
 
 | Path | What it shows |
 |---|---|
-| huggingface_hub, direct | Plain Hugging Face, including Xet if `hf_xet` is installed (it is by default). |
+| huggingface_hub, Xet | Hugging Face with Xet (`hf_xet`, which the script installs). |
+| huggingface_hub, no Xet | Hugging Face over plain HTTP, with `HF_HUB_DISABLE_XET=1`. |
 | chungus hub, cold | A fresh `chungus hub` pulling from huggingface.co while it packs: the cost of going through chungus the first time. |
 | chungus hub, warm | The same hub serving from its store: what the second machine in an office gets. |
 | LAN peer (`--peer URL`) | A fresh offline hub filling from another hub on the LAN that already has the model. |

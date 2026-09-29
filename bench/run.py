@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["huggingface_hub>=0.34"]
+# dependencies = ["huggingface_hub>=0.34", "hf_xet"]
 # ///
 """Benchmark chungus on real models: storage saved and download speed.
 
@@ -11,13 +11,19 @@
 Three measurements, all written to bench/results/<date>-<host>.{md,json}:
 
 1. Compression per model: raw size vs zstd alone vs chungus's float transform + zstd,
-   per tensor dtype, from `chungus bench --json`.
+   per tensor dtype, from `chungus bench --json`, next to what Hugging Face's Xet
+   storage keeps and sends for the same files.
 2. Dedup between versions: how much of a second model (a fine-tune, another revision)
    is already in a store that holds the first, i.e. what a user who has the first
-   actually downloads.
-3. Download time: huggingface_hub straight from the Hub vs through `chungus hub`,
-   cold (the hub pulls from upstream while packing) and warm (served from its store),
-   plus a LAN peer (--peer) or the internet swarm (--swarm) when given.
+   actually downloads, with chungus and with Xet.
+3. Download time: huggingface_hub straight from the Hub, with Xet and over plain HTTP,
+   vs through `chungus hub`, cold (the hub pulls from upstream while packing) and warm
+   (served from its store), plus a LAN peer (--peer) or the internet swarm (--swarm)
+   when given.
+
+The Xet numbers come from the Xet reconstruction API, which lists, for each file, the
+byte ranges of Xet's compressed chunks (grouped into "xorbs") that a client downloads.
+Nothing is estimated from a reimplementation of Xet's chunking.
 
 Models are downloaded once into bench/.cache (git-ignored). Timed downloads always go
 into fresh temporary caches, so the cache never makes a timed run look faster.
@@ -35,6 +41,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -151,15 +159,17 @@ class Runner:
             name, _, path = spec.partition("=")
             self.local[name] = Path(path).resolve()
         self.errors: list[str] = []
+        self.xet_cache: dict[str, dict] = {}
+        self.tmp = tempfile.TemporaryDirectory(prefix="chungus-bench-")
 
     # --- helpers -------------------------------------------------------------------------
 
     def download(
-        self, m: Model, cache_dir: Path, endpoint: str | None = None
+        self, m: Model, cache_dir: Path, endpoint: str | None = None, env: dict | None = None
     ) -> tuple[Path, float]:
         """snapshot_download in a child process, so HF_ENDPOINT is read fresh each time.
         Returns the snapshot folder and the seconds snapshot_download took."""
-        env = dict(os.environ)
+        env = {**os.environ, **(env or {})}
         env["HF_ENDPOINT"] = endpoint or self.args.hf_endpoint
         env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         env.pop("HF_HUB_OFFLINE", None)
@@ -188,7 +198,18 @@ class Runner:
             return self.local[name]
         m = parse_model(name)
         log(f"getting {m.label}")
-        return self.download(m, CACHE)[0]
+        snapshot = self.download(m, CACHE)[0]
+        # The snapshot folder also holds files fetched for other models from the same repo
+        # (two GGUF quantizations, say), so link just this model's files into a folder of
+        # their own.
+        from huggingface_hub.utils import filter_repo_objects
+
+        files = [p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*") if p.is_file()]
+        own = Path(tempfile.mkdtemp(prefix="chungus-model-", dir=self.tmp.name))
+        for rel in filter_repo_objects(files, allow_patterns=m.patterns):
+            (own / rel).parent.mkdir(parents=True, exist_ok=True)
+            (own / rel).symlink_to((snapshot / rel).resolve())
+        return own
 
     def bench(self, *paths: Path) -> dict:
         out = subprocess.run(
@@ -198,6 +219,68 @@ class Runner:
             text=True,
         )
         return json.loads(out.stdout)
+
+    def xet(self, name: str) -> dict | None:
+        """What Xet stores and sends for a model's files, from the reconstruction API.
+
+        `chunks` maps (xorb, chunk index) to that chunk's share of the compressed bytes
+        a client fetches. A fetch range covers several chunks and the API gives only its
+        total size, so each chunk gets an equal share of its range. Files Xet doesn't hold
+        (small files kept in git) count at their raw size in `git_bytes`."""
+        if name in self.local:
+            return None
+        if name in self.xet_cache:
+            return self.xet_cache[name]
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import build_hf_headers, filter_repo_objects
+
+        m = parse_model(name)
+        rev = m.revision or "main"
+        files = [
+            f
+            for f in HfApi(endpoint=self.args.hf_endpoint).list_repo_tree(
+                m.repo, revision=m.revision, recursive=True
+            )
+            if hasattr(f, "size")
+        ]
+        files = list(filter_repo_objects(files, allow_patterns=m.patterns, key=lambda f: f.path))
+        headers = build_hf_headers()
+        url = (
+            f"{self.args.hf_endpoint}/api/models/{m.repo}/xet-read-token/"
+            f"{urllib.parse.quote(rev, safe='')}"
+        )
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as r:
+            token = json.load(r)
+        chunks: dict[tuple[str, int], float] = {}
+        git_bytes = 0
+        for f in files:
+            if not getattr(f, "xet_hash", None):
+                git_bytes += f.size
+                continue
+            req = urllib.request.Request(
+                f"{token['casUrl']}/v1/reconstructions/{f.xet_hash}",
+                headers={"Authorization": f"Bearer {token['accessToken']}"},
+            )
+            with urllib.request.urlopen(req) as r:
+                rec = json.load(r)
+            for xorb, ranges in rec["fetch_info"].items():
+                for e in ranges:
+                    first, end = e["range"]["start"], e["range"]["end"]
+                    # url_range is inclusive at both ends; range (chunk indices) is not.
+                    size = e["url_range"]["end"] - e["url_range"]["start"] + 1
+                    for i in range(first, end):
+                        chunks[(xorb, i)] = size / (end - first)
+        out = {
+            "raw_bytes": sum(f.size for f in files),
+            "git_bytes": git_bytes,
+            "transfer_bytes": round(git_bytes + sum(chunks.values())),
+            "chunks": chunks,
+        }
+        self.xet_cache[name] = out
+        return out
+
+    def try_xet(self, name: str) -> dict | None:
+        return self.attempt(f"Xet {name}", lambda: self.xet(name))
 
     def label(self, name: str) -> tuple[str, str]:
         if name in self.local:
@@ -228,7 +311,10 @@ class Runner:
                 log(f"bench {name}")
                 r = self.bench(path)
                 label, note = self.label(name)
-                return {"model": label, "note": note, **r}
+                row = {"model": label, "note": note, **r}
+                if x := self.try_xet(name):
+                    row["xet"] = {k: v for k, v in x.items() if k != "chunks"}
+                return row
 
             if (r := self.attempt(name, one)) is not None:
                 rows.append(r)
@@ -246,7 +332,7 @@ class Runner:
                 r = self.bench(pa, pb)
                 second = r["inputs"][1]
                 alone = self.bench(pb)
-                return {
+                row = {
                     "first": self.label(a)[0],
                     "second": self.label(b)[0],
                     "raw_bytes": second["raw_bytes"],
@@ -254,6 +340,14 @@ class Runner:
                     "fetch_bytes": second["new_stored_bytes"],
                     "fetch_bytes_alone": alone["dedup_bytes"],
                 }
+                xa, xb = self.try_xet(a), self.try_xet(b)
+                if xa and xb:
+                    # A client that kept every chunk of the first model fetches only the
+                    # chunks it lacks. Git-held files are always fetched again.
+                    new = sum(v for k, v in xb["chunks"].items() if k not in xa["chunks"])
+                    row["xet_fetch_bytes"] = round(xb["git_bytes"] + new)
+                    row["xet_fetch_bytes_alone"] = xb["transfer_bytes"]
+                return row
 
             if (r := self.attempt(f"{a} -> {b}", one)) is not None:
                 rows.append(r)
@@ -287,9 +381,11 @@ class Runner:
         proc.kill()
         raise RuntimeError("chungus hub did not start")
 
-    def timed_download(self, m: Model, endpoint: str | None = None) -> dict:
+    def timed_download(self, m: Model, endpoint: str | None = None, xet: bool = True) -> dict:
         with tempfile.TemporaryDirectory(prefix="chungus-bench-") as tmp:
-            _, secs = self.download(m, Path(tmp), endpoint)
+            # A fresh Xet chunk cache too, so Xet can't serve chunks from an earlier run.
+            env = {"HF_XET_CACHE": f"{tmp}/xet", "HF_HUB_DISABLE_XET": "" if xet else "1"}
+            _, secs = self.download(m, Path(tmp) / "hub", endpoint, env)
             # The snapshot folder is symlinks into blobs/, so measure the whole cache.
             return {"secs": secs, "bytes": du(Path(tmp))}
 
@@ -300,8 +396,10 @@ class Runner:
 
             def one(m=m):
                 row = {"model": m.label, "runs": {}}
-                log(f"download {m.label} from {self.args.hf_endpoint}")
-                row["runs"]["huggingface_hub, direct"] = self.timed_download(m)
+                log(f"download {m.label} from {self.args.hf_endpoint} with Xet")
+                row["runs"]["huggingface_hub, Xet"] = self.timed_download(m)
+                log(f"download {m.label} from {self.args.hf_endpoint} over plain HTTP")
+                row["runs"]["huggingface_hub, no Xet"] = self.timed_download(m, xet=False)
                 with tempfile.TemporaryDirectory(prefix="chungus-hub-") as tmp:
                     store = Path(tmp) / "store"
                     hub, url = self.start_hub(store, ["--no-mdns"])
@@ -371,24 +469,51 @@ def report(
     out = [f"# chungus benchmark, {meta['date']}", ""]
     out.append(
         f"{meta['host']}: {meta['cpu']}, {meta['cores']} cores, {meta['os']}. "
-        f"chungus {meta['commit']}. Upstream {meta['endpoint']}."
+        f"chungus {meta['commit']}, hf_xet {meta['hf_xet']}. Upstream {meta['endpoint']}."
     )
+    versus = [
+        (r["model"], r["note"] or "download", r["dedup_bytes"], r["xet"]["transfer_bytes"])
+        for r in comp
+        if "xet" in r
+    ] + [
+        (f"{r['first']} → {r['second']}", "update, first one in store", r["fetch_bytes"], r["xet_fetch_bytes"])
+        for r in dedup
+        if "xet_fetch_bytes" in r
+    ]
+    if versus:
+        out += [
+            "",
+            "## chungus vs Xet",
+            "",
+            "Bytes to download, from the tables below (lower is better).",
+            "",
+            "| Model | Kind | chungus | Xet | chungus vs Xet |",
+            "|---|---|--:|--:|--:|",
+        ]
+        for model, what, c, x in versus:
+            diff = f"{100 * (c - x) / x:+.1f}%" if x else "n/a"
+            out.append(f"| {model} | {what} | {mb(c)} | {mb(x)} | {diff} |")
     if comp:
         out += [
             "",
             "## Storage",
             "",
             "Size as a share of the raw files (lower is better). *zstd* compresses each chunk "
-            "on its own; *chungus* adds the float transform and dedup within the model.",
+            "on its own; *chungus* adds the float transform and dedup within the model. "
+            "*Xet* is what Hugging Face's Xet storage sends for the same files: its "
+            "compressed, deduplicated chunks, plus small files kept in git at full size.",
             "",
-            "| Model | Kind | Raw | zstd | chungus | Saved | Decode |",
-            "|---|---|--:|--:|--:|--:|--:|",
+            "| Model | Kind | Raw | zstd | chungus | Xet | Saved | Decode |",
+            "|---|---|--:|--:|--:|--:|--:|--:|",
         ]
         for r in comp:
             raw = r["raw_bytes"]
+            x = r.get("xet")
             out.append(
                 f"| {r['model']} | {r['note']} | {mb(raw)} | {pct(r['zstd_bytes'], raw)} | "
-                f"{pct(r['dedup_bytes'], raw)} | {mb(raw - r['dedup_bytes'])} | "
+                f"{pct(r['dedup_bytes'], raw)} | "
+                f"{pct(x['transfer_bytes'], x['raw_bytes']) if x else 'n/a'} | "
+                f"{mb(raw - r['dedup_bytes'])} | "
                 f"{raw / 1e6 / max(r['decode_secs'], 1e-9):,.0f} MB/s |"
             )
         out += [
@@ -424,24 +549,35 @@ def report(
             "",
             "## Dedup between versions",
             "",
-            "What fetching the second model costs when the first is already in the store.",
+            "What fetching the second model costs when the first is already in the store. "
+            "The Xet columns assume a client that kept every Xet chunk of the first model "
+            "(the most Xet's chunk cache could save); a Xet fetch range's bytes are split "
+            "evenly across its chunks.",
             "",
-            "| Have | Fetch | Size | Already have | Transfer | Without dedup |",
-            "|---|---|--:|--:|--:|--:|",
+            "| Have | Fetch | Size | Already have | Transfer | Without dedup "
+            "| Xet transfer | Xet without dedup |",
+            "|---|---|--:|--:|--:|--:|--:|--:|",
         ]
         for r in dedup:
+            xet = (
+                f"{mb(r['xet_fetch_bytes'])} | {mb(r['xet_fetch_bytes_alone'])}"
+                if "xet_fetch_bytes" in r
+                else "n/a | n/a"
+            )
             out.append(
                 f"| {r['first']} | {r['second']} | {mb(r['raw_bytes'])} | "
                 f"{pct(r['raw_bytes'] - r['new_raw_bytes'], r['raw_bytes'])} | "
-                f"{mb(r['fetch_bytes'])} | {mb(r['fetch_bytes_alone'])} |"
+                f"{mb(r['fetch_bytes'])} | {mb(r['fetch_bytes_alone'])} | {xet} |"
             )
     if dl:
         out += [
             "",
             "## Download time",
             "",
-            "Each run downloads into an empty cache. *Cold* is a fresh hub pulling from "
-            "upstream while it packs; *warm* is the same hub serving from its store.",
+            "Each run downloads into an empty cache, including an empty Xet chunk cache. "
+            "*No Xet* sets HF_HUB_DISABLE_XET so huggingface_hub uses plain HTTP. *Cold* is "
+            "a fresh hub pulling from upstream while it packs; *warm* is the same hub "
+            "serving from its store.",
             "",
             "| Model | Path | Time | Speed |",
             "|---|---|--:|--:|",
@@ -461,6 +597,15 @@ def report(
     if errors:
         out += ["", "## Skipped", ""] + [f"- {e}" for e in errors]
     return "\n".join(out) + "\n"
+
+
+def xet_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("hf_xet")
+    except PackageNotFoundError:
+        return "not installed"
 
 
 def main() -> None:
@@ -557,6 +702,7 @@ def main() -> None:
         "os": f"{platform.system()} {platform.release()}",
         "commit": commit,
         "endpoint": args.hf_endpoint,
+        "hf_xet": xet_version(),
     }
     args.out.mkdir(parents=True, exist_ok=True)
     stem = args.out / f"{meta['date']}-{meta['host']}"

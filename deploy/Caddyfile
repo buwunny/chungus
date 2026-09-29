@@ -23,6 +23,13 @@ https://{$CHUNGUS_DOMAIN} {
 		file_server
 	}
 
+	# A missing page gets the site's lost-bunny page, still with a 404 status.
+	handle_errors 404 {
+		root * /srv/site
+		rewrite * /404.html
+		file_server
+	}
+
 	header {
 		Strict-Transport-Security "max-age=63072000"
 		X-Content-Type-Options nosniff

@@ -1,0 +1,473 @@
+{
+  "meta": {
+    "date": "2026-09-28",
+    "host": "arch",
+    "cpu": "AMD Ryzen AI 9 HX 370 w/ Radeon 890M",
+    "cores": 24,
+    "os": "Linux 7.2.7-arch1-1",
+    "commit": "623e81b",
+    "endpoint": "https://huggingface.co",
+    "hf_xet": "1.6.0"
+  },
+  "compression": [
+    {
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "note": "BF16 fine-tune",
+      "raw_bytes": 272496399,
+      "zstd_bytes": 211753404,
+      "encoded_bytes": 199072162,
+      "dedup_bytes": 199072162,
+      "unique_raw_bytes": 272496399,
+      "chunks": 3597,
+      "unique_chunks": 3597,
+      "chunk_secs": 0.224041288,
+      "encode_secs": 0.262241408,
+      "decode_secs": 0.042507762,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-dosm6uat",
+          "raw_bytes": 272496399,
+          "new_raw_bytes": 272496399,
+          "new_stored_bytes": 199072162
+        }
+      ],
+      "by_dtype": {
+        "bf16": {
+          "raw_bytes": 269030016,
+          "zstd_bytes": 210499176,
+          "encoded_bytes": 197817769
+        },
+        "raw": {
+          "raw_bytes": 3466383,
+          "zstd_bytes": 1254228,
+          "encoded_bytes": 1254393
+        }
+      },
+      "xet": {
+        "raw_bytes": 272496399,
+        "git_bytes": 3435847,
+        "transfer_bytes": 271538056
+      }
+    },
+    {
+      "model": "openai-community/gpt2",
+      "note": "F32",
+      "raw_bytes": 554323319,
+      "zstd_bytes": 464387315,
+      "encoded_bytes": 440941866,
+      "dedup_bytes": 440381653,
+      "unique_raw_bytes": 507081300,
+      "chunks": 6573,
+      "unique_chunks": 6382,
+      "chunk_secs": 0.5047672230000001,
+      "encode_secs": 0.381517186,
+      "decode_secs": 0.038497291,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-y2bcp0e0",
+          "raw_bytes": 554323319,
+          "new_raw_bytes": 507081300,
+          "new_stored_bytes": 440381653
+        }
+      ],
+      "by_dtype": {
+        "f32": {
+          "raw_bytes": 548090880,
+          "zstd_bytes": 461934990,
+          "encoded_bytes": 438489307
+        },
+        "raw": {
+          "raw_bytes": 6232439,
+          "zstd_bytes": 2452325,
+          "encoded_bytes": 2452559
+        }
+      },
+      "xet": {
+        "raw_bytes": 554323319,
+        "git_bytes": 6218148,
+        "transfer_bytes": 480224407
+      }
+    },
+    {
+      "model": "sentence-transformers/all-MiniLM-L6-v2",
+      "note": "F32 embedding model",
+      "raw_bytes": 91607178,
+      "zstd_bytes": 83448680,
+      "encoded_bytes": 79098977,
+      "dedup_bytes": 79098977,
+      "unique_raw_bytes": 91607178,
+      "chunks": 1238,
+      "unique_chunks": 1238,
+      "chunk_secs": 0.06897916800000001,
+      "encode_secs": 0.080838037,
+      "decode_secs": 0.0077686940000000005,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-5jyzgpiw",
+          "raw_bytes": 91607178,
+          "new_raw_bytes": 91607178,
+          "new_stored_bytes": 79098977
+        }
+      ],
+      "by_dtype": {
+        "f32": {
+          "raw_bytes": 90852864,
+          "zstd_bytes": 83120216,
+          "encoded_bytes": 78770453
+        },
+        "raw": {
+          "raw_bytes": 754314,
+          "zstd_bytes": 328464,
+          "encoded_bytes": 328524
+        }
+      },
+      "xet": {
+        "raw_bytes": 91607178,
+        "git_bytes": 738802,
+        "transfer_bytes": 85720912
+      }
+    },
+    {
+      "model": "EleutherAI/pythia-160m",
+      "note": "F16",
+      "raw_bytes": 377113470,
+      "zstd_bytes": 294581006,
+      "encoded_bytes": 293456547,
+      "dedup_bytes": 293384794,
+      "unique_raw_bytes": 330975928,
+      "chunks": 4478,
+      "unique_chunks": 4280,
+      "chunk_secs": 0.40371129800000005,
+      "encode_secs": 0.20137357899999997,
+      "decode_secs": 0.03287789000000001,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-yyi81gg1",
+          "raw_bytes": 377113470,
+          "new_raw_bytes": 330975928,
+          "new_stored_bytes": 293384794
+        }
+      ],
+      "by_dtype": {
+        "f16": {
+          "raw_bytes": 324646104,
+          "zstd_bytes": 293840921,
+          "encoded_bytes": 292715778
+        },
+        "raw": {
+          "raw_bytes": 52467366,
+          "zstd_bytes": 740085,
+          "encoded_bytes": 740769
+        }
+      },
+      "xet": {
+        "raw_bytes": 377113470,
+        "git_bytes": 2114774,
+        "transfer_bytes": 326841444
+      }
+    },
+    {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "note": "BF16 fine-tune",
+      "raw_bytes": 999586347,
+      "zstd_bytes": 775392805,
+      "encoded_bytes": 728024843,
+      "dedup_bytes": 728024843,
+      "unique_raw_bytes": 999586347,
+      "chunks": 12654,
+      "unique_chunks": 12654,
+      "chunk_secs": 0.875791106,
+      "encode_secs": 0.666794904,
+      "decode_secs": 0.12189876100000001,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-9sp4_mmv",
+          "raw_bytes": 999586347,
+          "new_raw_bytes": 999586347,
+          "new_stored_bytes": 728024843
+        }
+      ],
+      "by_dtype": {
+        "bf16": {
+          "raw_bytes": 988065536,
+          "zstd_bytes": 771270922,
+          "encoded_bytes": 723902510
+        },
+        "raw": {
+          "raw_bytes": 11520811,
+          "zstd_bytes": 4121883,
+          "encoded_bytes": 4122333
+        }
+      },
+      "xet": {
+        "raw_bytes": 999586347,
+        "git_bytes": 11488523,
+        "transfer_bytes": 865435192
+      }
+    },
+    {
+      "model": "Qwen/Qwen3-0.6B",
+      "note": "BF16",
+      "raw_bytes": 1519182365,
+      "zstd_bytes": 1182120855,
+      "encoded_bytes": 1105183090,
+      "dedup_bytes": 878706968,
+      "unique_raw_bytes": 1208017437,
+      "chunks": 19389,
+      "unique_chunks": 15481,
+      "chunk_secs": 1.1814712859999998,
+      "encode_secs": 0.9431361409999999,
+      "decode_secs": 0.183481276,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-8abqfx2t",
+          "raw_bytes": 1519182365,
+          "new_raw_bytes": 1208017437,
+          "new_stored_bytes": 878706968
+        }
+      ],
+      "by_dtype": {
+        "bf16": {
+          "raw_bytes": 1503264768,
+          "zstd_bytes": 1177804329,
+          "encoded_bytes": 1100865832
+        },
+        "raw": {
+          "raw_bytes": 15917597,
+          "zstd_bytes": 4316526,
+          "encoded_bytes": 4317258
+        }
+      },
+      "xet": {
+        "raw_bytes": 1519182365,
+        "git_bytes": 4459383,
+        "transfer_bytes": 1062354281
+      }
+    },
+    {
+      "model": "Qwen/Qwen3-0.6B-FP8",
+      "note": "FP8 (E4M3)",
+      "raw_bytes": 1078857831,
+      "zstd_bytes": 857998386,
+      "encoded_bytes": 824831291,
+      "dedup_bytes": 598355169,
+      "unique_raw_bytes": 767692903,
+      "chunks": 13969,
+      "unique_chunks": 10061,
+      "chunk_secs": 0.72420174,
+      "encode_secs": 0.518150507,
+      "decode_secs": 0.108302188,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-dyr5u52l",
+          "raw_bytes": 1078857831,
+          "new_raw_bytes": 767692903,
+          "new_stored_bytes": 598355169
+        }
+      ],
+      "by_dtype": {
+        "bf16": {
+          "raw_bytes": 622514688,
+          "zstd_bytes": 486251718,
+          "encoded_bytes": 453067109
+        },
+        "raw": {
+          "raw_bytes": 456343143,
+          "zstd_bytes": 371746668,
+          "encoded_bytes": 371764182
+        }
+      },
+      "xet": {
+        "raw_bytes": 1078857831,
+        "git_bytes": 4459433,
+        "transfer_bytes": 732674083
+      }
+    },
+    {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "note": "GGUF Q4_K_M",
+      "raw_bytes": 491400032,
+      "zstd_bytes": 478831409,
+      "encoded_bytes": 478806282,
+      "dedup_bytes": 478806282,
+      "unique_raw_bytes": 491400032,
+      "chunks": 6144,
+      "unique_chunks": 6144,
+      "chunk_secs": 0.404764078,
+      "encode_secs": 0.143815119,
+      "decode_secs": 0.022507797,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-3kjnzsj4",
+          "raw_bytes": 491400032,
+          "new_raw_bytes": 491400032,
+          "new_stored_bytes": 478806282
+        }
+      ],
+      "by_dtype": {
+        "raw": {
+          "raw_bytes": 491400032,
+          "zstd_bytes": 478831409,
+          "encoded_bytes": 478806282
+        }
+      },
+      "xet": {
+        "raw_bytes": 491400032,
+        "git_bytes": 0,
+        "transfer_bytes": 485633377
+      }
+    },
+    {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "note": "GGUF Q8_0",
+      "raw_bytes": 675710816,
+      "zstd_bytes": 642721518,
+      "encoded_bytes": 642746796,
+      "dedup_bytes": 504892143,
+      "unique_raw_bytes": 531161580,
+      "chunks": 8426,
+      "unique_chunks": 6629,
+      "chunk_secs": 0.427263407,
+      "encode_secs": 0.168475231,
+      "decode_secs": 0.056511485,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-gexugru5",
+          "raw_bytes": 675710816,
+          "new_raw_bytes": 531161580,
+          "new_stored_bytes": 504892143
+        }
+      ],
+      "by_dtype": {
+        "raw": {
+          "raw_bytes": 675710816,
+          "zstd_bytes": 642721518,
+          "encoded_bytes": 642746796
+        }
+      },
+      "xet": {
+        "raw_bytes": 675710816,
+        "git_bytes": 0,
+        "transfer_bytes": 570857981
+      }
+    },
+    {
+      "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "note": "BF16, 2.2 GB",
+      "raw_bytes": 2202465492,
+      "zstd_bytes": 1718082513,
+      "encoded_bytes": 1610719470,
+      "dedup_bytes": 1610719470,
+      "unique_raw_bytes": 2202465492,
+      "chunks": 27768,
+      "unique_chunks": 27768,
+      "chunk_secs": 2.644403616,
+      "encode_secs": 1.427636017,
+      "decode_secs": 0.249040438,
+      "inputs": [
+        {
+          "path": "/tmp/chungus-bench-8gun5sqq/chungus-model-6jbhwktq",
+          "raw_bytes": 2202465492,
+          "new_raw_bytes": 2202465492,
+          "new_stored_bytes": 1610719470
+        }
+      ],
+      "by_dtype": {
+        "bf16": {
+          "raw_bytes": 2200096768,
+          "zstd_bytes": 1717312821,
+          "encoded_bytes": 1609949667
+        },
+        "raw": {
+          "raw_bytes": 2368724,
+          "zstd_bytes": 769692,
+          "encoded_bytes": 769803
+        }
+      },
+      "xet": {
+        "raw_bytes": 2202465492,
+        "git_bytes": 1845905,
+        "transfer_bytes": 1902132054
+      }
+    }
+  ],
+  "dedup": [
+    {
+      "first": "HuggingFaceTB/SmolLM2-135M",
+      "second": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "raw_bytes": 272496399,
+      "new_raw_bytes": 269094254,
+      "fetch_bytes": 197833205,
+      "fetch_bytes_alone": 199072162,
+      "xet_fetch_bytes": 271538056,
+      "xet_fetch_bytes_alone": 271538056
+    },
+    {
+      "first": "Qwen/Qwen2.5-0.5B",
+      "second": "Qwen/Qwen2.5-0.5B-Instruct",
+      "raw_bytes": 999586347,
+      "new_raw_bytes": 988073742,
+      "fetch_bytes": 723904408,
+      "fetch_bytes_alone": 728024843,
+      "xet_fetch_bytes": 865435192,
+      "xet_fetch_bytes_alone": 865435192
+    },
+    {
+      "first": "Qwen/Qwen3-0.6B",
+      "second": "Qwen/Qwen3-0.6B-FP8",
+      "raw_bytes": 1078857831,
+      "new_raw_bytes": 440515831,
+      "fetch_bytes": 367490280,
+      "fetch_bytes_alone": 598355169,
+      "xet_fetch_bytes": 459523905,
+      "xet_fetch_bytes_alone": 732674083
+    }
+  ],
+  "downloads": [
+    {
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "runs": {
+        "huggingface_hub, Xet": {
+          "secs": 14.197177194997494,
+          "bytes": 272554937
+        },
+        "huggingface_hub, no Xet": {
+          "secs": 14.958755740000925,
+          "bytes": 272501781
+        },
+        "chungus hub, cold": {
+          "secs": 15.878300529999251,
+          "bytes": 269064938
+        },
+        "chungus hub, warm": {
+          "secs": 0.6568350350062246,
+          "bytes": 269064938
+        }
+      },
+      "store_bytes": 269071166
+    },
+    {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "runs": {
+        "huggingface_hub, Xet": {
+          "secs": 48.56293086899677,
+          "bytes": 999686750
+        },
+        "huggingface_hub, no Xet": {
+          "secs": 49.34359476300597,
+          "bytes": 999587829
+        },
+        "chungus hub, cold": {
+          "secs": 55.91197751299478,
+          "bytes": 988099223
+        },
+        "chungus hub, warm": {
+          "secs": 48.68959440800245,
+          "bytes": 988099223
+        }
+      },
+      "store_bytes": 988106432
+    }
+  ],
+  "skipped": []
+}
