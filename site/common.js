@@ -8,6 +8,30 @@
     location.replace("https://" + location.host + location.pathname + location.search + location.hash);
   }
 
+  // The theme follows the system unless the reader picked one with the toggle. This
+  // script runs in <head>, so the choice applies before the page paints.
+  const root = document.documentElement;
+  const dark = window.matchMedia("(prefers-color-scheme: dark)");
+  try {
+    const saved = localStorage.getItem("theme");
+    if (saved === "light" || saved === "dark") root.dataset.theme = saved;
+  } catch {}
+  const isDark = () => (root.dataset.theme || (dark.matches ? "dark" : "light")) === "dark";
+  document.addEventListener("DOMContentLoaded", () => {
+    const button = document.querySelector(".theme-toggle");
+    if (!button) return;
+    const label = () => button.setAttribute("aria-label", `Switch to ${isDark() ? "light" : "dark"} theme`);
+    label();
+    dark.addEventListener("change", label);
+    button.addEventListener("click", () => {
+      root.dataset.theme = isDark() ? "light" : "dark";
+      try {
+        localStorage.setItem("theme", root.dataset.theme);
+      } catch {}
+      label();
+    });
+  });
+
   const config = window.CHUNGUS || {};
   let registry = (config.registry || "").replace(/\/+$/, "");
   // Only talk to a registry over HTTPS (plain HTTP is allowed for local testing).

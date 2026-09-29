@@ -14,21 +14,21 @@ esac
 curl -L https://github.com/buwunny/chungus/releases/download/$v/chungus-$v-$t.tar.gz | tar xz
 sudo mv chungus-$v-$t/chungus /usr/local/bin/ && chungus --version`;
 
-const step = (n, title, note, cmd) =>
+const step = (title, note, cmd) =>
   el("li", { class: "step" },
-    el("h3", { text: `${n}. ${title}` }),
+    el("h3", { text: title }),
     note ? el("p", { class: "muted", text: note }) : null,
     command(cmd),
   );
 
 $("start").append(
   el("ol", { class: "steps" },
-    step(1, "Install", "Linux (x86_64, aarch64; glibc 2.39+) or macOS. Or build from source with cargo.", install),
-    step(2, "Find a model and download it",
+    step("Install", "Linux (x86_64, aarch64; glibc 2.39+) or macOS. Or build from source with cargo.", install),
+    step("Find a model and download it",
       "Every chunk is checked against its hash, and the publisher's signature is required. On Linux, chungus mount instead starts loading before the download finishes.",
       `export CHUNGUS_REGISTRY=${registryUrl}\nchungus search llama\nchungus fetch acme/tiny-llama --swarm -o tiny-llama/`),
-    step(3, "Share it back", "A node seeds everything in its store, even from behind NAT.", "chungus node"),
-    step(4, "Publish your own", "Weights as safetensors or GGUF. Pickle-based files are refused.",
+    step("Share it back", "A node seeds everything in its store, even from behind NAT.", "chungus node"),
+    step("Publish your own", "Weights as safetensors or GGUF. Pickle-based files are refused.",
       "chungus keygen\nchungus pack path/to/model          # prints: root <hash>\nchungus publish <hash> --name you/my-model --description \"What it is\"\nchungus node"),
   ),
   el("p", { class: "muted" },
