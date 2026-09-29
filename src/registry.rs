@@ -1196,7 +1196,10 @@ impl Client {
         let status = resp.status();
         let body = resp.bytes().await?;
         if !status.is_success() {
-            bail!("registry refused ({status}): {}", String::from_utf8_lossy(&body));
+            bail!(
+                "registry refused ({status}): {}",
+                String::from_utf8_lossy(&body)
+            );
         }
         Ok(serde_json::from_slice(&body)?)
     }
@@ -1243,7 +1246,10 @@ impl Client {
         let status = resp.status();
         let body = resp.bytes().await?;
         if !status.is_success() {
-            bail!("registry refused ({status}): {}", String::from_utf8_lossy(&body));
+            bail!(
+                "registry refused ({status}): {}",
+                String::from_utf8_lossy(&body)
+            );
         }
         Ok(serde_json::from_slice(&body)?)
     }
