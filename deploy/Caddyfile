@@ -9,7 +9,16 @@ http://{$CHUNGUS_DOMAIN} {
 https://{$CHUNGUS_DOMAIN} {
 	encode zstd gzip
 
-	# The registry API. Statements are small; refuse anything bigger.
+	# Publishing carries the whole manifest, which lists every chunk: about 1 MB per
+	# 10 GB of model. Match the registry's own cap (registry::MAX_MANIFEST, 256 MB).
+	handle /v1/publish {
+		request_body {
+			max_size 257MB
+		}
+		reverse_proxy registry:7450
+	}
+
+	# The rest of the registry API. Statements are small; refuse anything bigger.
 	handle /v1/* {
 		request_body {
 			max_size 64KB
