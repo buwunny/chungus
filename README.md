@@ -280,7 +280,7 @@ The operator key signs the log head, the blocklist and the anchor list, and ever
 
 ```sh
 # 1. Start the registry once; it creates online.key and prints it
-docker compose logs registry            # "online key chungus1... is not delegated" (or signing with the root key)
+docker compose logs registry            # "... delegate to online key chungus1..."
 
 # 2. Copy the root key to your own machine, and keep a backup of it somewhere offline
 docker compose cp registry:/data/registry/operator.key ./chungus-root.key
