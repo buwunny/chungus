@@ -255,13 +255,13 @@ chungus fetch acme/tiny-llama@v1 -o model/     # requires the publisher's signat
 chungus audit --operator chungus1<operator key>
 ```
 
-`publish` sends the manifest along with the signed statement. The registry checks that it hashes to the published root and lists no unsafe files, keeps it (`GET /v1/manifests/<root>` shows what a name contains), and only lists models whose manifest it checked in search and the index. Models published before this check need publishing again to be listed.
+`publish` sends the manifest along with the signed statement. The registry checks that it hashes to the published root and lists no unsafe files, keeps it (`GET /v1/manifests/<root>` shows what a name contains), and only lists models whose manifest it checked in search and the index. Models published before this check need publishing again to be listed. It also sends the header of each safetensors file, which the registry checks against the file's leading chunks (packing gives a header chunks of its own, and the signed root covers their hashes), so it can count parameters without trusting the publisher. `GET /v1/summary/<root>` returns a model's size, files, chunk counts and parameters per dtype. Publishing a model again adds the count to one published before this.
 
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
 ### A public registry and website
 
-`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its revisions and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
+`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
 
 To run a public registry on the same server as the public node, with the website on the same domain, HTTPS only (Caddy gets the certificate, redirects HTTP to HTTPS and sends HSTS):
 

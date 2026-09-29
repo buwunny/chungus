@@ -317,6 +317,27 @@ tbody tr:last-child td { border-bottom: 0; }
 th { font-weight: 800; }
 td code { overflow-wrap: anywhere; }
 #model > p { max-width: 640px; }
+th.num, td.num { text-align: right; }
+
+/* Model stats: a row of pastel stickers. */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin: 24px 0 8px; }
+.stats > div {
+  min-width: 0;
+  padding: 12px 14px;
+  color: var(--ink);
+  background: var(--butter);
+  border: 2.5px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 4px 4px 0 var(--drop);
+}
+.stats > div:nth-child(2) { background: var(--mint); }
+.stats > div:nth-child(3) { background: var(--lav); }
+.stats > div:nth-child(4) { background: var(--peach); }
+.stats > div:nth-child(5) { background: var(--pink); }
+.stats .label { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+.stats .value { font: 26px/1.15 var(--display); overflow-wrap: anywhere; }
+.stats .value.word { font-size: 20px; line-height: 1.5; overflow-wrap: normal; }
+.stats .note { font-size: 13px; opacity: .75; overflow-wrap: anywhere; }
 
 footer { overflow: hidden; }
 footer::before { content: ""; display: block; margin-bottom: 28px; border-top: 2.5px solid var(--line); }

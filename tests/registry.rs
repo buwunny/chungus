@@ -278,3 +278,172 @@ async fn followers_accept_a_delegated_online_key() {
         .unwrap();
     assert_eq!(client.anchors(Some(&operator)).await.unwrap().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_site_gets_a_summary_of_each_model() {
+    use chungus::manifest::{ChunkRef, FileEntry, Manifest};
+    use chungus::registry::{Summary, SummaryFile};
+    use chungus::segment::Dtype;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("reg");
+    let url = spawn(Arc::new(Registry::open(&dir).unwrap())).await;
+    let client = Client::new(&url).unwrap();
+    let alice = sign::generate_key(&tmp.path().join("alice")).unwrap();
+
+    let chunk = |s: &str, len| ChunkRef {
+        hash: blake3::hash(s.as_bytes()).to_hex().to_string(),
+        len,
+        dtype: Dtype::Raw,
+    };
+    let file = |path: &str, chunks: Vec<ChunkRef>| FileEntry {
+        path: path.into(),
+        size: chunks.iter().map(|c| u64::from(c.len)).sum(),
+        hash: blake3::hash(path.as_bytes()).to_hex().to_string(),
+        chunks,
+    };
+    // A repeated chunk counts once towards what a download transfers.
+    let m = Manifest::new(vec![
+        file("config.json", vec![chunk("config", 100)]),
+        file(
+            "model.safetensors",
+            vec![chunk("a", 1000), chunk("b", 1000), chunk("a", 1000)],
+        ),
+    ]);
+    let bytes = serde_json::to_vec(&m).unwrap();
+    client
+        .publish(&publish(&alice, "acme/model", &m.root, ""), &bytes)
+        .await
+        .unwrap();
+
+    let want = Summary {
+        size: 3100,
+        weights: 3000,
+        formats: vec!["safetensors".into()],
+        chunks: 4,
+        unique_chunks: 3,
+        unique_bytes: 2100,
+        // No headers were sent, so there's no count.
+        params: None,
+        dtypes: Default::default(),
+        files: vec![
+            SummaryFile {
+                path: "config.json".into(),
+                size: 100,
+            },
+            SummaryFile {
+                path: "model.safetensors".into(),
+                size: 3000,
+            },
+        ],
+    };
+    let get = |path: String| async move {
+        serde_json::from_slice::<serde_json::Value>(
+            &reqwest::get(path)
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let got: Summary =
+        serde_json::from_value(get(format!("{url}/v1/summary/{}", m.root)).await).unwrap();
+    assert_eq!(got, want);
+    let index = get(format!("{url}/v1/index")).await;
+    assert_eq!(index[0]["size"], 3100);
+    let missing = reqwest::get(format!("{url}/v1/summary/{}", "0".repeat(64)))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    // A restarted registry rebuilds the summaries from the manifests on disk.
+    let reopened = Registry::open(&dir).unwrap();
+    assert_eq!(*reopened.summary(&m.root).unwrap(), want);
+}
+
+/// Writes a safetensors file with tensors of the given dtype and shape, zero-filled.
+fn safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[u64])]) {
+    let mut header = serde_json::Map::new();
+    let mut at = 0u64;
+    for (name, dtype, shape) in tensors {
+        let width = if *dtype == "F32" { 4 } else { 2 };
+        let len = shape.iter().product::<u64>() * width;
+        header.insert(
+            name.to_string(),
+            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [at, at + len]}),
+        );
+        at += len;
+    }
+    let json = serde_json::to_vec(&header).unwrap();
+    let mut file = (json.len() as u64).to_le_bytes().to_vec();
+    file.extend(json);
+    file.resize(file.len() + at as usize, 0);
+    std::fs::write(path, file).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parameters_are_counted_from_checked_headers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("reg");
+    let reg = Arc::new(Registry::open(&dir).unwrap());
+    let url = spawn(reg.clone()).await;
+    let client = Client::new(&url).unwrap();
+    let alice = sign::generate_key(&tmp.path().join("alice")).unwrap();
+
+    // Two shards, so the count covers both.
+    let model = tmp.path().join("model");
+    std::fs::create_dir(&model).unwrap();
+    safetensors(
+        &model.join("model-1.safetensors"),
+        &[("embed", "BF16", &[1000, 64]), ("norm", "F32", &[64])],
+    );
+    safetensors(
+        &model.join("model-2.safetensors"),
+        &[("head", "BF16", &[64, 1000])],
+    );
+    std::fs::write(model.join("config.json"), "{}").unwrap();
+    let store = chungus::store::Store::open(&tmp.path().join("store")).unwrap();
+    let (m, _) = chungus::pack(&model, &store).unwrap();
+    let bytes = serde_json::to_vec(&m).unwrap();
+    let headers = chungus::safetensors_headers(&m, &store).unwrap();
+    assert_eq!(headers.len(), 2);
+
+    // A header that doesn't match the file's chunks is refused, with the publish.
+    let mut forged = headers.clone();
+    let h = forged.get_mut("model-2.safetensors").unwrap();
+    *h = h.replace("[64,1000]", "[64,9000]");
+    let err = client
+        .publish_with_headers(&publish(&alice, "acme/model", &m.root, ""), &bytes, forged)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("doesn't match its chunks"),
+        "{err}"
+    );
+
+    client
+        .publish_with_headers(&publish(&alice, "acme/model", &m.root, ""), &bytes, headers)
+        .await
+        .unwrap();
+    let s = reg.summary(&m.root).unwrap();
+    assert_eq!(s.params, Some(128_064));
+    assert_eq!(
+        s.dtypes,
+        std::collections::BTreeMap::from([("BF16".into(), 128_000), ("F32".into(), 64)])
+    );
+
+    // The headers are kept, so a restarted registry still has the count, and so does a
+    // republish that sends none.
+    client
+        .publish(&publish(&alice, "acme/model", &m.root, "again"), &bytes)
+        .await
+        .unwrap();
+    assert_eq!(reg.summary(&m.root).unwrap().params, Some(128_064));
+    drop(reg);
+    let reopened = Registry::open(&dir).unwrap();
+    assert_eq!(reopened.summary(&m.root).unwrap().params, Some(128_064));
+}

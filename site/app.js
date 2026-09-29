@@ -2,7 +2,7 @@
 // searches it in the browser, ranking results the same way `chungus search` does.
 "use strict";
 
-const { el, ago, short, command, logLine, loadIndex, registryUrl } = window.chungus;
+const { el, ago, bytes, short, command, logLine, loadIndex, getJSON, registryUrl } = window.chungus;
 const $ = (id) => document.getElementById(id);
 
 let models = []; // one per name: { name, revs: [hit...] } with revs newest first
@@ -53,7 +53,14 @@ function renderList(query) {
         latest.description ? el("div", { class: "desc", text: latest.description }) : null,
         el("div", {
           class: "meta",
-          text: `${m.revs.length} rev${m.revs.length === 1 ? "" : "s"} · updated ${ago(latest.time)} · by ${short(latest.publisher)}`,
+          text: [
+            latest.size != null ? bytes(latest.size) : null,
+            `${m.revs.length} rev${m.revs.length === 1 ? "" : "s"}`,
+            `updated ${ago(latest.time)}`,
+            `by ${short(latest.publisher)}`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
         }),
       ),
     );
@@ -83,6 +90,7 @@ function renderModel(name) {
       el("h1", { text: m.name }),
       latest.description ? el("p", { text: latest.description }) : null,
       el("p", { class: "meta", text: `Published by ${latest.publisher}` }),
+      el("div", { id: "summary" }),
       latest.gated
         ? el("p", {
             text: `Gated: accept the license at huggingface.co/${latest.gated}, then set HF_TOKEN to your Hugging Face token. Only your token's access is checked; it goes to this registry and Hugging Face, never to peers.`,
@@ -106,11 +114,83 @@ function renderModel(name) {
     ),
   );
   view.append(
+    el("div", { id: "files" }),
     el("h2", { text: "Revisions" }),
     el("div", { class: "table-wrap" },
       el("table", {},
         el("thead", {}, el("tr", {}, el("th", { text: "Rev" }), el("th", { text: "Manifest root" }), el("th", { text: "Published" }))),
         el("tbody", {}, ...rows),
+      ),
+    ),
+  );
+  renderSummary(m.name, latest.root);
+}
+
+// 3821079552 -> "3.8B", the way model cards write parameter counts.
+function count(x) {
+  for (const [div, unit] of [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]]) {
+    if (x >= div) {
+      const v = x / div;
+      return `${v < 100 ? +v.toFixed(1) : Math.round(v)}${unit}`;
+    }
+  }
+  return String(x);
+}
+
+// Stats and files of the latest rev, from the registry's summary of its manifest. The
+// index snapshot deployed with the site has no summaries, so this can come back empty.
+async function renderSummary(name, root) {
+  let s;
+  try {
+    s = await getJSON(`${registryUrl}/v1/summary/${root}`);
+  } catch {
+    return;
+  }
+  const box = document.getElementById("summary");
+  const filesBox = document.getElementById("files");
+  // The reader may have moved on to another model while this loaded.
+  if (!box || !filesBox || decodeURIComponent(location.hash.slice(2)) !== name) return;
+  const n = (x) => x.toLocaleString();
+  const saved = s.size - s.unique_bytes;
+  const shards = s.files.filter((f) => /\.(safetensors|gguf)$/i.test(f.path)).length;
+  const dtypes = Object.keys(s.dtypes || {});
+  const tiles = [
+    s.params != null ? ["Parameters", count(s.params), `${n(s.params)} exactly`] : null,
+    ["Size", bytes(s.size), `${bytes(s.weights)} of weights`],
+    [
+      "Format",
+      s.formats.join(", ") || "none",
+      [dtypes.join(", "), `${n(shards)} weight file${shards === 1 ? "" : "s"}`].filter(Boolean).join(" · "),
+    ],
+    ["Files", n(s.files.length), `${bytes(s.size - s.weights)} besides weights`],
+    ["Chunks", n(s.unique_chunks), saved > 0 ? `${bytes(saved)} repeated within the model` : "all distinct"],
+  ];
+  const files = [...s.files].sort((a, b) => b.size - a.size);
+  box.append(
+    el("div", { class: "stats" },
+      ...tiles.filter(Boolean).map(([label, value, note]) =>
+        el("div", {},
+          el("div", { class: "label", text: label }),
+          // Words like "safetensors" shrink rather than break mid-word in a narrow tile.
+          el("div", { class: /\d/.test(value) ? "value" : "value word", text: value }),
+          el("div", { class: "note", text: note }),
+        ),
+      ),
+    ),
+  );
+  filesBox.append(
+    el("h2", { text: "Files" }),
+    el("div", { class: "table-wrap" },
+      el("table", {},
+        el("thead", {}, el("tr", {}, el("th", { text: "File" }), el("th", { class: "num", text: "Size" }))),
+        el("tbody", {},
+          ...files.map((f) =>
+            el("tr", {},
+              el("td", {}, el("code", { text: f.path })),
+              el("td", { class: "num", text: bytes(f.size), title: `${n(f.size)} bytes` }),
+            ),
+          ),
+        ),
       ),
     ),
   );

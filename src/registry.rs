@@ -654,6 +654,9 @@ pub struct Hit {
     /// The Hugging Face repo whose gate the model is behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated: Option<String>,
+    /// Total size of the model's files in bytes, when the registry holds its manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 impl Hit {
@@ -676,8 +679,140 @@ impl Hit {
             publisher: e.statement.key().to_string(),
             time: e.statement.time,
             gated: log.gate(root).map(str::to_string),
+            size: None,
         }
     }
+}
+
+/// What a model's manifest says about it, for the site's model page.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Summary {
+    /// Total size of every file, in bytes.
+    pub size: u64,
+    /// Bytes in weight files (safetensors and GGUF).
+    pub weights: u64,
+    /// Weight formats present, e.g. `["safetensors"]`.
+    pub formats: Vec<String>,
+    /// Chunks across all files, and how many of them are distinct.
+    pub chunks: u64,
+    pub unique_chunks: u64,
+    /// Bytes of the distinct chunks: what a download with an empty store transfers
+    /// before compression.
+    pub unique_bytes: u64,
+    /// Parameters across the safetensors files, when the publisher sent every file's
+    /// header (see [`Registry::publish`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<u64>,
+    /// Those parameters by dtype, e.g. `{"BF16": 3821079552}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dtypes: BTreeMap<String, u64>,
+    pub files: Vec<SummaryFile>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SummaryFile {
+    pub path: String,
+    pub size: u64,
+}
+
+impl Summary {
+    /// Summarize `m`, counting parameters from `headers` (checked with [`check_headers`]).
+    pub fn of(m: &crate::manifest::Manifest, headers: &BTreeMap<String, String>) -> Summary {
+        let mut seen = HashSet::new();
+        let (mut chunks, mut unique_bytes, mut weights) = (0, 0, 0);
+        let mut formats = std::collections::BTreeSet::new();
+        for f in &m.files {
+            let ext = f.path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+            if let Some(ext @ ("safetensors" | "gguf")) = ext.as_deref() {
+                weights += f.size;
+                formats.insert(ext.to_string());
+            }
+            for c in &f.chunks {
+                chunks += 1;
+                if seen.insert(c.hash.as_str()) {
+                    unique_bytes += u64::from(c.len);
+                }
+            }
+        }
+        let mut dtypes = BTreeMap::new();
+        let mut counted = 0;
+        for f in m.files.iter().filter(|f| f.path.ends_with(".safetensors")) {
+            let Some(p) = headers
+                .get(&f.path)
+                .and_then(|h| crate::safetensors::params(h.as_bytes()).ok())
+            else {
+                continue;
+            };
+            counted += 1;
+            for (dtype, n) in p {
+                *dtypes.entry(dtype).or_default() += n;
+            }
+        }
+        // A count missing some shards would be wrong, so show none instead.
+        let shards = m
+            .files
+            .iter()
+            .filter(|f| f.path.ends_with(".safetensors"))
+            .count();
+        if counted < shards || shards == 0 {
+            dtypes.clear();
+        }
+        Summary {
+            params: (!dtypes.is_empty()).then(|| dtypes.values().sum()),
+            dtypes,
+            size: m.files.iter().map(|f| f.size).sum(),
+            weights,
+            formats: formats.into_iter().collect(),
+            chunks,
+            unique_chunks: seen.len() as u64,
+            unique_bytes,
+            files: m
+                .files
+                .iter()
+                .map(|f| SummaryFile {
+                    path: f.path.clone(),
+                    size: f.size,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Check that each of `headers` (safetensors header JSON by path) is exactly the start
+/// of that file in `m`: prefixed with its length, it must split into the file's leading
+/// chunks and hash to them. Packing puts a header in chunks of its own, so this holds for
+/// any file `pack` wrote, and the signed root vouches for the result.
+pub fn check_headers(
+    m: &crate::manifest::Manifest,
+    headers: &BTreeMap<String, String>,
+) -> Result<()> {
+    for (path, json) in headers {
+        let f = m
+            .files
+            .iter()
+            .find(|f| &f.path == path && path.ends_with(".safetensors"))
+            .with_context(|| format!("{path} isn't a safetensors file of this model"))?;
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(json.as_bytes());
+        let mut at = 0;
+        for c in &f.chunks {
+            if at == bytes.len() {
+                break;
+            }
+            let end = at + c.len as usize;
+            let ok = bytes
+                .get(at..end)
+                .is_some_and(|b| blake3::hash(b).to_hex().as_str() == c.hash);
+            if !ok {
+                bail!("the header sent for {path} doesn't match its chunks");
+            }
+            at = end;
+        }
+        if at != bytes.len() {
+            bail!("the header sent for {path} is longer than the file");
+        }
+    }
+    Ok(())
 }
 
 // ---------- server ----------
@@ -694,9 +829,11 @@ pub struct Registry {
     online: SigningKey,
     file: Mutex<fs::File>,
     manifests: PathBuf,
-    /// Roots whose manifest the registry holds and has checked (see [`crate::safety`]).
-    /// Only these are listed in search and the index.
-    checked: RwLock<HashSet<String>>,
+    /// `<root>.json` for each model whose publisher sent its safetensors headers.
+    headers: PathBuf,
+    /// Roots whose manifest the registry holds and has checked (see [`crate::safety`]),
+    /// with a summary of each. Only these are listed in search and the index.
+    checked: RwLock<HashMap<String, Arc<Summary>>>,
     /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
     hf: String,
     http: reqwest::Client,
@@ -780,13 +917,22 @@ impl Registry {
             .with_context(|| format!("open {}", path.display()))?;
         let manifests = dir.join("manifests");
         fs::create_dir_all(&manifests)?;
-        let mut checked = HashSet::new();
+        let headers = dir.join("headers");
+        fs::create_dir_all(&headers)?;
+        let mut checked = HashMap::new();
         for e in fs::read_dir(&manifests)? {
-            let name = e?.file_name().to_string_lossy().into_owned();
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
             if let Some(root) = name.strip_suffix(".json")
                 && store::is_hash(root)
             {
-                checked.insert(root.to_string());
+                let m = crate::manifest::parse(&fs::read(e.path())?)
+                    .with_context(|| format!("{}", e.path().display()))?;
+                let h = match fs::read(headers.join(&name)) {
+                    Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+                    Err(_) => BTreeMap::new(),
+                };
+                checked.insert(root.to_string(), Arc::new(Summary::of(&m, &h)));
             }
         }
         Ok(Registry {
@@ -796,6 +942,7 @@ impl Registry {
             online,
             file: Mutex::new(file),
             manifests,
+            headers,
             checked: RwLock::new(checked),
             hf: DEFAULT_HF.into(),
             http: reqwest::Client::builder()
@@ -917,7 +1064,14 @@ impl Registry {
     /// Publish a model: the statement must name `manifest`'s root, the manifest must
     /// verify, and it must list only files chungus carries (no pickles). The registry keeps
     /// the manifest, so anyone can see what a name contains before fetching it.
-    pub fn publish(&self, st: Statement, manifest: &[u8]) -> Result<Entry> {
+    /// Publish `st` with the manifest it names, and optionally the header JSON of each
+    /// safetensors file (by path), from which the model page counts parameters.
+    pub fn publish(
+        &self,
+        st: Statement,
+        manifest: &[u8],
+        headers: &BTreeMap<String, String>,
+    ) -> Result<Entry> {
         let Claim::Publish { root, .. } = &st.claim else {
             bail!("not a publish statement");
         };
@@ -926,14 +1080,27 @@ impl Registry {
             bail!("the manifest doesn't match the published root {root}");
         }
         crate::safety::check_manifest(&m)?;
+        check_headers(&m, headers)?;
         // Check the statement before writing anything, so strangers can't fill the disk.
         self.log.lock().unwrap().check(&st)?;
         let path = self.manifests.join(format!("{root}.json"));
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, manifest)?;
         fs::rename(&tmp, &path)?;
+        // Republishing a model without headers keeps the ones sent before.
+        if !headers.is_empty() {
+            let path = self.headers.join(format!("{root}.json"));
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, serde_json::to_vec(headers)?)?;
+            fs::rename(&tmp, &path)?;
+        }
         let entry = self.submit(st)?;
-        self.checked.write().unwrap().insert(m.root);
+        let headers = match fs::read(self.headers.join(format!("{}.json", m.root))) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => BTreeMap::new(),
+        };
+        let summary = Arc::new(Summary::of(&m, &headers));
+        self.checked.write().unwrap().insert(m.root, summary);
         Ok(entry)
     }
 
@@ -948,13 +1115,21 @@ impl Registry {
     /// Whether search and the index list `root`: only models whose manifest was checked
     /// when they were published.
     pub fn is_listed(&self, root: &str) -> bool {
-        self.checked.read().unwrap().contains(root)
+        self.checked.read().unwrap().contains_key(root)
+    }
+
+    /// The summary of a listed model's manifest.
+    pub fn summary(&self, root: &str) -> Option<Arc<Summary>> {
+        self.checked.read().unwrap().get(root).cloned()
     }
 
     fn listed(&self, hits: Vec<Hit>) -> Vec<Hit> {
         let checked = self.checked.read().unwrap();
         hits.into_iter()
-            .filter(|h| checked.contains(&h.root))
+            .filter_map(|mut h| {
+                h.size = Some(checked.get(&h.root)?.size);
+                Some(h)
+            })
             .collect()
     }
 
@@ -999,6 +1174,7 @@ pub fn router(reg: Arc<Registry>) -> Router {
             )),
         )
         .route("/v1/manifests/{root}", get(manifest))
+        .route("/v1/summary/{root}", get(summary))
         .route("/v1/head", get(head))
         .route("/v1/log", get(log_entries))
         .route("/v1/resolve/{org}/{model}/{rev}", get(resolve))
@@ -1042,13 +1218,20 @@ pub struct Publication {
     pub statement: Statement,
     /// The manifest's JSON, exactly as packed.
     pub manifest: String,
+    /// Header JSON of each safetensors file, by path. Optional; checked against the
+    /// manifest's chunks.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 async fn publish(
     State(reg): State<Arc<Registry>>,
     axum::Json(p): axum::Json<Publication>,
 ) -> Response {
-    match tokio::task::spawn_blocking(move || reg.publish(p.statement, p.manifest.as_bytes())).await
+    match tokio::task::spawn_blocking(move || {
+        reg.publish(p.statement, p.manifest.as_bytes(), &p.headers)
+    })
+    .await
     {
         Ok(Ok(entry)) => axum::Json(entry).into_response(),
         Ok(Err(e)) => err(StatusCode::FORBIDDEN, format!("{e:#}")),
@@ -1063,6 +1246,13 @@ async fn manifest(State(reg): State<Arc<Registry>>, Path(root): Path<String>) ->
             bytes,
         )
             .into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no manifest for {root}")),
+    }
+}
+
+async fn summary(State(reg): State<Arc<Registry>>, Path(root): Path<String>) -> Response {
+    match reg.summary(&root) {
+        Some(s) => axum::Json(&*s).into_response(),
         None => err(StatusCode::NOT_FOUND, format!("no manifest for {root}")),
     }
 }
@@ -1230,9 +1420,22 @@ impl Client {
 
     /// Publish a model with its manifest (see [`Registry::publish`]).
     pub async fn publish(&self, st: &Statement, manifest: &[u8]) -> Result<Entry> {
+        self.publish_with_headers(st, manifest, BTreeMap::new())
+            .await
+    }
+
+    /// [`Client::publish`], also sending safetensors headers (see
+    /// [`crate::safetensors_headers`]) so the registry can count parameters.
+    pub async fn publish_with_headers(
+        &self,
+        st: &Statement,
+        manifest: &[u8],
+        headers: BTreeMap<String, String>,
+    ) -> Result<Entry> {
         let body = Publication {
             statement: st.clone(),
             manifest: String::from_utf8(manifest.to_vec()).context("manifest isn't UTF-8")?,
+            headers,
         };
         let resp = self
             .http

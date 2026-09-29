@@ -1050,8 +1050,10 @@ async fn main() -> Result<()> {
                     gated: gated_by,
                 },
             );
+            let m = chungus::manifest::parse(&manifest)?;
+            let headers = chungus::safetensors_headers(&m, &store)?;
             let entry = registry::Client::new(&registry)?
-                .publish(&st, &manifest)
+                .publish_with_headers(&st, &manifest, headers)
                 .await?;
             println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
         }

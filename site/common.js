@@ -88,6 +88,17 @@
     return "just now";
   }
 
+  // 1536 -> "1.5 KB", in powers of 1024 like `chungus list`.
+  function bytes(n) {
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) {
+      n /= 1024;
+      i++;
+    }
+    return `${i && n < 10 ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
+  }
+
   function short(key) {
     return key.length > 20 ? key.slice(0, 16) + "…" + key.slice(-4) : key;
   }
@@ -117,8 +128,10 @@
   window.chungus = {
     registryUrl: registry || location.origin,
     loadIndex,
+    getJSON,
     el,
     ago,
+    bytes,
     short,
     command,
     logLine,

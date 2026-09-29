@@ -150,6 +150,36 @@ pub fn pack(input: &Path, store: &Store) -> Result<(Manifest, PackStats)> {
 }
 
 /// Rebuild every file in `manifest` under `out`, verifying each chunk and each file.
+/// The header JSON of every safetensors file in `manifest`, read from the leading chunks
+/// in `store`, keyed by path. The registry checks each against the manifest's chunk
+/// hashes and counts the model's parameters from them.
+pub fn safetensors_headers(
+    manifest: &Manifest,
+    store: &Store,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for f in manifest
+        .files
+        .iter()
+        .filter(|f| f.path.ends_with(".safetensors"))
+    {
+        let mut data = Vec::new();
+        let mut json = None;
+        for c in &f.chunks {
+            data.extend(store::decode(&store.get(&c.hash)?, c.len as usize)?);
+            if let Some(j) = safetensors::header_json(&data)? {
+                json = Some(j.to_vec());
+                break;
+            }
+        }
+        // A file too short or too odd to be safetensors has no header to send.
+        if let Some(json) = json.and_then(|j| String::from_utf8(j).ok()) {
+            out.insert(f.path.clone(), json);
+        }
+    }
+    Ok(out)
+}
+
 pub fn unpack(manifest: &Manifest, store: &Store, out: &Path) -> Result<()> {
     if !manifest.verify_root() {
         bail!("manifest root does not match its contents");

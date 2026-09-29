@@ -5,3 +5,4 @@ deploy/node.env
 deploy/.env
 bench/.cache/
 bench/__pycache__/
+models/

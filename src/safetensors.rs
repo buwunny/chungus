@@ -86,3 +86,67 @@ pub fn segments(data: &[u8]) -> Result<Option<Vec<Segment>>> {
     }
     Ok(Some(out))
 }
+
+/// The header of a safetensors file's leading bytes (`8`-byte length, then JSON): its
+/// JSON, once `data` holds all of it. `None` while more bytes are needed.
+pub fn header_json(data: &[u8]) -> Result<Option<&[u8]>> {
+    let Some(len) = data.get(..8) else {
+        return Ok(None);
+    };
+    let len = u64::from_le_bytes(len.try_into().unwrap());
+    if len > MAX_HEADER {
+        bail!("safetensors header of {len} bytes is too large");
+    }
+    Ok(data.get(8..8 + len as usize))
+}
+
+/// Largest header accepted, as in the safetensors reference implementation.
+pub const MAX_HEADER: u64 = 100 << 20;
+
+#[derive(Deserialize)]
+struct Shape {
+    dtype: String,
+    shape: Vec<u64>,
+}
+
+/// Parameters per dtype (`"BF16"`, ...) of the tensors a header lists.
+pub fn params(json: &[u8]) -> Result<BTreeMap<String, u64>> {
+    let raw: BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(json).context("safetensors header isn't JSON")?;
+    let mut out = BTreeMap::new();
+    for (name, value) in raw {
+        if name == "__metadata__" {
+            continue;
+        }
+        let t: Shape = serde_json::from_value(value).with_context(|| format!("tensor {name}"))?;
+        let n = t
+            .shape
+            .iter()
+            .try_fold(1u64, |a, &d| a.checked_mul(d))
+            .with_context(|| format!("tensor {name} is too large"))?;
+        *out.entry(t.dtype).or_default() += n;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_parameters_per_dtype() {
+        let json = br#"{"__metadata__":{"format":"pt"},
+            "a":{"dtype":"BF16","shape":[4,3],"data_offsets":[0,24]},
+            "b":{"dtype":"BF16","shape":[5],"data_offsets":[24,34]},
+            "c":{"dtype":"F32","shape":[],"data_offsets":[34,38]}}"#;
+        let p = params(json).unwrap();
+        assert_eq!(p, BTreeMap::from([("BF16".into(), 17), ("F32".into(), 1)]));
+
+        let mut file = (json.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(json);
+        assert_eq!(header_json(&file[..20]).unwrap(), None);
+        assert_eq!(header_json(&file).unwrap(), Some(&json[..]));
+        let huge = (MAX_HEADER + 1).to_le_bytes();
+        assert!(header_json(&huge).is_err());
+    }
+}
