@@ -310,7 +310,7 @@ pre {
 .cards .hit::after { content: "→"; position: absolute; right: 16px; bottom: 8px; font: 24px/1 var(--display); transition: transform .2s; }
 .cards .hit:hover::after { transform: translateX(6px); }
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--muted) transparent; }
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px; border-bottom: 2px dashed var(--line); white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }

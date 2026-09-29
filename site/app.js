@@ -77,23 +77,26 @@ function renderModel(name) {
   const ref = `${m.name}@${latest.rev}`;
   const setup = `export CHUNGUS_REGISTRY=${registryUrl}`;
   $("status").textContent = "";
+  // append() would turn a null (no description, not gated) into the text "null".
   view.append(
-    el("h1", { text: m.name }),
-    latest.description ? el("p", { text: latest.description }) : null,
-    el("p", { class: "meta", text: `Published by ${latest.publisher}` }),
-    latest.gated
-      ? el("p", {
-          text: `Gated: accept the license at huggingface.co/${latest.gated}, then set HF_TOKEN to your Hugging Face token. Only your token's access is checked; it goes to this registry and Hugging Face, never to peers.`,
-        })
-      : null,
-    el("h2", { text: "Download" }),
-    command(`${setup}${latest.gated ? "\nexport HF_TOKEN=hf_..." : ""}\nchungus fetch ${ref} --swarm -o ${m.name.split("/")[1]}/`),
-    el("p", { class: "muted", text: "Or mount it and start loading before the download finishes:" }),
-    command(`chungus mount ${ref} ${m.name.split("/")[1]}/ --swarm`),
-    el("p", {
-      class: "muted",
-      text: "chungus checks every chunk against its hash and refuses a model its publisher hasn't signed.",
-    }),
+    ...[
+      el("h1", { text: m.name }),
+      latest.description ? el("p", { text: latest.description }) : null,
+      el("p", { class: "meta", text: `Published by ${latest.publisher}` }),
+      latest.gated
+        ? el("p", {
+            text: `Gated: accept the license at huggingface.co/${latest.gated}, then set HF_TOKEN to your Hugging Face token. Only your token's access is checked; it goes to this registry and Hugging Face, never to peers.`,
+          })
+        : null,
+      el("h2", { text: "Download" }),
+      command(`${setup}${latest.gated ? "\nexport HF_TOKEN=hf_..." : ""}\nchungus fetch ${ref} --swarm -o ${m.name.split("/")[1]}/`),
+      el("p", { class: "muted", text: "Or mount it and start loading before the download finishes:" }),
+      command(`chungus mount ${ref} ${m.name.split("/")[1]}/ --swarm`),
+      el("p", {
+        class: "muted",
+        text: "chungus checks every chunk against its hash and refuses a model its publisher hasn't signed.",
+      }),
+    ].filter(Boolean),
   );
   const rows = m.revs.map((r) =>
     el("tr", {},
