@@ -1012,7 +1012,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ if reg.has_root_key() => println!(
-                    "signing with the root key; to keep it offline, see `chungus delegate --help`"
+                    "signing with the root key; to keep it offline, delegate to online key \
+                     {online} (see `chungus delegate --help`)"
                 ),
                 _ => println!(
                     "online key {online} is not delegated, so clients will reject this \
