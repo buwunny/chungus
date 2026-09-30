@@ -37,7 +37,8 @@ use crate::sign::{self, Signature};
 use crate::store;
 
 pub const DEFAULT_PORT: u16 = 7450;
-pub const DEFAULT_URL: &str = "http://localhost:7450";
+/// The project's public registry. `--registry` or `CHUNGUS_REGISTRY` points elsewhere.
+pub const DEFAULT_URL: &str = "https://chungus.io";
 const STATEMENT_DOMAIN: &[u8] = b"chungus/registry-statement/v1\0";
 const HEAD_DOMAIN: &[u8] = b"chungus/registry-head/v1\0";
 const TICKET_DOMAIN: &[u8] = b"chungus/access-ticket/v1\0";

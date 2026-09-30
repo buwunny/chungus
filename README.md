@@ -22,10 +22,9 @@ curl -L https://github.com/buwunny/chungus/releases/download/$v/chungus-$v-$t.ta
 sudo mv chungus-$v-$t/chungus /usr/local/bin/ && chungus --version
 ```
 
-**2. Find a model and download it** from the swarm. Every chunk is checked against its hash, and the publisher's signature is required:
+**2. Find a model and download it** from the swarm. Names come from the public registry at chungus.io (set `CHUNGUS_REGISTRY` to use another). Every chunk is checked against its hash, and the publisher's signature is required:
 
 ```sh
-export CHUNGUS_REGISTRY=https://<the registry's address>
 chungus search llama
 chungus fetch acme/tiny-llama --swarm -o tiny-llama/
 ```
