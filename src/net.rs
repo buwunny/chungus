@@ -34,10 +34,12 @@ const CONCURRENCY: usize = 32;
 // ---------- server ----------
 
 /// HTTP routes for serving a store: `GET /v1/manifests`, `GET /v1/manifests/{root}`,
-/// `GET /v1/signatures/{root}`, `GET /v1/chunks/{hash}` and `GET /v1/meta/{key}`.
+/// `GET /v1/signatures/{root}`, `GET /v1/chunks/{hash}`, `GET /v1/meta/{key}` and
+/// `GET /v1/ollama/{digest}` (the manifest root indexing an Ollama manifest, as text).
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/v1/manifests", get(list_manifests))
+        .route("/v1/ollama/{digest}", get(get_ollama))
         .route("/v1/manifests/{root}", get(get_manifest))
         .route("/v1/signatures/{root}", get(get_signatures))
         .route("/v1/chunks/{hash}", get(get_chunk))
@@ -93,6 +95,21 @@ async fn get_meta(State(store): State<Arc<Store>>, Path(key): Path<String>) -> R
     }
     match tokio::task::spawn_blocking(move || store.get_meta(&key)).await {
         Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn get_ollama(State(store): State<Arc<Store>>, Path(digest): Path<String>) -> Response {
+    let Ok(key) = crate::ollama::digest_key(&digest.replacen('-', ":", 1)) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let found = tokio::task::spawn_blocking(move || -> Option<String> {
+        let root = String::from_utf8(store.get_meta(&key).ok()?).ok()?;
+        store.get_manifest(root.trim()).ok().map(|m| m.root)
+    })
+    .await;
+    match found {
+        Ok(Some(root)) => ([(header::CONTENT_TYPE, "text/plain")], root).into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -198,6 +215,8 @@ pub struct FetchStats {
     pub already_local: usize,
     /// Compressed bytes received from each source that served at least one chunk.
     pub bytes_by_source: BTreeMap<String, u64>,
+    /// Chunks received from each of those sources.
+    pub chunks_by_source: BTreeMap<String, u64>,
     /// Chunks a source sent that failed verification.
     pub rejected: usize,
     pub secs: f64,
@@ -422,6 +441,7 @@ where
 
     for r in results {
         let (source, bytes, rejected) = r?;
+        *stats.chunks_by_source.entry(source.clone()).or_default() += 1;
         *stats.bytes_by_source.entry(source).or_default() += bytes;
         stats.rejected += rejected;
     }
@@ -522,6 +542,23 @@ pub async fn fetch_one(
         }
     }
     false
+}
+
+/// Chunk `hash`'s blob from `source`, unverified.
+pub(crate) async fn download_chunk(
+    client: &reqwest::Client,
+    source: &str,
+    hash: &str,
+) -> Option<Bytes> {
+    let resp = client
+        .get(format!("{source}/v1/chunks/{hash}"))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.bytes().await.ok()
 }
 
 async fn try_chunk(

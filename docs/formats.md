@@ -12,9 +12,12 @@ network. `chungus --version` lists the versions a binary speaks.
 | Block id | `chungus/block/v1` | domain prefix of the block hash | |
 | Swarm requests | `/chungus/1` | libp2p protocol id | |
 | DHT | `/chungus/kad/1` | libp2p protocol id | |
-| Peer HTTP API (`serve`, `hub`) | `/v1/...` | URL prefix | |
+| Peer HTTP API (`serve`, `hub`, `ollama`) | `/v1/...` | URL prefix | |
+| Linked files | `links/<root>.json` in the store | JSON record (path, target, size, mtime) | ignored by older readers, which just don't serve those chunks |
+| Ollama records | `meta/ollama/tags/<host>/<ns>/<model>/<tag>.json`, `meta/ollama/digests/sha256-<hex>` | JSON record / manifest root | |
 | Registry API | `/v1/...` | URL prefix | |
 | Registry statements and head | `chungus/registry-statement/v1`, `chungus/registry-head/v1` | signature domain prefix | |
+| Leaderboard messages | `chungus/node-registration/v1`, `chungus/receipt/v1`, `chungus/probe-report/v1`, `chungus/anchor-access/v1`, `chungus/hide-node/v1`, `chungus/daily-totals/v1` | signature domain prefix | |
 | Signatures | `chungus1<hex>` keys, ed25519 over the manifest root | key prefix | |
 
 ## Weight files

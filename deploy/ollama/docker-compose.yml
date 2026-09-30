@@ -1,0 +1,51 @@
+# Ollama with chungus in front of it. Clients use http://localhost:11434 as usual; pulls
+# are filled from other chungus machines on the LAN first. From this directory:
+#   docker compose up -d
+#   docker compose exec ollama ollama pull llama3.2
+#
+# Both services use the host network: mDNS (how LAN peers find each other) doesn't cross
+# Docker's bridge network, and Docker Desktop on macOS and Windows doesn't support host
+# networking, so this is for Linux hosts. Open port 7447/tcp to the LAN for peers.
+services:
+  ollama:
+    image: ollama/ollama:latest
+    network_mode: host
+    environment:
+      # Ollama moves aside; chungus takes its default port.
+      OLLAMA_HOST: 127.0.0.1:11433
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+    # For NVIDIA GPUs (needs the NVIDIA container toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  chungus:
+    build: ../..
+    image: ${CHUNGUS_IMAGE:-ghcr.io/buwunny/chungus:latest}
+    network_mode: host
+    entrypoint:
+      - chungus
+      - ollama
+      - --models=/root/.ollama/models
+      - --store=/data/store
+    # Ollama's files are root's in its container; chungus writes blobs next to them, so
+    # it runs as the same uid (with no capabilities).
+    user: "0:0"
+    volumes:
+      - ollama:/root/.ollama
+      - chungus-data:/data
+    depends_on: [ollama]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  ollama:
+  chungus-data:

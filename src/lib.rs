@@ -10,11 +10,13 @@ pub mod downloads;
 pub mod gguf;
 pub mod hub;
 pub mod lazy;
+pub mod leaderboard;
 pub mod limits;
 pub mod manifest;
 #[cfg(target_os = "linux")]
 pub mod mount;
 pub mod net;
+pub mod ollama;
 pub mod p2p;
 pub mod progress;
 pub mod registry;

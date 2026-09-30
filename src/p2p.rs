@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::leaderboard::Receipt;
 use crate::limits::{Limits, RateLimiter, SubnetCaps};
 use crate::manifest::{BLOCK_BYTES, Manifest};
 use crate::net::{self, FetchStats};
@@ -67,6 +68,9 @@ pub enum Request {
     /// Present an access ticket, so later chunk requests for its repo are served. Added
     /// after the first release; older nodes don't gate anything and fail the request.
     Access(AccessTicket),
+    /// Hand the node a downloader's receipt for what it served, to submit to the
+    /// registry (see [`crate::leaderboard`]). Older nodes fail the request.
+    Receipt(Receipt),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -81,6 +85,8 @@ pub enum Response {
     Gated(String),
     /// Whether an access ticket was accepted.
     Granted(bool),
+    /// Whether a receipt was taken.
+    Receipt(bool),
 }
 
 #[derive(NetworkBehaviour)]
@@ -122,6 +128,8 @@ pub struct Config {
     pub relay: crate::limits::RelayLimits,
     /// Print connections, bootstrap progress and relay reservations as they happen.
     pub log: bool,
+    /// Where to send receipts downloaders hand this node. Without it they are refused.
+    pub receipts: Option<mpsc::UnboundedSender<Receipt>>,
     /// Serve counters as Prometheus text at `http://<addr>/metrics`.
     pub metrics: Option<SocketAddr>,
 }
@@ -222,6 +230,7 @@ enum Command {
     Request(PeerId, Request, oneshot::Sender<Result<Response>>),
     Announce,
     Addresses(oneshot::Sender<Vec<Multiaddr>>),
+    Find(PeerId, oneshot::Sender<()>),
 }
 
 /// A running node. Cheap to clone; the swarm runs in a background task until every
@@ -232,6 +241,7 @@ pub struct Node {
     pub peer_id: PeerId,
     block_bytes: u64,
     anchors: Vec<PeerId>,
+    key: Keypair,
     pub metrics: Arc<Metrics>,
 }
 
@@ -311,6 +321,7 @@ impl Node {
     /// any added later.
     pub async fn start(store: Arc<Store>, key: Keypair, mut cfg: Config) -> Result<Node> {
         let peer_id = key.public().to_peer_id();
+        let signing_key = key.clone();
         without_self(&mut cfg.bootstrap, peer_id);
         without_self(&mut cfg.relays, peer_id);
         without_self(&mut cfg.anchors, peer_id);
@@ -482,6 +493,8 @@ impl Node {
             mismatched: HashSet::new(),
             joined: false,
             granted: HashMap::new(),
+            closest: HashMap::new(),
+            receipts: cfg.receipts.clone(),
             metrics: metrics.clone(),
         };
         tokio::spawn(runner.run());
@@ -490,6 +503,7 @@ impl Node {
             peer_id,
             block_bytes,
             anchors,
+            key: signing_key,
             metrics,
         })
     }
@@ -521,6 +535,20 @@ impl Node {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Request(peer, req, tx))?;
         rx.await?
+    }
+
+    /// This node's identity, which signs its receipts.
+    pub fn key(&self) -> &Keypair {
+        &self.key
+    }
+
+    /// Look `peer` up in the DHT unless we already know how to reach it, so a request
+    /// to it can find an address.
+    pub async fn find(&self, peer: PeerId) {
+        let (tx, rx) = oneshot::channel();
+        if self.send(Command::Find(peer, tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// Announce what the store holds now instead of at the next rescan.
@@ -580,6 +608,9 @@ struct Runner {
     joined: bool,
     /// Gated repos each peer has shown a valid ticket for, and when each ticket expires.
     granted: HashMap<PeerId, HashMap<String, u64>>,
+    /// DHT lookups of a peer's address, from [`Node::find`].
+    closest: HashMap<kad::QueryId, oneshot::Sender<()>>,
+    receipts: Option<mpsc::UnboundedSender<Receipt>>,
     metrics: Arc<Metrics>,
 }
 
@@ -740,6 +771,14 @@ impl Runner {
                 self.requests.insert(id, tx);
             }
             Command::Announce => self.announce(),
+            Command::Find(peer, tx) => {
+                if self.swarm.is_connected(&peer) || self.addrs.contains_key(&peer) {
+                    let _ = tx.send(());
+                } else {
+                    let id = self.swarm.behaviour_mut().kad.get_closest_peers(peer);
+                    self.closest.insert(id, tx);
+                }
+            }
             Command::Addresses(tx) => {
                 let me = *self.swarm.local_peer_id();
                 let mut addrs: Vec<Multiaddr> = self
@@ -1022,6 +1061,18 @@ impl Runner {
                 kad::Event::OutboundQueryProgressed {
                     id, result, step, ..
                 } => {
+                    if let kad::QueryResult::GetClosestPeers(Ok(ok)) = &result {
+                        for p in &ok.peers {
+                            for a in &p.addrs {
+                                self.learn(p.peer_id, a.clone());
+                            }
+                        }
+                    }
+                    if step.last
+                        && let Some(tx) = self.closest.remove(&id)
+                    {
+                        let _ = tx.send(());
+                    }
                     if let kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
                         providers,
                         ..
@@ -1066,6 +1117,16 @@ impl Runner {
                                     .insert(ticket.repo.clone(), ticket.expires);
                             }
                             let _ = resp_tx.send((peer, channel, Response::Granted(ok)));
+                            return;
+                        }
+                        if let Request::Receipt(r) = request {
+                            // Only the downloader itself may hand over its receipt, and
+                            // only for what this node served.
+                            let ok = r.fetcher == peer.to_string()
+                                && r.server == self.swarm.local_peer_id().to_string()
+                                && r.verify()
+                                && self.receipts.as_ref().is_some_and(|tx| tx.send(r).is_ok());
+                            let _ = resp_tx.send((peer, channel, Response::Receipt(ok)));
                             return;
                         }
                         let now = registry::now();
@@ -1149,6 +1210,7 @@ fn answer(store: &Store, req: Request, granted: &HashSet<String>) -> Response {
             )
         }
         Request::Access(_) => Response::Granted(false),
+        Request::Receipt(_) => Response::Receipt(false),
     }
 }
 
@@ -1306,6 +1368,7 @@ pub async fn prepare(
         tickets: Default::default(),
         presented: Default::default(),
         gated_by: Default::default(),
+        served: Default::default(),
     };
     Ok((manifest, sources))
 }
@@ -1336,6 +1399,8 @@ pub struct ModelSources {
     presented: std::sync::Mutex<HashSet<(PeerId, String)>>,
     /// Why gated chunks couldn't be had, for the error message.
     gated_by: std::sync::Mutex<Option<String>>,
+    /// Bytes and chunks each peer has sent that checked out, for receipts.
+    served: std::sync::Mutex<HashMap<PeerId, (u64, u64)>>,
 }
 
 impl ModelSources {
@@ -1357,6 +1422,17 @@ impl ModelSources {
             }
         }
         order
+    }
+
+    /// Bytes and chunks each peer has sent so far that checked out.
+    pub fn served(&self) -> Vec<(PeerId, u64, u64)> {
+        let served = self.served.lock().unwrap();
+        served.iter().map(|(p, (b, c))| (*p, *b, *c)).collect()
+    }
+
+    /// Hand each peer a receipt for what it has sent so far (see [`send_receipts`]).
+    pub async fn send_receipts(&self) -> usize {
+        send_receipts(&self.node, &self.root, &self.served()).await
     }
 
     /// Turn a failed download into a clearer error when gates were in the way.
@@ -1495,16 +1571,55 @@ impl crate::lazy::ChunkSource for ModelSources {
         Box::pin(async move {
             for peer in self.sources(hash) {
                 if let Some(blob) = self.get(peer, hash.to_string()).await
-                    && net::verify_and_store(store, hash, len, blob)
-                        .await
-                        .is_some()
+                    && let Some(bytes) = net::verify_and_store(store, hash, len, blob).await
                 {
+                    let mut served = self.served.lock().unwrap();
+                    let s = served.entry(peer).or_default();
+                    s.0 += bytes;
+                    s.1 += 1;
                     return true;
                 }
             }
             false
         })
     }
+}
+
+/// Sign a receipt for each of `served` (peer, bytes, chunks) with this node's key and
+/// hand it to that peer, which submits it to the registry. Best effort: returns how many
+/// peers took theirs. Receipts are cumulative, so sending again later replaces them.
+pub async fn send_receipts(node: &Node, root: &str, served: &[(PeerId, u64, u64)]) -> usize {
+    let sends = served
+        .iter()
+        .filter(|(_, bytes, _)| *bytes > 0)
+        .map(|&(peer, bytes, chunks)| {
+            let r = Receipt::new(&node.key, root, &peer, bytes, chunks);
+            async move {
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    node.request(peer, Request::Receipt(r)),
+                )
+                .await;
+                matches!(resp, Ok(Ok(Response::Receipt(true))))
+            }
+        });
+    futures::future::join_all(sends)
+        .await
+        .into_iter()
+        .filter(|ok| *ok)
+        .count()
+}
+
+/// What each peer sent in a finished fetch, from its stats, for [`send_receipts`].
+pub fn served_by(stats: &FetchStats) -> Vec<(PeerId, u64, u64)> {
+    stats
+        .bytes_by_source
+        .iter()
+        .filter_map(|(source, bytes)| {
+            let chunks = stats.chunks_by_source.get(source).copied().unwrap_or(0);
+            Some((source.parse().ok()?, *bytes, chunks))
+        })
+        .collect()
 }
 
 #[cfg(test)]
