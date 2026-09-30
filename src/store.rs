@@ -4,8 +4,10 @@
 //! chunk's *raw* bytes. Addressing by raw content means the codec can change without
 //! breaking any hash, and a reader verifies exactly the bytes it will use.
 //!
-//! Blob layout: `[version=1][codec][param][payload...]`, where `param` is the element
-//! width for `PlaneZstd` and the float kind for `ExponentZstd`.
+//! Blob layout: `[version][codec][param][payload...]`, where `param` is the element
+//! width for `PlaneZstd` and `PlaneFrames` and the float kind for `ExponentZstd` and
+//! `ExponentFrames`. Version 1 blobs use codecs 0 to 3; version 2 adds the per-plane
+//! frame codecs, 4 and 5.
 //!
 //! A store can also hold *linked* files: files kept elsewhere on disk (an Ollama blob,
 //! say) that are byte for byte one of a manifest's files. Their chunks are read from the
@@ -29,8 +31,15 @@ use crate::segment::Dtype;
 use crate::sign::{self, Signature};
 use crate::transform::{self, FloatKind};
 
-/// Version byte at the start of every chunk blob.
+/// Version byte at the start of every chunk blob this release writes.
 pub const BLOB_VERSION: u8 = 1;
+/// Newest blob version this release reads. Version 2 (per-plane zstd frames) is read
+/// but not yet written, since peers send each other blobs: a release that reads it has
+/// to be out before one that writes it (see docs/formats.md).
+pub const BLOB_VERSION_READ: u8 = 2;
+/// Whether [`encode`] may write version 2 blobs. Turned on in the release after the one
+/// that first reads them.
+const WRITE_PLANE_FRAMES: bool = false;
 /// Version of the on-disk layout, kept in `<store>/VERSION`. Stores made before the file
 /// existed are version 1.
 pub const STORE_VERSION: u32 = 1;
@@ -47,6 +56,14 @@ pub enum Codec {
     PlaneZstd = 2,
     /// Payload is zstd(split_exponent(chunk, kind)).
     ExponentZstd = 3,
+    /// Blob v2. Byte planes as for `PlaneZstd`, but each plane is its own zstd frame, so
+    /// a skewed plane (the exponents) doesn't share an entropy table with a near-random
+    /// one (the low mantissa bits). Payload: for each of the `width` planes, a u32 LE
+    /// frame length and then the frame. The last plane also carries any trailing bytes.
+    PlaneFrames = 4,
+    /// Blob v2. `split_exponent(chunk, kind)`, one zstd frame per plane as for
+    /// `PlaneFrames`.
+    ExponentFrames = 5,
 }
 
 impl Codec {
@@ -56,6 +73,8 @@ impl Codec {
             1 => Codec::Zstd,
             2 => Codec::PlaneZstd,
             3 => Codec::ExponentZstd,
+            4 => Codec::PlaneFrames,
+            5 => Codec::ExponentFrames,
             _ => bail!("unknown codec {b}"),
         })
     }
@@ -64,6 +83,12 @@ impl Codec {
 /// Encode a chunk. Float chunks also try the byte-plane and exponent-split transforms;
 /// whichever encoding is smallest wins, falling back to storing the bytes as-is.
 pub fn encode(raw: &[u8], dtype: Dtype) -> Result<Vec<u8>> {
+    encode_with(raw, dtype, WRITE_PLANE_FRAMES)
+}
+
+/// [`encode`], also trying the version 2 per-plane frame codecs when `plane_frames` is
+/// set. The blob is version 2 only when one of those wins.
+pub fn encode_with(raw: &[u8], dtype: Dtype, plane_frames: bool) -> Result<Vec<u8>> {
     let width = dtype.width();
     let mut best = (Codec::Stored, 0u8, raw.to_vec());
     let plain = zstd::bulk::compress(raw, ZSTD_LEVEL)?;
@@ -81,10 +106,91 @@ pub fn encode(raw: &[u8], dtype: Dtype) -> Result<Vec<u8>> {
             best = (Codec::PlaneZstd, width as u8, planes);
         }
     }
+    if plane_frames && width > 1 && raw.len() >= width {
+        let (codec, param, planes) = match dtype.float_kind() {
+            Some(kind) => (
+                Codec::ExponentFrames,
+                kind as u8,
+                transform::split_exponent(raw, kind),
+            ),
+            None => (
+                Codec::PlaneFrames,
+                width as u8,
+                transform::split(raw, width),
+            ),
+        };
+        let framed = compress_planes(&planes, width)?;
+        if framed.len() < best.2.len() {
+            best = (codec, param, framed);
+        }
+    }
+    let version = match best.0 {
+        Codec::PlaneFrames | Codec::ExponentFrames => 2,
+        _ => BLOB_VERSION,
+    };
     let mut blob = Vec::with_capacity(3 + best.2.len());
-    blob.extend_from_slice(&[BLOB_VERSION, best.0 as u8, best.1]);
+    blob.extend_from_slice(&[version, best.0 as u8, best.1]);
     blob.extend_from_slice(&best.2);
     Ok(blob)
+}
+
+/// Where plane `k` of `width` lies in a split chunk of `len` bytes: every plane holds
+/// `len / width` bytes, and the last also holds the `len % width` trailing bytes.
+fn plane_range(len: usize, width: usize, k: usize) -> std::ops::Range<usize> {
+    let n = len / width;
+    let end = if k + 1 == width { len } else { (k + 1) * n };
+    k * n..end
+}
+
+/// One zstd frame per plane, each after its u32 LE length.
+fn compress_planes(planes: &[u8], width: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for k in 0..width {
+        let frame = zstd::bulk::compress(&planes[plane_range(planes.len(), width, k)], ZSTD_LEVEL)?;
+        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
+}
+
+/// Inverse of [`compress_planes`] for a chunk of `len` raw bytes. Each frame must
+/// decompress to exactly its plane's size, and the frames must fill the payload.
+fn decompress_planes(mut payload: &[u8], len: usize, width: usize) -> Result<Vec<u8>> {
+    if width < 2 || len < width {
+        bail!("bad plane frames");
+    }
+    let mut out = Vec::with_capacity(len);
+    for k in 0..width {
+        let want = plane_range(len, width, k).len();
+        let Some((head, rest)) = payload.split_first_chunk::<4>() else {
+            bail!("truncated plane frames");
+        };
+        let n = u32::from_le_bytes(*head) as usize;
+        if n > rest.len() {
+            bail!("truncated plane frames");
+        }
+        let plane = zstd::bulk::decompress(&rest[..n], want)?;
+        if plane.len() != want {
+            bail!(
+                "plane {k} decoded to {} bytes, expected {want}",
+                plane.len()
+            );
+        }
+        out.extend_from_slice(&plane);
+        payload = &rest[n..];
+    }
+    if !payload.is_empty() {
+        bail!("{} bytes after the last plane frame", payload.len());
+    }
+    Ok(out)
+}
+
+fn float_kind(param: u8) -> Result<FloatKind> {
+    Ok(match param {
+        0 => FloatKind::Bf16,
+        1 => FloatKind::F32,
+        _ => bail!("unknown float kind {param}"),
+    })
 }
 
 /// Decode a blob back to the raw chunk. `len` is the expected raw length.
@@ -99,8 +205,9 @@ pub fn decode(blob: &[u8], len: usize) -> Result<Vec<u8>> {
     if blob.len() < 3 {
         bail!("bad blob header");
     }
-    if blob[0] != BLOB_VERSION {
-        if blob[0] > BLOB_VERSION {
+    let version = blob[0];
+    if version == 0 || version > BLOB_VERSION_READ {
+        if version > BLOB_VERSION_READ {
             bail!(
                 "chunk encoded by a newer chungus (blob v{}); upgrade chungus",
                 blob[0]
@@ -109,17 +216,24 @@ pub fn decode(blob: &[u8], len: usize) -> Result<Vec<u8>> {
         bail!("bad blob header");
     }
     let (codec, param, payload) = (Codec::from_u8(blob[1])?, blob[2], &blob[3..]);
+    let framed = matches!(codec, Codec::PlaneFrames | Codec::ExponentFrames);
+    if framed && version < 2 {
+        bail!("codec {} needs blob v2", codec as u8);
+    }
     let raw = match codec {
         Codec::Stored => payload.to_vec(),
         Codec::Zstd => zstd::bulk::decompress(payload, len)?,
         Codec::PlaneZstd => transform::join(&zstd::bulk::decompress(payload, len)?, param as usize),
         Codec::ExponentZstd => {
-            let kind = match param {
-                0 => FloatKind::Bf16,
-                1 => FloatKind::F32,
-                _ => bail!("unknown float kind {param}"),
-            };
-            transform::join_exponent(&zstd::bulk::decompress(payload, len)?, kind)
+            transform::join_exponent(&zstd::bulk::decompress(payload, len)?, float_kind(param)?)
+        }
+        Codec::PlaneFrames => {
+            let width = param as usize;
+            transform::join(&decompress_planes(payload, len, width)?, width)
+        }
+        Codec::ExponentFrames => {
+            let kind = float_kind(param)?;
+            transform::join_exponent(&decompress_planes(payload, len, kind.width())?, kind)
         }
     };
     if raw.len() != len {
@@ -908,7 +1022,76 @@ mod tests {
     fn newer_blob_is_named() {
         let mut blob = encode(b"hello", Dtype::Raw).unwrap();
         assert_eq!(decode(&blob, 5).unwrap(), b"hello");
-        blob[0] = BLOB_VERSION + 1;
+        blob[0] = BLOB_VERSION_READ + 1;
         assert!(decode(&blob, 5).unwrap_err().to_string().contains("newer"));
+    }
+
+    /// Floats with a skewed exponent and random mantissas, like trained weights.
+    fn weights(dtype: Dtype, n: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // Uniform in [-0.025, 0.025) with a full random mantissa.
+            let v = (f32::from_bits(0x3f80_0000 | (x >> 41) as u32) - 1.5) * 0.05;
+            match dtype {
+                Dtype::F32 => out.extend_from_slice(&v.to_le_bytes()),
+                Dtype::Bf16 => out.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes()),
+                // F16 and friends: plain 2-byte planes; the exact bit layout doesn't matter.
+                _ => out.extend_from_slice(
+                    &((v.to_bits() >> 13) as u16 ^ (x as u16 & 0x3ff)).to_le_bytes(),
+                ),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn plane_frames_round_trip_and_are_v2() {
+        for dtype in [Dtype::F32, Dtype::Bf16, Dtype::F16] {
+            for n in [1, 3, 1000, 16_385] {
+                let mut raw = weights(dtype, n);
+                // A trailing partial element goes into the last plane.
+                raw.push(7);
+                let blob = encode_with(&raw, dtype, true).unwrap();
+                assert_eq!(decode(&blob, raw.len()).unwrap(), raw, "{dtype:?} {n}");
+                // Today's writer never produces v2.
+                assert_eq!(encode(&raw, dtype).unwrap()[0], 1);
+            }
+            let raw = weights(dtype, 16_384);
+            let blob = encode_with(&raw, dtype, true).unwrap();
+            assert_eq!(blob[0], 2, "{dtype:?}");
+            assert!(matches!(blob[1], 4 | 5));
+            assert!(blob.len() < encode(&raw, dtype).unwrap().len());
+        }
+    }
+
+    #[test]
+    fn bad_plane_frames_are_refused() {
+        let raw = weights(Dtype::F32, 4096);
+        let blob = encode_with(&raw, Dtype::F32, true).unwrap();
+        assert_eq!(blob[1], Codec::ExponentFrames as u8);
+        // A frame codec in a v1 blob.
+        let mut v1 = blob.clone();
+        v1[0] = 1;
+        assert!(decode(&v1, raw.len()).is_err());
+        // Truncated, padded, or claiming the wrong length.
+        assert!(decode(&blob[..blob.len() - 1], raw.len()).is_err());
+        let mut padded = blob.clone();
+        padded.push(0);
+        assert!(decode(&padded, raw.len()).is_err());
+        assert!(decode(&blob, raw.len() - 4).is_err());
+        assert!(decode(&blob, raw.len() + 4).is_err());
+        // A frame length past the end.
+        let mut long = blob.clone();
+        long[3..7].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&long, raw.len()).is_err());
+        // Width 0 or 1 in a PlaneFrames blob.
+        for w in [0u8, 1] {
+            let bad = [2, Codec::PlaneFrames as u8, w, 0, 0, 0, 0];
+            assert!(decode(&bad, 4).is_err());
+        }
     }
 }

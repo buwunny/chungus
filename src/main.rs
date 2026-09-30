@@ -24,7 +24,7 @@ use chungus::store::{self, Store};
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nmanifest: chungus/manifest/v2 (also reads v1)",
-    "\nstore: v1, chunk blobs: v1",
+    "\nstore: v1, chunk blobs: v1 (also reads v2)",
     "\nwire: /chungus/1, /chungus/kad/1, HTTP /v1",
 );
 

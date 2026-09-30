@@ -8,7 +8,7 @@ network. `chungus --version` lists the versions a binary speaks.
 |---|---|---|---|
 | Manifest | `chungus/manifest/v2` | `format` field of every manifest | `chungus/manifest/v1` |
 | Store layout | 1 | `<store>/VERSION` | stores made before the file existed (treated as 1) |
-| Chunk blob | 1 | first byte of every blob in `chunks/` | |
+| Chunk blob | 1 | first byte of every blob in `chunks/` | 2 (one zstd frame per byte plane; read now, written from the next release) |
 | Block id | `chungus/block/v1` | domain prefix of the block hash | |
 | Swarm requests | `/chungus/1` | libp2p protocol id (`Ollama` digest lookups answer with a manifest root; older nodes reject them and are skipped) | |
 | DHT | `/chungus/kad/1` | libp2p protocol id (provider keys: manifest roots, blocks, `ollama/sha256:<hex>` manifest digests) | |
