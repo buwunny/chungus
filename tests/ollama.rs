@@ -452,3 +452,212 @@ async fn shim_fills_blobs_then_lets_ollama_finish() {
     c.has(&reg.latest, "latest");
     assert_eq!(fake.pulls.load(Ordering::SeqCst), 1);
 }
+
+// ---------- phase 5: registry routes, the swarm, published models ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_routes_serve_and_pull_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = Registry::new();
+    let up = spawn(Router::new().fallback(registry).with_state(reg.clone())).await;
+    let a = Machine::new(tmp.path(), "a", Some(&up), &[]);
+    a.pull("tiny").await.unwrap();
+    let served = spawn(chungus::ollama::registry_router(a.ollama.clone())).await;
+    let client = reqwest::Client::new();
+
+    // What `ollama pull --insecure host/library/tiny` asks for.
+    let resp = client
+        .get(format!("{served}/v2/library/tiny/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()["docker-content-digest"],
+        digest(&reg.latest.manifest).as_str()
+    );
+    assert_eq!(resp.bytes().await.unwrap(), reg.latest.manifest);
+    let weights = &reg.latest.blobs[1];
+    let url = format!("{served}/v2/library/tiny/blobs/{}", digest(weights));
+    let head = client.head(&url).send().await.unwrap();
+    assert_eq!(
+        head.headers()[header::CONTENT_LENGTH],
+        weights.len().to_string().as_str()
+    );
+    let part = client
+        .get(&url)
+        .header(header::RANGE, "bytes=1000000-2999999")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.bytes().await.unwrap(), weights[1_000_000..3_000_000]);
+
+    // A tag this machine lacks is pulled first, then served.
+    reg.served.store(0, Ordering::SeqCst);
+    let resp = client
+        .get(format!("{served}/v2/library/tiny/manifests/v2"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap(), reg.v2.manifest);
+    a.has(&reg.v2, "v2");
+    let missing = client
+        .get(format!("{served}/v2/library/nope/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pulls_over_the_swarm() {
+    use chungus::p2p::{Config, Node};
+    use libp2p::identity::Keypair;
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = Registry::new();
+    let up = spawn(Router::new().fallback(registry).with_state(reg.clone())).await;
+    let a = Machine::new(tmp.path(), "a", Some(&up), &[]);
+    a.pull("tiny").await.unwrap();
+
+    let start = |store: Arc<Store>, cfg: Config| async move {
+        let node = Node::start(store, Keypair::generate_ed25519(), cfg)
+            .await
+            .unwrap();
+        let addrs = node
+            .addresses(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        (node, addrs)
+    };
+    let tcp: Vec<libp2p::Multiaddr> = vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()];
+    let (_boot, boot) = start(
+        Arc::new(Store::open(&tmp.path().join("boot")).unwrap()),
+        Config {
+            listen: tcp.clone(),
+            public: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let join = Config {
+        listen: tcp,
+        public: true,
+        bootstrap: boot,
+        ..Default::default()
+    };
+    // A seeds its Ollama model on the swarm; B has no LAN peers at all.
+    let (seed, _) = start(a.store.clone(), join.clone()).await;
+    seed.announce().unwrap();
+    let b = Machine::new(tmp.path(), "b", Some(&up), &[]);
+    let (fetcher, _) = start(b.store.clone(), join).await;
+    let d = digest(&reg.latest.manifest);
+    for _ in 0..50 {
+        if !fetcher.ollama_providers(&d).await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    b.ollama.set_swarm(fetcher);
+
+    reg.served.store(0, Ordering::SeqCst);
+    let f = b.pull("tiny").await.unwrap();
+    b.has(&reg.latest, "latest");
+    assert_eq!(reg.served.load(Ordering::SeqCst), 0);
+    assert!(f.stats.peer_bytes > 2_500_000, "{:?}", f.stats);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn published_models_pull_by_registry_name() {
+    use chungus::registry::{Claim, Client, Statement};
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = Registry::new();
+    let up = spawn(Router::new().fallback(registry).with_state(reg.clone())).await;
+    let chungus_reg =
+        Arc::new(chungus::registry::Registry::open(&tmp.path().join("registry")).unwrap());
+    let reg_url = spawn(chungus::registry::router(chungus_reg)).await;
+
+    // A made a model of its own (`ollama create mine`), and has ollama.com's tiny.
+    let a = Machine::new(tmp.path(), "a", Some(&up), &[]);
+    a.pull("tiny").await.unwrap();
+    let mine = model(random(1_500_000, 9));
+    let models = a.dir.join("models");
+    for b in &mine.blobs {
+        std::fs::write(models.join("blobs").join(digest(b).replace(':', "-")), b).unwrap();
+    }
+    let tag = models.join("manifests/registry.ollama.ai/library/mine/latest");
+    std::fs::create_dir_all(tag.parent().unwrap()).unwrap();
+    std::fs::write(&tag, &mine.manifest).unwrap();
+
+    // ollama.com's models can't be published; your own can.
+    let e = a
+        .ollama
+        .publishable(&Name::parse("tiny").unwrap())
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("ollama.com's own model"), "{e}");
+    let root = a
+        .ollama
+        .publishable(&Name::parse("mine").unwrap())
+        .await
+        .unwrap();
+    let key = chungus::sign::generate_key(&tmp.path().join("key")).unwrap();
+    a.store
+        .add_signatures(&root, &[chungus::sign::sign(&key, &root)])
+        .unwrap();
+    let st = Statement::new(
+        &key,
+        Claim::Publish {
+            name: "acme/mine".into(),
+            rev: "latest".into(),
+            root: root.clone(),
+            description: String::new(),
+            gated: None,
+        },
+    );
+    Client::new(&reg_url)
+        .unwrap()
+        .publish(&st, &a.store.get_manifest_bytes(&root).unwrap())
+        .await
+        .unwrap();
+
+    // B pulls it by its registry name from A; the registry.ollama.ai fake is never asked.
+    let a_url = a.serve().await;
+    let b = Machine::new(tmp.path(), "b", Some(&up), std::slice::from_ref(&a_url));
+    b.ollama.set_registry(&reg_url);
+    reg.served.store(0, Ordering::SeqCst);
+    let f = b.pull("chungus.io/acme/mine:latest").await.unwrap();
+    assert!(!f.online);
+    assert_eq!(reg.served.load(Ordering::SeqCst), 0);
+    let bm = b.dir.join("models");
+    assert_eq!(
+        std::fs::read(bm.join("manifests/chungus.io/acme/mine/latest")).unwrap(),
+        mine.manifest
+    );
+    for blob in &mine.blobs {
+        let p = bm.join("blobs").join(digest(blob).replace(':', "-"));
+        assert_eq!(&std::fs::read(p).unwrap(), blob);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn import_reindexes_models_indexed_the_old_way() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = Registry::new();
+    let up = spawn(Router::new().fallback(registry).with_state(reg.clone())).await;
+    let a = Machine::new(tmp.path(), "a", Some(&up), &[]);
+    a.pull("tiny").await.unwrap();
+    let key = "ollama/tags/registry.ollama.ai/library/tiny/latest.json";
+    let mut rec: serde_json::Value =
+        serde_json::from_slice(&a.store.get_meta(key).unwrap()).unwrap();
+    assert_eq!(rec["index"], chungus::ollama::INDEX_VERSION);
+    rec["index"] = 1.into();
+    a.store
+        .put_meta(key, &serde_json::to_vec(&rec).unwrap())
+        .unwrap();
+    let name = Name::parse("tiny").unwrap();
+    a.ollama.import(&[name]).await.unwrap();
+    let rec: serde_json::Value = serde_json::from_slice(&a.store.get_meta(key).unwrap()).unwrap();
+    assert_eq!(rec["index"], chungus::ollama::INDEX_VERSION);
+}

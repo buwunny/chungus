@@ -100,14 +100,12 @@ async fn get_meta(State(store): State<Arc<Store>>, Path(key): Path<String>) -> R
 }
 
 async fn get_ollama(State(store): State<Arc<Store>>, Path(digest): Path<String>) -> Response {
-    let Ok(key) = crate::ollama::digest_key(&digest.replacen('-', ":", 1)) else {
+    let digest = digest.replacen('-', ":", 1);
+    if crate::ollama::digest_key(&digest).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
-    };
-    let found = tokio::task::spawn_blocking(move || -> Option<String> {
-        let root = String::from_utf8(store.get_meta(&key).ok()?).ok()?;
-        store.get_manifest(root.trim()).ok().map(|m| m.root)
-    })
-    .await;
+    }
+    let found =
+        tokio::task::spawn_blocking(move || crate::ollama::root_for_digest(&store, &digest)).await;
     match found {
         Ok(Some(root)) => ([(header::CONTENT_TYPE, "text/plain")], root).into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
