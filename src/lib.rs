@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod mount;
 pub mod net;
 pub mod p2p;
+pub mod progress;
 pub mod registry;
 pub mod safetensors;
 pub mod safety;

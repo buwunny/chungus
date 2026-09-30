@@ -108,6 +108,8 @@ One machine packs a model and serves its store. It advertises itself over mDNS, 
 
 `fetch` downloads only the chunks it doesn't already have, so a second model that shares chunks with the first transfers less, and an interrupted fetch picks up where it stopped. Every chunk is checked against its BLAKE3 hash on arrival. A peer that sends bad data is skipped and the chunk is taken from the next peer. With several peers, chunks are spread across them. `--peer http://host:7447` adds a peer by hand (for networks that block multicast), and `--origin URL` names a server to use only when no peer has a chunk. `chungus list` shows the models in a store.
 
+While a download runs in a terminal, a bunny hops along a progress bar, jumping cacti like the Chrome dinosaur game, with the percentage, speed and time left beside it (`mount --prefetch` shows it too). It draws on stderr only when that is a terminal; `CHUNGUS_NO_PROGRESS=1` turns it off.
+
 `serve` exposes the store read-only over plain HTTP to anyone who can reach the port. Run it only on networks you trust; encrypted, authenticated transport comes with the internet milestone.
 
 ## Drop-in Hugging Face cache
