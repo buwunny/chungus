@@ -6,6 +6,12 @@
 //!
 //! Blob layout: `[version=1][codec][param][payload...]`, where `param` is the element
 //! width for `PlaneZstd` and the float kind for `ExponentZstd`.
+//!
+//! A store can also hold *linked* files: files kept elsewhere on disk (an Ollama blob,
+//! say) that are byte for byte one of a manifest's files. Their chunks are read from the
+//! file itself instead of being copied into `chunks/`, checked by size, mtime and BLAKE3
+//! on every read, and handed out as `Stored` blobs. A link whose file changed or vanished
+//! is dropped.
 
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +19,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::manifest::Manifest;
 use crate::segment::Dtype;
@@ -130,7 +140,73 @@ pub struct Store {
     /// Manifest roots and chunk hashes this store refuses to hold or hand out.
     blocked: RwLock<HashSet<String>>,
     gates: RwLock<Gates>,
+    links: RwLock<Links>,
+    opened: Instant,
 }
+
+/// One manifest file that lives outside the store, in `target`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Link {
+    /// The file's path in the manifest.
+    pub path: String,
+    /// Where the file is on disk.
+    pub target: PathBuf,
+    pub size: u64,
+    /// Modification time when linked, in nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+}
+
+impl Link {
+    /// A link to `target` as it is on disk now.
+    pub fn new(path: &str, target: &Path) -> Result<Self> {
+        let md = fs::metadata(target).with_context(|| format!("stat {}", target.display()))?;
+        Ok(Link {
+            path: path.to_string(),
+            target: target.to_path_buf(),
+            size: md.len(),
+            mtime_ns: mtime_ns(&md),
+        })
+    }
+
+    /// Whether the file on disk still looks like the one that was linked.
+    pub fn is_current(&self) -> bool {
+        fs::metadata(&self.target)
+            .is_ok_and(|md| md.is_file() && md.len() == self.size && mtime_ns(&md) == self.mtime_ns)
+    }
+}
+
+fn mtime_ns(md: &fs::Metadata) -> u64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// `links/<root>.json`: the files of manifest `root` that are linked rather than stored.
+#[derive(Serialize, Deserialize, Default)]
+struct LinkRecord {
+    files: Vec<Link>,
+}
+
+/// Where each linked chunk can be read, built from the link records when the store opens.
+#[derive(Default)]
+struct Links {
+    targets: Vec<Target>,
+    /// Chunk hash -> (index into `targets`, offset, length). One location per chunk.
+    chunks: HashMap<[u8; 32], (usize, u64, u32)>,
+}
+
+struct Target {
+    root: String,
+    link: Link,
+    /// When the file was last seen unchanged, in ms since the store opened (0 = never), so
+    /// `contains` doesn't stat a file for every chunk it's asked about.
+    checked_ms: AtomicU64,
+}
+
+/// How long a linked file that looked unchanged is trusted by `contains` before it is
+/// checked again. Reads always check.
+const LINK_RECHECK_MS: u64 = 10_000;
 
 /// Models behind a Hugging Face repo's gate, from a registry this store follows.
 #[derive(Default)]
@@ -149,25 +225,35 @@ impl Store {
             .with_context(|| format!("create store {}", root.display()))?;
         fs::create_dir_all(root.join("manifests"))?;
         check_version(root)?;
-        Ok(Store {
+        let store = Store {
             root: root.to_path_buf(),
             blocked: Default::default(),
             gates: Default::default(),
-        })
+            links: Default::default(),
+            opened: Instant::now(),
+        };
+        store.reload_links()?;
+        Ok(store)
     }
 
     /// Replace the blocklist, and delete any blocked chunks and manifests already on disk.
     /// Returns how many were deleted.
     pub fn set_blocked(&self, hashes: HashSet<String>) -> usize {
         let mut removed = 0;
+        let mut unlinked = false;
         for h in hashes.iter().filter(|h| is_hash(h)) {
             for path in [self.path(h), self.manifest_path(h)] {
                 if fs::remove_file(path).is_ok() {
                     removed += 1;
                 }
             }
+            // A linked file isn't the store's to delete; forget it instead.
+            unlinked |= fs::remove_file(self.link_path(h)).is_ok();
         }
         *self.blocked.write().unwrap() = hashes;
+        if unlinked {
+            let _ = self.reload_links();
+        }
         removed
     }
 
@@ -231,7 +317,9 @@ impl Store {
     }
 
     pub fn contains(&self, hash: &str) -> bool {
-        is_hash(hash) && !self.is_blocked(hash) && self.path(hash).exists()
+        is_hash(hash)
+            && !self.is_blocked(hash)
+            && (self.path(hash).exists() || self.has_linked(hash))
     }
 
     /// Write a blob unless it's already present. Returns true if it was new.
@@ -265,7 +353,14 @@ impl Store {
             bail!("invalid chunk hash {hash:?}");
         }
         self.check_allowed(hash)?;
-        fs::read(self.path(hash)).with_context(|| format!("missing chunk {hash}"))
+        match fs::read(self.path(hash)) {
+            Ok(blob) => Ok(blob),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match self.read_linked(hash) {
+                Some(r) => r,
+                None => Err(e).with_context(|| format!("missing chunk {hash}")),
+            },
+            Err(e) => Err(e).with_context(|| format!("read chunk {hash}")),
+        }
     }
 
     fn manifest_path(&self, root: &str) -> PathBuf {
@@ -384,6 +479,228 @@ pub fn is_meta_key(key: &str) -> bool {
 }
 
 impl Store {
+    fn link_path(&self, root: &str) -> PathBuf {
+        self.root.join("links").join(format!("{root}.json"))
+    }
+
+    /// Record that the files `links` name hold manifest `root`'s files of the same path,
+    /// replacing earlier links for those paths. The manifest must already be in the store,
+    /// and each file must have the size the manifest gives it. Nothing is read or copied:
+    /// the caller has already checked the contents (by packing them, say).
+    pub fn add_links(&self, root: &str, links: Vec<Link>) -> Result<()> {
+        let m = self.get_manifest(root)?;
+        for l in &links {
+            let Some(f) = m.files.iter().find(|f| f.path == l.path) else {
+                bail!("manifest {root} has no file {}", l.path);
+            };
+            if f.size != l.size {
+                bail!("{} is {} bytes, not {}", l.target.display(), l.size, f.size);
+            }
+        }
+        let mut record = self.link_record(root);
+        record
+            .files
+            .retain(|old| !links.iter().any(|l| l.path == old.path));
+        record.files.extend(links);
+        write_atomic(&self.link_path(root), &serde_json::to_vec_pretty(&record)?)?;
+        self.reload_links()
+    }
+
+    /// The linked files of manifest `root`.
+    pub fn links(&self, root: &str) -> Vec<Link> {
+        self.link_record(root).files
+    }
+
+    fn link_record(&self, root: &str) -> LinkRecord {
+        if !is_hash(root) {
+            return LinkRecord::default();
+        }
+        fs::read(self.link_path(root))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Drop every link whose file is gone or changed, and every link record whose manifest
+    /// is gone. Returns how many files were unlinked.
+    pub fn gc_links(&self) -> Result<usize> {
+        let dir = self.root.join("links");
+        let mut dropped = 0;
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Ok(0);
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let Some(root) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".json"))
+                .filter(|r| is_hash(r))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let record = self.link_record(&root);
+            let before = record.files.len();
+            if !self.manifest_path(&root).exists() {
+                fs::remove_file(&path)?;
+                dropped += before;
+                continue;
+            }
+            let files: Vec<Link> = record.files.into_iter().filter(Link::is_current).collect();
+            if files.len() < before {
+                dropped += before - files.len();
+                if files.is_empty() {
+                    fs::remove_file(&path)?;
+                } else {
+                    write_atomic(&path, &serde_json::to_vec_pretty(&LinkRecord { files })?)?;
+                }
+            }
+        }
+        self.reload_links()?;
+        Ok(dropped)
+    }
+
+    /// Rebuild the in-memory chunk locations from the link records on disk.
+    fn reload_links(&self) -> Result<()> {
+        let mut links = Links::default();
+        if let Ok(entries) = fs::read_dir(self.root.join("links")) {
+            for entry in entries {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                let Some(root) = name.strip_suffix(".json").filter(|r| is_hash(r)) else {
+                    continue;
+                };
+                if self.is_blocked(root) {
+                    continue;
+                }
+                let Ok(m) = self.get_manifest(root) else {
+                    continue;
+                };
+                for link in self.link_record(root).files {
+                    let Some(f) = m.files.iter().find(|f| f.path == link.path) else {
+                        continue;
+                    };
+                    if f.size != link.size {
+                        continue;
+                    }
+                    let t = links.targets.len();
+                    let mut offset = 0u64;
+                    for c in &f.chunks {
+                        if let Some(key) = hash_bytes(&c.hash) {
+                            links.chunks.entry(key).or_insert((t, offset, c.len));
+                        }
+                        offset += c.len as u64;
+                    }
+                    links.targets.push(Target {
+                        root: root.to_string(),
+                        link,
+                        checked_ms: AtomicU64::new(0),
+                    });
+                }
+            }
+        }
+        *self.links.write().unwrap() = links;
+        Ok(())
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.opened.elapsed().as_millis() as u64 + 1
+    }
+
+    fn has_linked(&self, hash: &str) -> bool {
+        let Some(key) = hash_bytes(hash) else {
+            return false;
+        };
+        let target = {
+            let links = self.links.read().unwrap();
+            let Some(&(t, _, _)) = links.chunks.get(&key) else {
+                return false;
+            };
+            let target = &links.targets[t];
+            let checked = target.checked_ms.load(Ordering::Relaxed);
+            if checked != 0 && self.now_ms() - checked < LINK_RECHECK_MS {
+                return true;
+            }
+            if target.link.is_current() {
+                target.checked_ms.store(self.now_ms(), Ordering::Relaxed);
+                return true;
+            }
+            (target.root.clone(), target.link.path.clone())
+        };
+        self.drop_link(&target.0, &target.1);
+        // Another linked file may hold the same chunk.
+        let links = self.links.read().unwrap();
+        links.chunks.contains_key(&key)
+    }
+
+    /// A linked chunk as a `Stored` blob, or None if no linked file holds it.
+    fn read_linked(&self, hash: &str) -> Option<Result<Vec<u8>>> {
+        let key = hash_bytes(hash)?;
+        // A file that fails its checks is unlinked, and the next file holding the chunk
+        // (if any) is tried.
+        for _ in 0..8 {
+            let (root, link, offset, len) = {
+                let links = self.links.read().unwrap();
+                let &(t, offset, len) = links.chunks.get(&key)?;
+                let target = &links.targets[t];
+                (target.root.clone(), target.link.clone(), offset, len)
+            };
+            match read_at(&link, offset, len as usize) {
+                Ok(raw) if blake3::hash(&raw).as_bytes() == &key => {
+                    let mut blob = Vec::with_capacity(3 + raw.len());
+                    blob.extend_from_slice(&[BLOB_VERSION, Codec::Stored as u8, 0]);
+                    blob.extend_from_slice(&raw);
+                    return Some(Ok(blob));
+                }
+                _ => self.drop_link(&root, &link.path),
+            }
+        }
+        Some(Err(anyhow::anyhow!(
+            "no linked copy of chunk {hash} is intact"
+        )))
+    }
+
+    /// Forget that manifest `root`'s file `path` is linked.
+    fn drop_link(&self, root: &str, path: &str) {
+        let mut record = self.link_record(root);
+        record.files.retain(|l| l.path != path);
+        let file = self.link_path(root);
+        let _ = if record.files.is_empty() {
+            fs::remove_file(&file).map_err(anyhow::Error::from)
+        } else {
+            serde_json::to_vec_pretty(&record)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| write_atomic(&file, &b))
+        };
+        let _ = self.reload_links();
+    }
+}
+
+fn hash_bytes(hash: &str) -> Option<[u8; 32]> {
+    if !is_hash(hash) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hash[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `len` bytes at `offset` of a linked file, if the file still looks as it was linked.
+fn read_at(link: &Link, offset: u64, len: usize) -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let file = fs::File::open(&link.target)?;
+    let md = file.metadata()?;
+    if md.len() != link.size || mtime_ns(&md) != link.mtime_ns {
+        bail!("{} changed since it was linked", link.target.display());
+    }
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, offset)?;
+    Ok(buf)
+}
+
+impl Store {
     fn meta_path(&self, key: &str) -> Result<PathBuf> {
         if !is_meta_key(key) {
             bail!("invalid metadata key {key:?}");
@@ -469,6 +786,76 @@ mod tests {
         fs::write(dir.path().join("VERSION"), "99\n").unwrap();
         let e = Store::open(dir.path()).err().unwrap().to_string();
         assert!(e.contains("newer chungus"), "{e}");
+    }
+
+    #[test]
+    fn linked_files_serve_chunks_until_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store")).unwrap();
+        let mut state = 7u64;
+        let data: Vec<u8> = (0..400_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 56) as u8
+            })
+            .collect();
+        let file = dir.path().join("blob");
+        fs::write(&file, &data).unwrap();
+        let spans = crate::chunk::chunk(&data, &crate::file_segments(&file, &data).unwrap());
+        let chunks: Vec<_> = spans
+            .iter()
+            .map(|s| crate::manifest::ChunkRef {
+                hash: blake3::hash(&data[s.start..s.end]).to_hex().to_string(),
+                len: (s.end - s.start) as u32,
+                dtype: Dtype::Raw,
+            })
+            .collect();
+        let m = Manifest::new(vec![crate::manifest::FileEntry {
+            path: "blob".into(),
+            size: data.len() as u64,
+            hash: blake3::hash(&data).to_hex().to_string(),
+            chunks: chunks.clone(),
+        }]);
+        store.put_manifest(&m).unwrap();
+        assert!(!store.contains(&chunks[1].hash));
+        store
+            .add_links(&m.root, vec![Link::new("blob", &file).unwrap()])
+            .unwrap();
+        // Nothing was copied, and every chunk reads back from the linked file.
+        assert_eq!(
+            fs::read_dir(dir.path().join("store/chunks"))
+                .unwrap()
+                .count(),
+            0
+        );
+        for c in &chunks {
+            assert!(store.contains(&c.hash));
+            let raw = decode(&store.get(&c.hash).unwrap(), c.len as usize).unwrap();
+            assert_eq!(blake3::hash(&raw).to_hex().as_str(), c.hash);
+        }
+        // Survives reopening.
+        let store = Store::open(&dir.path().join("store")).unwrap();
+        assert!(store.get(&chunks[0].hash).is_ok());
+        assert_eq!(store.links(&m.root).len(), 1);
+
+        // Edited in place (same size): the read fails its check and the link is dropped.
+        let mut edited = data.clone();
+        edited[10] ^= 1;
+        fs::write(&file, &edited).unwrap();
+        assert!(store.get(&chunks[0].hash).is_err());
+        assert!(!store.contains(&chunks[1].hash));
+        assert!(store.links(&m.root).is_empty());
+
+        // Deleted: gc sweeps the link.
+        fs::write(&file, &data).unwrap();
+        store
+            .add_links(&m.root, vec![Link::new("blob", &file).unwrap()])
+            .unwrap();
+        fs::remove_file(&file).unwrap();
+        assert_eq!(store.gc_links().unwrap(), 1);
+        assert!(!store.contains(&chunks[0].hash));
     }
 
     #[test]

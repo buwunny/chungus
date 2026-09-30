@@ -13,6 +13,7 @@ pub mod manifest;
 #[cfg(target_os = "linux")]
 pub mod mount;
 pub mod net;
+pub mod ollama;
 pub mod p2p;
 pub mod registry;
 pub mod safetensors;
