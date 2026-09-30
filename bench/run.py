@@ -153,6 +153,18 @@ def du(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file() and not p.is_symlink())
 
 
+def wait_packed(store: Path, timeout: float = 600) -> None:
+    """A hub packs a download into its store after the client has every byte, working in
+    <store>/tmp. Wait for that to finish, so the store's size and a warm run that follows
+    see the packed model instead of a half-packed copy."""
+    deadline = time.monotonic() + timeout
+    while any(p.is_file() for p in (store / "tmp").rglob("*")):
+        if time.monotonic() > deadline:
+            log(f"the hub was still packing into {store} after {timeout:.0f}s")
+            return
+        time.sleep(0.1)
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -423,6 +435,7 @@ class Runner:
                     try:
                         log(f"download {m.label} through a cold chungus hub")
                         row["runs"]["chungus hub, cold"] = self.timed_download(m, url)
+                        wait_packed(store)
                         row["store_bytes"] = du(store)
                         log(f"download {m.label} through the same hub, warm")
                         row["runs"]["chungus hub, warm"] = self.timed_download(m, url)
