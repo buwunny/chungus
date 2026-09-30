@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chungus::limits::Limits;
@@ -83,7 +84,18 @@ async fn fetch_through_the_dht() {
         bootstrap: boot_addrs,
         ..Default::default()
     };
-    let (seed, _) = node(&seed_store, join.clone()).await;
+    let metrics_addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let (seed, _) = node(
+        &seed_store,
+        Config {
+            metrics: Some(metrics_addr),
+            ..join.clone()
+        },
+    )
+    .await;
     seed.announce().unwrap();
     let local = store(&tmp.path().join("local"));
     let (fetcher, _) = node(&local, join).await;
@@ -101,6 +113,26 @@ async fn fetch_through_the_dht() {
     assert_eq!(stats.already_local, 0);
     assert_eq!(stats.bytes_by_source.len(), 1);
     assert_eq!(local.signatures(&m.root).unwrap().len(), 1);
+
+    // The seed counted what it served, and says so on its metrics endpoint.
+    let served = seed.metrics.bytes_served.load(Ordering::Relaxed);
+    assert!(
+        served >= stats.bytes_by_source.values().sum::<u64>(),
+        "{served}"
+    );
+    assert!(seed.metrics.requests.load(Ordering::Relaxed) > 0);
+    let text = reqwest::get(format!("http://{metrics_addr}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains(&format!("chungus_bytes_served_total {served}")),
+        "{text}"
+    );
+    assert!(text.contains("# TYPE chungus_peers gauge"), "{text}");
+
     let out = tmp.path().join("out");
     chungus::unpack(&got, &local, &out).unwrap();
     for f in ["weights.safetensors", "config.json"] {

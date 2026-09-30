@@ -220,6 +220,10 @@ enum Cmd {
         /// With --relay-server: peers that may be reachable through this relay at once.
         #[arg(long, env = "CHUNGUS_RELAY_MAX_RESERVATIONS", default_value_t = RelayLimits::default().max_reservations)]
         relay_max_reservations: usize,
+        /// Serve Prometheus metrics (bytes served, requests, peers, ...) at
+        /// http://<addr>/metrics, e.g. 127.0.0.1:9101.
+        #[arg(long, env = "CHUNGUS_METRICS")]
+        metrics: Option<SocketAddr>,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -952,6 +956,7 @@ async fn main() -> Result<()> {
             relay_circuit_mb,
             relay_circuit_secs,
             relay_max_reservations,
+            metrics,
         } => {
             let store = Arc::new(Store::open(&store)?);
             if let Some(url) = anchors_from {
@@ -1008,10 +1013,14 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 },
                 log: true,
+                metrics,
                 ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key, config).await?;
             println!("peer id {}", node.peer_id);
+            if let Some(addr) = metrics {
+                println!("metrics on http://{addr}/metrics");
+            }
             if download_only {
                 println!("download-only: serving and announcing nothing");
             } else {

@@ -186,6 +186,8 @@ A node behind NAT is reached through its relay, and the two ends then try to hol
 
 `node` logs what it connects to, so you can tell it joined: `connected to bootstrap <peer>`, `joined the DHT`, and with `--relay`, `relay reservation accepted by <peer>` followed by a `/p2p-circuit` address that others can reach you at. `could not reach bootstrap <peer>: <error>` means the bootstrap node's port is closed or the address is wrong. The public node logs a line for each peer that connects to it.
 
+`--metrics 127.0.0.1:9101` serves counters in Prometheus format at `/metrics`: bytes served, requests, requests answered busy, connected peers, and circuits relayed. They start from zero whenever the node restarts.
+
 ### Limits and attack resistance
 
 A node is someone's desktop, so it protects its owner. `--max-upload <MB/s>` caps upload bandwidth (on `serve` too), `--max-connections`, `--max-requests-per-peer` and `--max-uploads` bound how many peers and requests it serves at once (a peer over its share is told to come back later), and `--download-only` fetches through the swarm without serving or announcing anything. A one-off `chungus fetch` is always download-only.
