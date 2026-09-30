@@ -1,10 +1,7 @@
 //! A registry over HTTP: publishing, resolving, searching and auditing the log.
 
-<<<<<<< HEAD
 use std::collections::BTreeMap;
-=======
 use std::net::SocketAddr;
->>>>>>> d807142 (Registry download stats)
 use std::sync::Arc;
 
 use chungus::registry::{self, Claim, Client, Registry, Statement};
@@ -106,11 +103,16 @@ async fn publish_resolve_search_audit() {
     assert_eq!(client.downloads("acme/tiny-llama").await.unwrap().total, 0);
     for _ in 0..3 {
         client
-            .resolve_download("acme/tiny-llama", "main")
+            .resolve_download("acme/tiny-llama", "main", None)
             .await
             .unwrap();
     }
-    assert!(client.resolve_download("acme/nope", "main").await.is_err());
+    assert!(
+        client
+            .resolve_download("acme/nope", "main", None)
+            .await
+            .is_err()
+    );
     // A client can't pose as another network: X-Forwarded-For counts only behind a proxy.
     reqwest::Client::new()
         .get(format!("{url}/v1/resolve/acme/tiny-llama/main?download=1"))

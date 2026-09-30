@@ -303,6 +303,22 @@ The registry keeps `operator.pub` so it still knows which key nodes pin. Renew b
 
 The site can also be published to GitHub Pages: set the repository variable `CHUNGUS_REGISTRY_URL` to the registry's HTTPS address (the workflow refuses anything else), set Settings > Pages > Source to "GitHub Actions" and tick "Enforce HTTPS". The Pages workflow points the page at the live registry and bundles a snapshot of its index, refreshed every six hours, for when the registry is down.
 
+### The node leaderboard
+
+Nodes can opt in to a public leaderboard, ranked only on numbers someone other than the node confirms. A node's own counters never rank, since a modified node can report anything.
+
+```sh
+# List this node, under a display name, on the registry it follows
+chungus node --blocklist https://chungus.example.com --leaderboard "bunny burrow"
+```
+
+- **Uptime and models held** come from probes. Every few minutes each anchor node (run with `--probe`) asks each listed node for a random chunk of a model it claims, from a separate download-only identity so the node can't tell probes from downloads, and reports the result signed with its node key. The registry counts reports only from the anchors in its signed list.
+- **Bytes and downloads served** come from receipts. `fetch` and `mount` over the swarm bind their name lookup to their one-run peer id, then sign a receipt for what each peer sent and hand it to that peer, which submits it. The registry credits a receipt only if its signer made a lookup the registry counted (one per model, client network and UTC day), and credits at most the model's unique bytes per downloader. `--no-receipts` turns them off.
+
+`GET /v1/leaderboard?metric=bytes|downloads|uptime|models&days=30` ranks the listed nodes, `GET /v1/nodes/<peer id>` is one node's daily history, and `GET /v1/downloads` has the swarm-wide totals. Once a day can get no more receipts, the registry signs its totals (`GET /v1/totals/<YYYY-MM-DD>`), so they can't be quietly revised. The site's `leaderboard.html` shows it all. Receipts carry only a one-run peer id, the registry stores client networks only as hashes under a key it forgets every day, and raw receipts are deleted after a week. The operator can hide an abusive name with `chungus hide-node <peer id> --key <operator key>`; its numbers stay.
+
+Behind a reverse proxy the registry needs `--behind-proxy` to see each client's network (deploy/ sets it); never set it on a registry clients can reach directly.
+
 ## Safe files only
 
 A chunk's hash proves a file arrived intact, not that it is safe to load, and pickle-based weights can run arbitrary code the moment PyTorch, joblib or NumPy opens them. So chungus carries weights only as **safetensors** or **GGUF**, plus the small files around them (configs, tokenizers, READMEs). Files ending in `.bin`, `.pt`, `.pth`, `.ckpt`, `.pkl`, `.pickle`, `.joblib`, `.dill`, `.pd`, `.npy`, `.npz`, `.h5`, `.hdf5` or `.keras` are kept out everywhere:

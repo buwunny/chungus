@@ -15,6 +15,7 @@ network. `chungus --version` lists the versions a binary speaks.
 | Peer HTTP API (`serve`, `hub`) | `/v1/...` | URL prefix | |
 | Registry API | `/v1/...` | URL prefix | |
 | Registry statements and head | `chungus/registry-statement/v1`, `chungus/registry-head/v1` | signature domain prefix | |
+| Leaderboard messages | `chungus/node-registration/v1`, `chungus/receipt/v1`, `chungus/probe-report/v1`, `chungus/anchor-access/v1`, `chungus/hide-node/v1`, `chungus/daily-totals/v1` | signature domain prefix | |
 | Signatures | `chungus1<hex>` keys, ed25519 over the manifest root | key prefix | |
 
 ## Weight files
