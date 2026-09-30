@@ -436,7 +436,7 @@ fn check_version(root: &Path) -> Result<()> {
 }
 
 /// Write via a temp file and rename, so a crash never leaves a truncated file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir)?;

@@ -14,8 +14,9 @@
 //!   credited downloader costs a real network. Credit per downloader is capped at the
 //!   model's `unique_bytes`.
 //!
-//! The registry keeps registrations in `nodes.json`, download counts in `downloads.json`
-//! and the rest in `ledger.json`, and signs each day's totals once no more receipts can
+//! Lookups are counted by [`crate::downloads`]; a counted one that names a peer id is
+//! bound to it here. The registry keeps registrations in `nodes.json` and the rest in
+//! `ledger.json`, and signs each day's totals once no more receipts can
 //! arrive for it (`days/<date>.json`), so published numbers can't be quietly revised.
 //! Client networks are only ever stored as hashes under a key that changes every UTC day
 //! and is never written down.
@@ -401,18 +402,11 @@ pub struct DayTotals {
     pub day: String,
     pub nodes: BTreeMap<String, NodeDay>,
     pub bytes_served: u64,
-    /// Downloads the registry counted that day.
-    pub downloads: u64,
     pub signature: Signature,
 }
 
-fn totals_message(
-    day: &str,
-    nodes: &BTreeMap<String, NodeDay>,
-    bytes_served: u64,
-    downloads: u64,
-) -> Vec<u8> {
-    let body = serde_json::to_vec(&(day, nodes, bytes_served, downloads)).expect("serializes");
+fn totals_message(day: &str, nodes: &BTreeMap<String, NodeDay>, bytes_served: u64) -> Vec<u8> {
+    let body = serde_json::to_vec(&(day, nodes, bytes_served)).expect("serializes");
     [TOTALS_DOMAIN, &body].concat()
 }
 
@@ -420,7 +414,7 @@ impl DayTotals {
     pub fn verify(&self) -> bool {
         sign::verify_message(
             &self.signature,
-            &totals_message(&self.day, &self.nodes, self.bytes_served, self.downloads),
+            &totals_message(&self.day, &self.nodes, self.bytes_served),
         )
     }
 }
@@ -471,8 +465,6 @@ struct Ledger {
     probes: BTreeMap<String, BTreeMap<u64, Probes>>,
     /// node -> root -> when a chunk of it last checked out.
     held: BTreeMap<String, BTreeMap<String, u64>>,
-    /// Downloads counted per day, for days not yet signed.
-    counted: BTreeMap<u64, u64>,
 }
 
 /// A registered node, as the leaderboard and probers see it.
@@ -515,15 +507,6 @@ pub struct HistoryDay {
     pub signed: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Downloads {
-    /// Counted downloads by manifest root.
-    pub models: BTreeMap<String, u64>,
-    pub downloads: u64,
-    /// Credited bytes served, by every node, registered or not.
-    pub bytes_served: u64,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
@@ -537,14 +520,11 @@ pub enum Metric {
 pub struct Board {
     dir: PathBuf,
     nodes: BTreeMap<String, NodeRecord>,
-    downloads: BTreeMap<String, u64>,
     ledger: Ledger,
     days: BTreeMap<u64, DayTotals>,
     /// The day the network key is for, and the key. Never written down.
     key_day: u64,
     day_key: [u8; 32],
-    /// (root, network hash) counted today.
-    counted_today: HashSet<(String, String)>,
     /// When each (anchor, node) pair last reported.
     last_probe: HashMap<(String, String), u64>,
     /// Registrations per network this hour.
@@ -608,13 +588,11 @@ impl Board {
         getrandom::fill(&mut day_key).map_err(|e| anyhow!("no randomness: {e}"))?;
         Ok(Board {
             nodes: read_json(&dir.join("nodes.json"))?,
-            downloads: read_json(&dir.join("downloads.json"))?,
             ledger: read_json(&dir.join("ledger.json"))?,
             days,
             dir: dir.to_path_buf(),
             key_day: day_of(now()),
             day_key,
-            counted_today: HashSet::new(),
             last_probe: HashMap::new(),
             posts: HashMap::new(),
             dirty: false,
@@ -627,7 +605,6 @@ impl Board {
             return Ok(());
         }
         write_json(&self.dir.join("nodes.json"), &self.nodes)?;
-        write_json(&self.dir.join("downloads.json"), &self.downloads)?;
         write_json(&self.dir.join("ledger.json"), &self.ledger)?;
         self.dirty = false;
         Ok(())
@@ -639,44 +616,31 @@ impl Board {
         if day_of(t) != self.key_day {
             self.key_day = day_of(t);
             getrandom::fill(&mut self.day_key).expect("randomness");
-            self.counted_today.clear();
         }
         blake3::keyed_hash(&self.day_key, network.as_bytes())
             .to_hex()
             .to_string()
     }
 
-    /// Count a download lookup of `root` from `network`, at most once per network and
-    /// day. When counted and `peer` names the lookup's one-run peer id, that peer's
-    /// receipts for `root` can be credited, up to `cap` bytes. Returns whether it counted.
-    pub fn count_lookup(
-        &mut self,
-        t: u64,
-        root: &str,
-        network: &str,
-        peer: Option<&str>,
-        cap: u64,
-    ) -> bool {
-        let hash = self.network_hash(t, network);
-        if !self.counted_today.insert((root.to_string(), hash.clone())) {
-            return false;
-        }
-        *self.downloads.entry(root.to_string()).or_default() += 1;
-        *self.ledger.counted.entry(day_of(t)).or_default() += 1;
+    /// Bind a lookup of `root` from `network` that [`crate::downloads`] counted to `peer`,
+    /// the downloader's one-run peer id, so the receipts it signs for `root` can be
+    /// credited, up to `cap` bytes.
+    pub fn bind_lookup(&mut self, t: u64, root: &str, network: &str, peer: Option<&str>, cap: u64) {
+        let Some(peer) = peer.filter(|p| valid_peer(p)) else {
+            return;
+        };
+        let network = self.network_hash(t, network);
         // A peer id binds once: a later lookup naming someone else's peer id can't take
         // over its receipts.
-        if let Some(peer) = peer.filter(|p| valid_peer(p)) {
-            self.ledger
-                .lookups
-                .entry(format!("{peer} {root}"))
-                .or_insert(Lookup {
-                    network: hash,
-                    time: t,
-                    cap,
-                });
-        }
+        self.ledger
+            .lookups
+            .entry(format!("{peer} {root}"))
+            .or_insert(Lookup {
+                network,
+                time: t,
+                cap,
+            });
         self.dirty = true;
-        true
     }
 
     /// Register or refresh a node. `network` is the poster's network, for rate limiting.
@@ -979,7 +943,8 @@ impl Board {
         })
     }
 
-    pub fn downloads(&self, t: u64) -> Downloads {
+    /// Credited bytes served by every node, registered or not, all time.
+    pub fn bytes_served(&self, t: u64) -> u64 {
         let today = day_of(t);
         let signed: u64 = self.days.values().map(|d| d.bytes_served).sum();
         let live: u64 = self
@@ -992,11 +957,7 @@ impl Board {
             .filter(|d| !self.days.contains_key(d) && *d <= today)
             .map(|d| self.day(d).values().map(|n| n.bytes).sum::<u64>())
             .sum();
-        Downloads {
-            downloads: self.downloads.values().sum(),
-            models: self.downloads.clone(),
-            bytes_served: signed + live,
-        }
+        signed + live
     }
 
     pub fn totals(&self, day: u64) -> Option<&DayTotals> {
@@ -1016,7 +977,6 @@ impl Board {
         if let Some(key) = key {
             let mut pending: BTreeSet<u64> = self.ledger.credits.values().map(|c| c.day).collect();
             pending.extend(self.ledger.probes.values().flat_map(|d| d.keys().copied()));
-            pending.extend(self.ledger.counted.keys().copied());
             for day in pending {
                 // Lookups on `day` are credited until a day later, and receipts may take
                 // a little while to be forwarded.
@@ -1029,17 +989,12 @@ impl Board {
                     .into_iter()
                     .filter(|(peer, _)| self.nodes.contains_key(peer))
                     .collect();
-                let (d, downloads) = (
-                    date(day),
-                    self.ledger.counted.get(&day).copied().unwrap_or(0),
-                );
-                let signature =
-                    sign::sign_message(key, &totals_message(&d, &nodes, bytes_served, downloads));
+                let d = date(day);
+                let signature = sign::sign_message(key, &totals_message(&d, &nodes, bytes_served));
                 let totals = DayTotals {
                     day: d.clone(),
                     nodes,
                     bytes_served,
-                    downloads,
                     signature,
                 };
                 write_json(&self.dir.join("days").join(format!("{d}.json")), &totals)?;
@@ -1063,7 +1018,6 @@ impl Board {
             d.retain(|day, _| !days.contains_key(day));
         }
         self.ledger.probes.retain(|_, d| !d.is_empty());
-        self.ledger.counted.retain(|day, _| !days.contains_key(day));
         for h in self.ledger.held.values_mut() {
             h.retain(|_, at| t.saturating_sub(*at) < HELD_SECS);
         }
@@ -1104,7 +1058,7 @@ pub(crate) fn client_ip(
     headers: &HeaderMap,
     conn: Option<&ConnectInfo<SocketAddr>>,
 ) -> Option<IpAddr> {
-    if reg.behind_proxy() {
+    if reg.is_behind_proxy() {
         headers
             .get_all("x-forwarded-for")
             .iter()
@@ -1133,7 +1087,6 @@ pub(crate) fn routes() -> Router<Arc<Registry>> {
         .route("/v1/probes", post(probes))
         .route("/v1/anchor-access", post(anchor_access))
         .route("/v1/leaderboard", get(leaderboard))
-        .route("/v1/downloads", get(downloads))
         .route("/v1/totals", get(signed_days))
         .route("/v1/totals/{day}", get(totals))
 }
@@ -1242,10 +1195,6 @@ async fn leaderboard(State(reg): State<Arc<Registry>>, Query(q): Query<BoardQuer
     let metric = q.metric.unwrap_or(Metric::Bytes);
     let days = q.days.unwrap_or(DEFAULT_DAYS);
     axum::Json(reg.board(|b| b.leaderboard(metric, days, now()))).into_response()
-}
-
-async fn downloads(State(reg): State<Arc<Registry>>) -> Response {
-    axum::Json(reg.board(|b| b.downloads(now()))).into_response()
 }
 
 async fn signed_days(State(reg): State<Arc<Registry>>) -> Response {
@@ -1616,13 +1565,9 @@ mod tests {
         let r1 = Receipt::at(&fetcher, &root(1), &s1p, 600, 3, t);
         assert_eq!(b.receipts(vec![r1.clone()], t).unwrap(), 0);
 
-        assert!(b.count_lookup(t, &root(1), "198.51.100.0/24", Some(&fp), 1000));
-        // The same network on the same day isn't counted again, nor bound.
-        let again = Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-            .to_string();
-        assert!(!b.count_lookup(t, &root(1), "198.51.100.0/24", Some(&again), 1000));
+        b.bind_lookup(t, &root(1), "198.51.100.0/24", Some(&fp), 1000);
+        // A second bind of the same peer and root keeps the first lookup.
+        b.bind_lookup(t, &root(1), "203.0.113.0/24", Some(&fp), 5000);
 
         let r2 = Receipt::at(&fetcher, &root(1), &s2p, 900, 4, t);
         assert_eq!(b.receipts(vec![r1.clone(), r2, r1.clone()], t).unwrap(), 2);
@@ -1645,7 +1590,7 @@ mod tests {
         let rows = b.leaderboard(Metric::Bytes, 30, t);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bytes, 400);
-        assert_eq!(b.downloads(t).bytes_served, 1000);
+        assert_eq!(b.bytes_served(t), 1000);
 
         // Two days on, the day is signed and frozen.
         let op = sign::generate_key(&dir.path().join("op.key")).unwrap();
@@ -1653,12 +1598,11 @@ mod tests {
         let totals = b.totals(day_of(t)).unwrap().clone();
         assert!(totals.verify());
         assert_eq!(totals.bytes_served, 1000);
-        assert_eq!(totals.downloads, 1);
         assert_eq!(totals.nodes.len(), 1);
         b.save().unwrap();
         let reopened = Board::open(dir.path()).unwrap();
         assert_eq!(reopened.day(day_of(t))[&s1p.to_string()].bytes, 400);
-        assert_eq!(reopened.downloads(t).downloads, 1);
+        assert_eq!(reopened.bytes_served(t), 1000);
     }
 
     #[test]

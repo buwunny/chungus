@@ -22,10 +22,9 @@ curl -L https://github.com/buwunny/chungus/releases/download/$v/chungus-$v-$t.ta
 sudo mv chungus-$v-$t/chungus /usr/local/bin/ && chungus --version
 ```
 
-**2. Find a model and download it** from the swarm. Every chunk is checked against its hash, and the publisher's signature is required:
+**2. Find a model and download it** from the swarm. Names come from the public registry at chungus.io (set `CHUNGUS_REGISTRY` to use another). Every chunk is checked against its hash, and the publisher's signature is required:
 
 ```sh
-export CHUNGUS_REGISTRY=https://<the registry's address>
 chungus search llama
 chungus fetch acme/tiny-llama --swarm -o tiny-llama/
 ```
@@ -187,6 +186,8 @@ A node behind NAT is reached through its relay, and the two ends then try to hol
 
 `node` logs what it connects to, so you can tell it joined: `connected to bootstrap <peer>`, `joined the DHT`, and with `--relay`, `relay reservation accepted by <peer>` followed by a `/p2p-circuit` address that others can reach you at. `could not reach bootstrap <peer>: <error>` means the bootstrap node's port is closed or the address is wrong. The public node logs a line for each peer that connects to it.
 
+`--metrics 127.0.0.1:9101` serves counters in Prometheus format at `/metrics`: bytes served, requests, requests answered busy, connected peers, and circuits relayed. They start from zero whenever the node restarts.
+
 ### Limits and attack resistance
 
 A node is someone's desktop, so it protects its owner. `--max-upload <MB/s>` caps upload bandwidth (on `serve` too), `--max-connections`, `--max-requests-per-peer` and `--max-uploads` bound how many peers and requests it serves at once (a peer over its share is told to come back later), and `--download-only` fetches through the swarm without serving or announcing anything. A one-off `chungus fetch` is always download-only.
@@ -261,9 +262,11 @@ chungus audit --operator chungus1<operator key>
 
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
+The registry also counts downloads. Peers move the bytes, so it counts what it can see: `chungus fetch` and `chungus mount` looking up a name (`chungus resolve` doesn't count). Each model counts at most once per client network (IPv4 /24 or IPv6 /48) per UTC day, so re-running a fetch or looping on the endpoint adds at most one a day, and inflating a count takes many networks. No addresses are stored: a network is remembered only as a hash under a random key, and both are discarded at the end of the day. `GET /v1/downloads/<org>/<model>` returns a model's total and last-30-day counts, and `GET /v1/downloads` the totals across models with a count per day. The counts live in `downloads.json` in the data directory and are saved every minute and on shutdown. Behind a reverse proxy, pass `--behind-proxy` so counts go by the client's address in `X-Forwarded-For`. Without the flag that header is ignored, since a client could set it to anything.
+
 ### A public registry and website
 
-`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
+`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, downloads, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
 
 To run a public registry on the same server as the public node, with the website on the same domain, HTTPS only (Caddy gets the certificate, redirects HTTP to HTTPS and sends HSTS):
 
@@ -274,7 +277,7 @@ docker compose --profile registry up -d
 docker compose logs registry   # the operator key: nodes pin it with --operator
 ```
 
-Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and keys live in the `registry-data` volume.
+Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log, keys and download counts live in the `registry-data` volume.
 
 ### Keeping the operator key offline
 
@@ -312,9 +315,7 @@ chungus node --blocklist https://chungus.example.com --leaderboard "bunny burrow
 - **Uptime and models held** come from probes. Every few minutes each anchor node (run with `--probe`) asks each listed node for a random chunk of a model it claims, from a separate download-only identity so the node can't tell probes from downloads, and reports the result signed with its node key. The registry counts reports only from the anchors in its signed list.
 - **Bytes and downloads served** come from receipts. `fetch` and `mount` over the swarm bind their name lookup to their one-run peer id, then sign a receipt for what each peer sent and hand it to that peer, which submits it. The registry credits a receipt only if its signer made a lookup the registry counted (one per model, client network and UTC day), and credits at most the model's unique bytes per downloader. `--no-receipts` turns them off.
 
-`GET /v1/leaderboard?metric=bytes|downloads|uptime|models&days=30` ranks the listed nodes, `GET /v1/nodes/<peer id>` is one node's daily history, and `GET /v1/downloads` has the swarm-wide totals. Once a day can get no more receipts, the registry signs its totals (`GET /v1/totals/<YYYY-MM-DD>`), so they can't be quietly revised. The site's `leaderboard.html` shows it all. Receipts carry only a one-run peer id, the registry stores client networks only as hashes under a key it forgets every day, and raw receipts are deleted after a week. The operator can hide an abusive name with `chungus hide-node <peer id> --key <operator key>`; its numbers stay.
-
-Behind a reverse proxy the registry needs `--behind-proxy` to see each client's network (deploy/ sets it); never set it on a registry clients can reach directly.
+`GET /v1/leaderboard?metric=bytes|downloads|uptime|models&days=30` ranks the listed nodes, `GET /v1/nodes/<peer id>` is one node's daily history, and `GET /v1/downloads` adds the swarm-wide `bytes_served` to the download totals. Once a day can get no more receipts, the registry signs its totals (`GET /v1/totals/<YYYY-MM-DD>`), so they can't be quietly revised. The site's `leaderboard.html` shows it all. Receipts carry only a one-run peer id, the registry stores client networks only as hashes under a key it forgets every day, and raw receipts are deleted after a week. The operator can hide an abusive name with `chungus hide-node <peer id> --key <operator key>`; its numbers stay.
 
 ## Safe files only
 

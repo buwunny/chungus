@@ -7,7 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chungus::leaderboard::{Downloads, Prober, Registration, Row};
+use chungus::downloads::Totals;
+use chungus::leaderboard::{Prober, Registration, Row};
 use chungus::limits::Limits;
 use chungus::p2p::{self, Config, Node};
 use chungus::registry::{self, Claim, Client, Registry, Statement};
@@ -190,8 +191,8 @@ async fn receipts_and_probes_rank_a_node() {
     assert_eq!(rows[0].bytes, credited);
     assert_eq!(rows[0].downloads, 1);
     assert_eq!(rows[0].uptime, None);
-    let d: Downloads = get(&format!("{url}/v1/downloads")).await;
-    assert_eq!((d.downloads, d.bytes_served), (1, credited));
+    let d: Totals = get(&format!("{url}/v1/downloads")).await;
+    assert_eq!((d.total, d.bytes_served), (1, credited));
 
     // Only an anchor's probes count. Make one an anchor, then probe from a separate
     // download-only identity.

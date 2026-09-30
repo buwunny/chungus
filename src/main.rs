@@ -233,6 +233,10 @@ enum Cmd {
         /// download-only identity. Only counts for the registry's anchor nodes.
         #[arg(long, env = "CHUNGUS_PROBE")]
         probe: bool,
+        /// Serve Prometheus metrics (bytes served, requests, peers, ...) at
+        /// http://<addr>/metrics, e.g. 127.0.0.1:9101.
+        #[arg(long, env = "CHUNGUS_METRICS")]
+        metrics: Option<SocketAddr>,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -245,9 +249,9 @@ enum Cmd {
         data: PathBuf,
         #[arg(long, env = "CHUNGUS_REGISTRY_PORT", default_value_t = registry::DEFAULT_PORT)]
         port: u16,
-        /// The registry is reachable only through a reverse proxy (like deploy/'s Caddy),
-        /// so take each client's address, for counting downloads, from the last
-        /// X-Forwarded-For entry. Never set this on a registry clients can reach directly.
+        /// The registry is only reachable through a reverse proxy (like the Caddy in
+        /// deploy/) that puts the client's address last in X-Forwarded-For. Download
+        /// counts then go by that address instead of the proxy's.
         #[arg(long, env = "CHUNGUS_BEHIND_PROXY")]
         behind_proxy: bool,
     },
@@ -637,6 +641,21 @@ impl FromArgs {
         };
         p2p::Node::start(store.clone(), key, config).await
     }
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM (what `docker stop` sends).
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn parse_keys(keys: &[String]) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
@@ -1038,6 +1057,7 @@ async fn main() -> Result<()> {
             leaderboard,
             registry,
             probe,
+            metrics,
         } => {
             let store = Arc::new(Store::open(&store)?);
             let registry = registry.or_else(|| blocklist.clone());
@@ -1135,6 +1155,7 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 },
                 log: true,
+                metrics,
                 ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key.clone(), config).await?;
@@ -1145,6 +1166,9 @@ async fn main() -> Result<()> {
             if let (Some(prober), Some(url)) = (prober, &registry) {
                 println!("probing {url}'s listed nodes as {}", prober.peer_id);
                 chungus::leaderboard::probe_loop(url.clone(), key, prober);
+            }
+            if let Some(addr) = metrics {
+                println!("metrics on http://{addr}/metrics");
             }
             if download_only {
                 println!("download-only: serving and announcing nothing");
@@ -1167,7 +1191,7 @@ async fn main() -> Result<()> {
             port,
             behind_proxy,
         } => {
-            let reg = Arc::new(registry::Registry::open(&data)?.with_behind_proxy(behind_proxy));
+            let reg = Arc::new(registry::Registry::open(&data)?.behind_proxy(behind_proxy));
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -1194,7 +1218,30 @@ async fn main() -> Result<()> {
                      chungus delegate {online} --key <root key> --registry <this registry>"
                 ),
             }
-            registry::serve(listener, reg).await?;
+            // Download counts and the leaderboard are kept in memory and written out
+            // every minute (signing finished days), and once more on the way out.
+            let saver = reg.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    every.tick().await;
+                    let saver = saver.clone();
+                    match tokio::task::spawn_blocking(move || saver.flush()).await {
+                        Ok(Err(e)) => {
+                            eprintln!("saving download counts and the leaderboard: {e:#}")
+                        }
+                        Err(e) => eprintln!("saving download counts and the leaderboard: {e}"),
+                        Ok(Ok(())) => {}
+                    }
+                }
+            });
+            axum::serve(
+                listener,
+                registry::router(reg.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
+            reg.flush()?;
         }
         Cmd::Publish {
             root,
