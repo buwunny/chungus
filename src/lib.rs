@@ -6,7 +6,11 @@
 //! once, encoded with the smallest of {stored, zstd, byte-plane + zstd}.
 
 pub mod chunk;
+<<<<<<< HEAD
 pub mod gguf;
+=======
+pub mod downloads;
+>>>>>>> d807142 (Registry download stats)
 pub mod hub;
 pub mod lazy;
 pub mod limits;

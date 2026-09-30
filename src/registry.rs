@@ -33,6 +33,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::downloads::{Downloads, ModelDownloads};
 use crate::sign::{self, Signature};
 use crate::store;
 
@@ -980,6 +981,11 @@ pub struct Registry {
     /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
     hf: String,
     http: reqwest::Client,
+    downloads: Downloads,
+    /// Whether requests come through a reverse proxy that puts the client's address last
+    /// in `X-Forwarded-For` (Caddy does). Otherwise that header is ignored, since
+    /// clients could set it to anything.
+    behind_proxy: bool,
 }
 
 pub const DEFAULT_HF: &str = "https://huggingface.co";
@@ -1067,8 +1073,12 @@ impl Registry {
         fs::create_dir_all(&manifests)?;
         let headers = dir.join("headers");
         fs::create_dir_all(&headers)?;
+<<<<<<< HEAD
         let gguf = dir.join("gguf");
         fs::create_dir_all(&gguf)?;
+=======
+        let downloads = Downloads::open(&dir.join("downloads.json"))?;
+>>>>>>> d807142 (Registry download stats)
         let mut checked = HashMap::new();
         for e in fs::read_dir(&manifests)? {
             let e = e?;
@@ -1097,6 +1107,8 @@ impl Registry {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
+            downloads,
+            behind_proxy: false,
         })
     }
 
@@ -1115,6 +1127,22 @@ impl Registry {
     pub fn with_hf(mut self, url: &str) -> Registry {
         self.hf = url.trim_end_matches('/').to_string();
         self
+    }
+
+    /// Take the client's address from the last `X-Forwarded-For` entry, for a registry
+    /// only reachable through a reverse proxy that sets it.
+    pub fn behind_proxy(mut self, yes: bool) -> Registry {
+        self.behind_proxy = yes;
+        self
+    }
+
+    pub fn downloads(&self) -> &Downloads {
+        &self.downloads
+    }
+
+    /// Write download counts to disk if they changed. Call it now and then, and on exit.
+    pub fn save_downloads(&self) -> Result<()> {
+        self.downloads.save()
     }
 
     /// Issue a ticket for `req.peer` to download `req.root`, if Hugging Face says the
@@ -1310,7 +1338,12 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 
 /// `POST /v1/statements`, `POST /v1/publish`, `GET /v1/manifests/{root}`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
 /// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
-/// `GET /v1/owners/{org}`, `GET /v1/anchors` and `POST /v1/access`.
+/// `GET /v1/owners/{org}`, `GET /v1/anchors`, `POST /v1/access`, `GET /v1/downloads` and
+/// `GET /v1/downloads/{org}/{model}`.
+///
+/// `GET /v1/resolve/...?download=1` also counts a download of the name (see
+/// [`crate::downloads`]). Serve with `into_make_service_with_connect_info::<SocketAddr>()`
+/// so the client's address is known; without it, nothing is counted.
 ///
 /// Everything it serves is public and signed, so any web page may read it: responses
 /// allow every origin. Browsers can't submit statements, since there is no CORS
@@ -1334,6 +1367,8 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/v1/owners/{org}", get(owners))
         .route("/v1/anchors", get(anchors))
         .route("/v1/access", post(access))
+        .route("/v1/downloads", get(download_totals))
+        .route("/v1/downloads/{org}/{model}", get(model_downloads))
         .layer(axum::middleware::map_response(allow_any_origin))
         .with_state(reg)
 }
@@ -1452,13 +1487,41 @@ async fn log_entries(State(reg): State<Arc<Registry>>, Query(p): Query<Page>) ->
     axum::Json(page).into_response()
 }
 
+#[derive(Deserialize)]
+struct ResolveQuery {
+    #[serde(default)]
+    download: u8,
+}
+
+/// The address of the client that sent `req`, if it can be trusted.
+fn client_ip(reg: &Registry, req: &axum::extract::Request) -> Option<std::net::IpAddr> {
+    if reg.behind_proxy {
+        // The proxy appends the address it saw; anything before it came from the client.
+        let xff = req.headers().get("x-forwarded-for")?.to_str().ok()?;
+        return xff.rsplit(',').next()?.trim().parse().ok();
+    }
+    let info = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()?;
+    Some(info.0.ip())
+}
+
 async fn resolve(
     State(reg): State<Arc<Registry>>,
     Path((org, model, rev)): Path<(String, String, String)>,
+    Query(q): Query<ResolveQuery>,
+    req: axum::extract::Request,
 ) -> Response {
     let name = format!("{org}/{model}");
     match reg.with_log(|log| log.resolve(&name, &rev).cloned()) {
-        Some(entry) => axum::Json(entry).into_response(),
+        Some(entry) => {
+            if q.download == 1
+                && let Some(ip) = client_ip(&reg, &req)
+            {
+                reg.downloads.count(&name, ip, now());
+            }
+            axum::Json(entry).into_response()
+        }
         None => err(
             StatusCode::NOT_FOUND,
             format!("{name}@{rev} is not published"),
@@ -1470,6 +1533,17 @@ async fn resolve(
 struct SearchQuery {
     #[serde(default)]
     q: String,
+}
+
+async fn model_downloads(
+    State(reg): State<Arc<Registry>>,
+    Path((org, model)): Path<(String, String)>,
+) -> Response {
+    axum::Json(reg.downloads.of(&format!("{org}/{model}"), now())).into_response()
+}
+
+async fn download_totals(State(reg): State<Arc<Registry>>) -> Response {
+    axum::Json(reg.downloads.totals(now())).into_response()
 }
 
 async fn search(State(reg): State<Arc<Registry>>, Query(q): Query<SearchQuery>) -> Response {
@@ -1631,7 +1705,23 @@ impl Client {
 
     /// The entry that currently defines `name@rev`, with its signature checked.
     pub async fn resolve(&self, name: &str, rev: &str) -> Result<Entry> {
-        let entry: Entry = self.get(&format!("/v1/resolve/{name}/{rev}")).await?;
+        self.resolve_at(&format!("/v1/resolve/{name}/{rev}"), name, rev)
+            .await
+    }
+
+    /// [`Client::resolve`], counting a download of `name` in the registry's stats.
+    pub async fn resolve_download(&self, name: &str, rev: &str) -> Result<Entry> {
+        self.resolve_at(&format!("/v1/resolve/{name}/{rev}?download=1"), name, rev)
+            .await
+    }
+
+    /// How often `name` has been downloaded, as counted by [`Client::resolve_download`].
+    pub async fn downloads(&self, name: &str) -> Result<ModelDownloads> {
+        self.get(&format!("/v1/downloads/{name}")).await
+    }
+
+    async fn resolve_at(&self, path: &str, name: &str, rev: &str) -> Result<Entry> {
+        let entry: Entry = self.get(path).await?;
         match &entry.statement.claim {
             Claim::Publish {
                 name: n,

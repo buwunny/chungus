@@ -1,7 +1,7 @@
 // The landing page: install commands, and live numbers and recent models from the registry.
 "use strict";
 
-const { el, ago, short, command, logLine, loadIndex, registryUrl } = window.chungus;
+const { el, ago, short, command, logLine, loadIndex, getJSON, registryUrl } = window.chungus;
 const $ = (id) => document.getElementById(id);
 
 // One install command per release target, with tabs to switch and the visitor's platform
@@ -162,6 +162,12 @@ async function main() {
     ? `${n} model${n === 1 ? "" : "s"} published · ${head.size} signed log entr${head.size === 1 ? "y" : "ies"}`
     : `${n} model${n === 1 ? "" : "s"} published`;
   $("log").textContent = logLine(head);
+  // Downloads across every model, from registries that count them.
+  getJSON(`${registryUrl}/v1/downloads`)
+    .then((d) => {
+      if (d.total) $("stats").textContent += ` · ${d.total.toLocaleString()} global download${d.total === 1 ? "" : "s"}`;
+    })
+    .catch(() => {});
   const recent = $("recent");
   recent.replaceChildren();
   if (!n) recent.append(el("p", { class: "muted", text: "Nothing yet. Be the first to publish." }));

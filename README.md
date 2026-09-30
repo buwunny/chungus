@@ -262,9 +262,11 @@ chungus audit --operator chungus1<operator key>
 
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
+The registry also counts downloads. Peers move the bytes, so it counts what it can see: `chungus fetch` and `chungus mount` looking up a name (`chungus resolve` doesn't count). Each model counts at most once per client network (IPv4 /24 or IPv6 /48) per UTC day, so re-running a fetch or looping on the endpoint adds at most one a day, and inflating a count takes many networks. No addresses are stored: a network is remembered only as a hash under a random key, and both are discarded at the end of the day. `GET /v1/downloads/<org>/<model>` returns a model's total and last-30-day counts, and `GET /v1/downloads` the totals across models with a count per day. The counts live in `downloads.json` in the data directory and are saved every minute and on shutdown. Behind a reverse proxy, pass `--behind-proxy` so counts go by the client's address in `X-Forwarded-For`. Without the flag that header is ignored, since a client could set it to anything.
+
 ### A public registry and website
 
-`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
+`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, downloads, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
 
 To run a public registry on the same server as the public node, with the website on the same domain, HTTPS only (Caddy gets the certificate, redirects HTTP to HTTPS and sends HSTS):
 
@@ -275,7 +277,7 @@ docker compose --profile registry up -d
 docker compose logs registry   # the operator key: nodes pin it with --operator
 ```
 
-Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and keys live in the `registry-data` volume.
+Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log, keys and download counts live in the `registry-data` volume.
 
 ### Keeping the operator key offline
 

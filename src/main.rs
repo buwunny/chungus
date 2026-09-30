@@ -236,6 +236,11 @@ enum Cmd {
         data: PathBuf,
         #[arg(long, env = "CHUNGUS_REGISTRY_PORT", default_value_t = registry::DEFAULT_PORT)]
         port: u16,
+        /// The registry is only reachable through a reverse proxy (like the Caddy in
+        /// deploy/) that puts the client's address last in X-Forwarded-For. Download
+        /// counts then go by that address instead of the proxy's.
+        #[arg(long, env = "CHUNGUS_BEHIND_PROXY")]
+        behind_proxy: bool,
     },
     /// Give a model in the store a name (org/model[@rev]) in the registry, signed by you.
     Publish {
@@ -507,7 +512,7 @@ impl FromArgs {
         }
         let (name, rev) = registry::parse_ref(model)?;
         let entry = registry::Client::new(&self.registry)?
-            .resolve(&name, &rev)
+            .resolve_download(&name, &rev)
             .await?;
         let Claim::Publish { root, .. } = entry.statement.claim else {
             unreachable!("resolve returns publishes")
@@ -586,6 +591,21 @@ impl FromArgs {
         };
         p2p::Node::start(store.clone(), key, config).await
     }
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM (what `docker stop` sends).
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn parse_keys(keys: &[String]) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
@@ -1037,8 +1057,12 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
-        Cmd::Registry { data, port } => {
-            let reg = Arc::new(registry::Registry::open(&data)?);
+        Cmd::Registry {
+            data,
+            port,
+            behind_proxy,
+        } => {
+            let reg = Arc::new(registry::Registry::open(&data)?.behind_proxy(behind_proxy));
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -1065,7 +1089,25 @@ async fn main() -> Result<()> {
                      chungus delegate {online} --key <root key> --registry <this registry>"
                 ),
             }
-            axum::serve(listener, registry::router(reg)).await?;
+            // Download counts are kept in memory and written out every minute, and once
+            // more on the way out.
+            let saver = reg.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    every.tick().await;
+                    if let Err(e) = saver.save_downloads() {
+                        eprintln!("saving download counts: {e:#}");
+                    }
+                }
+            });
+            axum::serve(
+                listener,
+                registry::router(reg.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
+            reg.save_downloads()?;
         }
         Cmd::Publish {
             root,
