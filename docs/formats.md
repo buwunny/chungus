@@ -18,6 +18,19 @@ network. `chungus --version` lists the versions a binary speaks.
 | Leaderboard messages | `chungus/node-registration/v1`, `chungus/receipt/v1`, `chungus/probe-report/v1`, `chungus/anchor-access/v1`, `chungus/hide-node/v1`, `chungus/daily-totals/v1` | signature domain prefix | |
 | Signatures | `chungus1<hex>` keys, ed25519 over the manifest root | key prefix | |
 
+## Weight files
+
+Safetensors and GGUF files are split per tensor before chunking, so chunk edges fall on
+tensor edges and a tensor two files share chunks the same way in both. A GGUF file's
+header (key/values, including the tokenizer, and tensor info) is one segment, each tensor
+is another, and padding between tensors makes small raw segments. F32, F16, BF16 and F64
+tensors get the same float transforms they get in safetensors; quantized types are
+stored as raw bytes. A GGUF file chungus can't parse (a version other than 2 or 3, or
+anything malformed) is chunked whole as one raw segment, so it still packs and serves
+unchanged. Segmenting changes where chunks are cut, so a GGUF file packed by an older
+chungus has a different manifest root, but no format changes: the dtypes are the ones
+manifests already carry.
+
 ## Rules for changing a format
 
 - **Never change what an existing version means.** A change gets a new version; the old

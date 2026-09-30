@@ -388,11 +388,14 @@ where
         chunks: wanted.len(),
         ..Default::default()
     };
+    let wanted_bytes: u64 = wanted.iter().map(|(_, len)| *len as u64).sum();
     let missing: Vec<_> = wanted
         .into_iter()
         .filter(|(h, _)| !store.contains(h))
         .collect();
     stats.already_local = stats.chunks - missing.len();
+    let missing_bytes: u64 = missing.iter().map(|(_, len)| *len as u64).sum();
+    crate::progress::begin(wanted_bytes - missing_bytes, wanted_bytes);
 
     let (get, sources) = (&get, &sources);
     let results = stream::iter(missing)
@@ -405,7 +408,10 @@ where
                         continue;
                     };
                     match verify_and_store(&store, &hash, len, blob).await {
-                        Some(bytes) => return Ok((source.to_string(), bytes, rejected)),
+                        Some(bytes) => {
+                            crate::progress::advance(len as u64);
+                            return Ok((source.to_string(), bytes, rejected));
+                        }
                         None => rejected += 1,
                     }
                 }

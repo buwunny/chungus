@@ -56,7 +56,7 @@ model files ─► segments ─► FastCDC chunks ─► BLAKE3 ─► float tra
               (per tensor)   (~64 KiB)       (raw bytes)  (exponent split)
 ```
 
-1. **Segments.** Safetensors files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
+1. **Segments.** Safetensors and GGUF files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
 2. **Content-defined chunking.** FastCDC cuts each segment into chunks of 16–256 KiB (64 KiB average). Cut points inside float tensors are rounded to whole elements.
 3. **Hashing.** Each chunk is addressed by the BLAKE3 hash of its *raw* bytes. Identical chunks are stored once, across files and across models.
 4. **Float transform.** For BF16 and F32 tensors, each element is rearranged into an exponent byte and sign+mantissa bytes, then grouped into planes. Exponents are low-entropy and compress well. This is lossless: unpacking gives back the exact bits. The split and unshuffle run SIMD kernels (SSSE3 on x86-64, NEON on ARM) at 4 to 9 GB/s per core, faster than zstd decodes; `cargo run --release --example transform_speed` measures them.
@@ -107,6 +107,8 @@ One machine packs a model and serves its store. It advertises itself over mDNS, 
 ```
 
 `fetch` downloads only the chunks it doesn't already have, so a second model that shares chunks with the first transfers less, and an interrupted fetch picks up where it stopped. Every chunk is checked against its BLAKE3 hash on arrival. A peer that sends bad data is skipped and the chunk is taken from the next peer. With several peers, chunks are spread across them. `--peer http://host:7447` adds a peer by hand (for networks that block multicast), and `--origin URL` names a server to use only when no peer has a chunk. `chungus list` shows the models in a store.
+
+While a download runs in a terminal, a bunny hops along a progress bar, jumping cacti like the Chrome dinosaur game, with the percentage, speed and time left beside it (`mount --prefetch` shows it too). It draws on stderr only when that is a terminal; `CHUNGUS_NO_PROGRESS=1` turns it off.
 
 `serve` exposes the store read-only over plain HTTP to anyone who can reach the port. Run it only on networks you trust; encrypted, authenticated transport comes with the internet milestone.
 

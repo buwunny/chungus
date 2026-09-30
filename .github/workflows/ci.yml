@@ -47,6 +47,7 @@ jobs:
       - name: Fuzz each target for a minute
         run: |
           for t in $(cargo fuzz list); do
+            if [ -d "fuzz/seeds/$t" ]; then mkdir -p "fuzz/corpus/$t" && cp fuzz/seeds/"$t"/* "fuzz/corpus/$t/"; fi
             cargo fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=60 -rss_limit_mb=2048
           done
 

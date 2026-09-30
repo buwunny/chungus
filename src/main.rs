@@ -13,6 +13,7 @@ use chungus::limits::{Limits, RateLimiter, RelayLimits};
 use chungus::manifest::{self, Manifest};
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
+use chungus::progress;
 use chungus::registry::{self, Claim, Statement};
 use chungus::sign;
 use chungus::store::{self, Store};
@@ -69,6 +70,9 @@ enum Cmd {
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
+        /// Chunk every file whole, without splitting safetensors and GGUF per tensor.
+        #[arg(long)]
+        whole_files: bool,
     },
     /// Share this store with peers on the LAN (read-only HTTP, advertised over mDNS).
     Serve {
@@ -706,8 +710,12 @@ async fn main() -> Result<()> {
                 println!("{root}  {:>10.1} MB  {}", mb(size), names.join(", "));
             }
         }
-        Cmd::Bench { inputs, json } => {
-            let r = chungus::bench(&inputs)?;
+        Cmd::Bench {
+            inputs,
+            json,
+            whole_files,
+        } => {
+            let r = chungus::bench(&inputs, whole_files)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
@@ -849,17 +857,28 @@ async fn main() -> Result<()> {
             let store = Arc::new(Store::open(&from.store)?);
             let key = from.swarm_key();
             let (root, trust, bound) = from.resolve(&root, &store, key.as_ref()).await?;
-            let (manifest, s) = if let Some(key) = key {
+            let bar = progress::Bar::new();
+            let label = format!("fetching {}", &root[..12.min(root.len())]);
+            let result = if let Some(key) = key {
                 let node = from.swarm_node(&store, key).await?;
-                let (m, s) = p2p::fetch(&node, &root, store.clone(), &trust, from.access()).await?;
-                if bound {
-                    p2p::send_receipts(&node, &root, &p2p::served_by(&s)).await;
+                let display = progress::show(label, bar.progress());
+                let fetch = p2p::fetch(&node, &root, store.clone(), &trust, from.access());
+                let r = progress::track(bar, fetch).await;
+                progress::done(display, &r).await;
+                if bound && let Ok((_, s)) = &r {
+                    p2p::send_receipts(&node, &root, &p2p::served_by(s)).await;
                 }
-                (m, s)
+                r
             } else {
                 let peers = from.lan_peers().await?;
-                net::fetch(&root, store.clone(), &peers, from.origin.as_deref(), &trust).await?
+                let display = progress::show(label, bar.progress());
+                let origin = from.origin.as_deref();
+                let fetch = net::fetch(&root, store.clone(), &peers, origin, &trust);
+                let r = progress::track(bar, fetch).await;
+                progress::done(display, &r).await;
+                r
             };
+            let (manifest, s) = result?;
             report_fetch(&s);
             if let Some(output) = output {
                 tokio::task::spawn_blocking(move || chungus::unpack(&manifest, &store, &output))
@@ -914,16 +933,29 @@ async fn main() -> Result<()> {
                     .local_bytes
                     .load(std::sync::atomic::Ordering::Relaxed)),
             );
-            let progress = {
+            let prefetching = {
                 let lazy = lazy.clone();
                 async move {
                     if prefetch == 0 {
                         return std::future::pending().await;
                     }
                     let started = std::time::Instant::now();
+                    let display = progress::show("prefetching", {
+                        let lazy = lazy.clone();
+                        move || {
+                            let local = lazy
+                                .stats
+                                .local_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            (local, lazy.total_bytes())
+                        }
+                    });
                     let ticker = async {
                         loop {
                             tokio::time::sleep(Duration::from_secs(5)).await;
+                            if display.is_some() {
+                                continue;
+                            }
                             let local = lazy
                                 .stats
                                 .local_bytes
@@ -936,15 +968,17 @@ async fn main() -> Result<()> {
                             );
                         }
                     };
-                    tokio::select! {
-                        r = lazy.prefetch(prefetch) => match r {
-                            Ok(()) => println!(
-                                "prefetch done in {:.1}s: the whole model is local",
-                                started.elapsed().as_secs_f64()
-                            ),
-                            Err(e) => eprintln!("prefetch stopped: {e:#}"),
-                        },
-                        _ = ticker => {}
+                    let r = tokio::select! {
+                        r = lazy.prefetch(prefetch) => r,
+                        _ = ticker => unreachable!(),
+                    };
+                    progress::done(display, &r).await;
+                    match r {
+                        Ok(()) => println!(
+                            "prefetch done in {:.1}s: the whole model is local",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => eprintln!("prefetch stopped: {e:#}"),
                     }
                     std::future::pending::<()>().await
                 }
@@ -963,7 +997,7 @@ async fn main() -> Result<()> {
                 }
             };
             tokio::select! {
-                _ = progress => {}
+                _ = prefetching => {}
                 _ = every_few_minutes => {}
                 r = tokio::signal::ctrl_c() => r?,
             }
@@ -1191,8 +1225,9 @@ async fn main() -> Result<()> {
             );
             let m = chungus::manifest::parse(&manifest)?;
             let headers = chungus::safetensors_headers(&m, &store)?;
+            let gguf_headers = chungus::gguf_headers(&m, &store)?;
             let entry = registry::Client::new(&registry)?
-                .publish_with_headers(&st, &manifest, headers)
+                .publish_with_headers(&st, &manifest, headers, gguf_headers)
                 .await?;
             println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
         }
