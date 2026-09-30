@@ -131,6 +131,25 @@ For each file, the hub serves it from its store if it has it. Otherwise it pulls
 
 `--offline` never contacts huggingface.co, `--upstream URL` points at a different Hub-compatible server, and `--peer URL` adds a hub by hand.
 
+## Ollama
+
+`chungus ollama` sits in front of a stock Ollama on its default port and fills pulls from LAN peers before the registry. `ollama pull`, `ollama run`, Open WebUI and anything else that talks to the Ollama API keep working with the same model names:
+
+```sh
+OLLAMA_HOST=127.0.0.1:11433 ollama serve     # move Ollama aside
+./target/release/chungus ollama              # takes 127.0.0.1:11434
+ollama pull llama3.2                         # blobs come from peers where they can
+```
+
+On each pull it fetches the manifest from registry.ollama.ai, writes every blob into `$OLLAMA_MODELS` (from this machine, then peers found over mDNS, then the registry), and forwards the pull, so Ollama finds the blobs in place and only writes the manifest. A second machine on the LAN pulls from the first, and a new tag of a model already held fetches only the chunks that differ.
+
+- **No second copy.** Ollama's blob files are the only copy of the weights. The store indexes them (a manifest, plus links to the files) at about 0.15% of the model's size, and serves peers from them. `ollama rm` or an edited file just drops the link; `chungus ollama gc` sweeps dead ones.
+- **Blobs always match their digest.** Chunks from peers are checked by BLAKE3 as they arrive and each blob by sha256 before Ollama can see it. A peer whose copy doesn't match isn't asked for that blob again.
+- **Offline**, pulls resolve a tag from this store, or from LAN peers when two agree on its digest (`--trust-peers` accepts one). The shim then writes the manifest itself.
+- **Public models only.** Models that need a login are left to Ollama and never shared.
+
+`chungus ollama pull <name>` does the same without a daemon, and `chungus ollama import` indexes models Ollama already has so this machine seeds them. [deploy/ollama](deploy/ollama) has a compose file and a systemd drop-in for the Linux service.
+
 No model handy? Generate a synthetic BF16 file:
 
 ```sh
@@ -345,7 +364,7 @@ On synthetic BF16 weights (normal distribution, 64M parameters), `bench` reports
 
 ## Manifest and store layout
 
-A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatures in `manifests/<root>.sigs.json`, and `meta/hub/...` records of cached Hub repos. A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that, including each chunk's hash and length, and is the value a publisher signs.
+A store holds `chunks/<hh>/<hash>` blobs, `manifests/<root>.json`, their signatures in `manifests/<root>.sigs.json`, `meta/hub/...` records of cached Hub repos, `meta/ollama/...` records of Ollama tags, and `links/<root>.json` for manifests whose files are kept elsewhere (Ollama's blobs). A manifest lists every file, its size and BLAKE3 hash, and the ordered chunks that rebuild it. Its `root` hash commits to all of that, including each chunk's hash and length, and is the value a publisher signs.
 
 Every format is versioned: manifests name theirs in `format`, a store records its layout in `VERSION`, each chunk blob starts with a version byte, and the swarm protocols carry a version in their ids. A newer chungus keeps reading older data, and an older one refuses newer data with a message to upgrade rather than misreading it. [docs/formats.md](docs/formats.md) lists every version and the rules for changing one; `chungus --version` shows what a binary speaks.
 
@@ -358,6 +377,7 @@ Every format is versioned: manifests name theirs in `format`, a store records it
 | **M3** (done) | Local cache that speaks the Hugging Face Hub API, so existing tools work via `HF_ENDPOINT` |
 | **M4** (done) | Signed models, internet swarm over libp2p with 64 MB block announcements, registry with a transparency log, search and blocklist |
 | Node limits (done) | Upload caps, connection and request limits, download-only mode, disjoint DHT lookups, subnet caps, registry-signed anchor nodes |
+| Ollama (done) | `chungus ollama`: a shim on Ollama's port that fills pulls from LAN peers, with no second copy on disk |
 | Lazy loading (done) | `chungus mount`: read models before they finish downloading, with layer-order prefetch |
 | Later | OCI images, dedicated nodes, voting, optional GPU-side decode straight into VRAM (in addition to the CPU SIMD path) |
 

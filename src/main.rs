@@ -12,6 +12,7 @@ use chungus::hub;
 use chungus::limits::{Limits, RateLimiter, RelayLimits};
 use chungus::manifest::{self, Manifest};
 use chungus::net::{self, FetchStats};
+use chungus::ollama;
 use chungus::p2p;
 use chungus::progress;
 use chungus::registry::{self, Claim, Statement};
@@ -119,6 +120,15 @@ enum Cmd {
         /// Don't advertise or discover peers over mDNS.
         #[arg(long)]
         no_mdns: bool,
+    },
+    /// Pull Ollama models from LAN peers first. With no subcommand, runs in front of
+    /// Ollama on its default port (start Ollama with OLLAMA_HOST=127.0.0.1:11433), so
+    /// `ollama pull` and every other client get blobs from peers with no other change.
+    Ollama {
+        #[command(subcommand)]
+        cmd: Option<OllamaCmd>,
+        #[command(flatten)]
+        args: OllamaArgs,
     },
     /// Download a model by manifest root or registry name from peers.
     Fetch {
@@ -478,6 +488,62 @@ fn hf_token() -> Option<String> {
 }
 
 /// Where to get a model from, shared by `fetch` and `mount`.
+#[derive(Subcommand)]
+enum OllamaCmd {
+    /// Run in front of Ollama (the default).
+    Serve,
+    /// Put a model's blobs and manifest into Ollama's models directory without a daemon.
+    Pull {
+        /// An Ollama model name, e.g. llama3.2:1b.
+        name: String,
+    },
+    /// Index models already in Ollama's models directory so this machine seeds them.
+    /// Nothing is copied. With no names, every model.
+    Import { names: Vec<String> },
+    /// Forget indexed blobs that Ollama has since deleted or changed.
+    Gc,
+}
+
+#[derive(clap::Args)]
+struct OllamaArgs {
+    #[arg(long, global = true, env = "CHUNGUS_STORE", default_value = DEFAULT_STORE)]
+    store: PathBuf,
+    /// Ollama's models directory [default: $OLLAMA_MODELS, else ~/.ollama/models, else
+    /// /usr/share/ollama/.ollama/models]
+    #[arg(long, global = true)]
+    models: Option<PathBuf>,
+    /// The registry for ollama.com names.
+    #[arg(long, global = true, default_value = ollama::DEFAULT_UPSTREAM)]
+    upstream: String,
+    /// Never contact a registry; pull only from this store and peers.
+    #[arg(long, global = true)]
+    offline: bool,
+    /// Offline, accept a tag's digest from a single peer (normally two must agree).
+    #[arg(long, global = true)]
+    trust_peers: bool,
+    /// A peer to use in addition to discovered ones, e.g. http://192.168.1.20:7447.
+    #[arg(long, global = true)]
+    peer: Vec<String>,
+    /// Don't advertise or discover peers over mDNS.
+    #[arg(long, global = true)]
+    no_mdns: bool,
+    /// Follow this registry's blocklist.
+    #[arg(long, global = true)]
+    blocklist: Option<String>,
+    /// The registry operator's public key, to pin when following its blocklist.
+    #[arg(long, global = true)]
+    operator: Option<String>,
+    /// Where the shim listens for Ollama clients.
+    #[arg(long, global = true, default_value = ollama::DEFAULT_LISTEN)]
+    listen: SocketAddr,
+    /// The real Ollama.
+    #[arg(long, global = true, default_value = ollama::DEFAULT_BACKEND)]
+    ollama: String,
+    /// Port for the peer API other machines fetch chunks from (all interfaces).
+    #[arg(long, global = true, default_value_t = net::DEFAULT_PORT)]
+    peer_port: u16,
+}
+
 #[derive(clap::Args)]
 struct FromArgs {
     #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
@@ -641,6 +707,167 @@ impl FromArgs {
         };
         p2p::Node::start(store.clone(), key, config).await
     }
+}
+
+/// Keep `set` up to date with `extra` plus peers found on the LAN, every 30 seconds.
+fn discover_forever(
+    own_id: String,
+    extra: Vec<String>,
+    set: impl Fn(Vec<String>) + Send + 'static,
+) {
+    tokio::spawn(async move {
+        loop {
+            let id = own_id.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                net::discover(Duration::from_secs(2), Some(&id))
+            })
+            .await;
+            if let Ok(Ok(found)) = found {
+                let mut peers = extra.clone();
+                peers.extend(found);
+                peers.sort();
+                peers.dedup();
+                set(peers);
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
+async fn run_ollama(cmd: OllamaCmd, a: OllamaArgs) -> Result<()> {
+    let store = Arc::new(Store::open(&a.store)?);
+    follow_blocklist(&store, a.blocklist.clone(), a.operator.clone())?;
+    let models = a.models.clone().unwrap_or_else(ollama::default_models);
+    let upstream = (!a.offline).then(|| a.upstream.clone());
+    let peers = match &cmd {
+        OllamaCmd::Pull { .. } if !a.no_mdns => {
+            let mut peers = a.peer.clone();
+            peers.extend(
+                tokio::task::spawn_blocking(|| net::discover(Duration::from_secs(2), None))
+                    .await??,
+            );
+            peers.sort();
+            peers.dedup();
+            peers
+        }
+        _ => a.peer.clone(),
+    };
+    let o = Arc::new(ollama::Ollama::new(
+        store.clone(),
+        models.clone(),
+        upstream,
+        peers,
+        a.trust_peers,
+    )?);
+    match cmd {
+        OllamaCmd::Pull { name } => {
+            let name = ollama::Name::parse(&name)?;
+            ollama::check_access(&models)?;
+            let progress = Arc::new(ollama::Progress::default());
+            let ticker = {
+                let progress = progress.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let (done, total) = progress
+                            .snapshot()
+                            .iter()
+                            .fold((0, 0), |(d, t), (_, total, c)| (d + c, t + total));
+                        eprint!("\rpulling {:.1} / {:.1} MB", mb(done), mb(total));
+                    }
+                })
+            };
+            let filled = o.fill(&name, &progress).await;
+            ticker.abort();
+            eprintln!();
+            let f = filled?;
+            o.write_tag(&name, &f.manifest_bytes)?;
+            let s = &f.stats;
+            println!(
+                "{name}: {} blobs, {} already present; {:.1} MB from this machine, {:.1} MB \
+                 from peers, {:.1} MB from the registry",
+                s.blobs,
+                s.present,
+                mb(s.local_bytes),
+                mb(s.peer_bytes),
+                mb(s.upstream_bytes)
+            );
+            println!("indexed as {}", f.root);
+        }
+        OllamaCmd::Import { names } => {
+            let names = names
+                .iter()
+                .map(|n| ollama::Name::parse(n))
+                .collect::<Result<Vec<_>>>()?;
+            let mut failed = 0;
+            for (name, result) in o.import(&names).await? {
+                match result {
+                    Ok(root) => println!("{name}: {root}"),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{name}: {e:#}");
+                    }
+                }
+            }
+            if failed > 0 {
+                bail!("{failed} model(s) not imported");
+            }
+        }
+        OllamaCmd::Gc => {
+            let n = store.gc_links()?;
+            println!("unlinked {n} file(s) that Ollama deleted or changed");
+        }
+        OllamaCmd::Serve => {
+            ollama::check_access(&models)?;
+            let listener = match tokio::net::TcpListener::bind(a.listen).await {
+                Ok(l) => l,
+                Err(e) => {
+                    let taken = reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(Duration::from_secs(2))
+                        .build()?
+                        .get(format!("http://{}/api/version", a.listen))
+                        .send()
+                        .await
+                        .is_ok_and(|r| r.status().is_success());
+                    if taken {
+                        bail!(
+                            "Ollama is already on {}. Restart it on another port with \
+                             OLLAMA_HOST={} ollama serve (or, for the Linux service, see \
+                             deploy/ollama), then run chungus ollama again",
+                            a.listen,
+                            a.ollama.trim_start_matches("http://")
+                        );
+                    }
+                    return Err(e).with_context(|| format!("bind {}", a.listen));
+                }
+            };
+            let peer_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, a.peer_port));
+            let peer_listener = tokio::net::TcpListener::bind(peer_addr)
+                .await
+                .with_context(|| format!("bind {peer_addr}"))?;
+            let id = net::node_id();
+            let _mdns = if a.no_mdns {
+                None
+            } else {
+                let o2 = o.clone();
+                discover_forever(id.clone(), a.peer.clone(), move |p| o2.set_peers(p));
+                Some(net::advertise(a.peer_port, &id)?)
+            };
+            let seeding = store.manifests()?.len();
+            tokio::spawn(net::serve_on(peer_listener, store.clone()));
+            println!(
+                "Ollama API on http://{} (forwarding to {}), peers on port {} ({} models in \
+                 the store)",
+                a.listen, a.ollama, a.peer_port, seeding
+            );
+            if a.offline {
+                println!("offline: pulls come only from this store and peers");
+            }
+            axum::serve(listener, ollama::router(o, &a.ollama)?).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolves on Ctrl-C, or on SIGTERM (what `docker stop` sends).
@@ -872,6 +1099,7 @@ async fn main() -> Result<()> {
             println!("use it with: export HF_ENDPOINT=http://localhost:{port}");
             axum::serve(listener, hub::router(hub)).await?;
         }
+        Cmd::Ollama { cmd, args } => run_ollama(cmd.unwrap_or(OllamaCmd::Serve), args).await?,
         Cmd::Fetch { root, output, from } => {
             let store = Arc::new(Store::open(&from.store)?);
             let key = from.swarm_key();
