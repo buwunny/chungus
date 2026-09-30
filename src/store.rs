@@ -308,6 +308,9 @@ struct Links {
     targets: Vec<Target>,
     /// Chunk hash -> (index into `targets`, offset, length). One location per chunk.
     chunks: HashMap<[u8; 32], (usize, u64, u32)>,
+    /// Modification time of `links/` when loaded, so links another process adds (a
+    /// `chungus ollama` next to a `chungus node` on the same store) are picked up.
+    dir_mtime: Option<std::time::SystemTime>,
 }
 
 struct Target {
@@ -675,9 +678,24 @@ impl Store {
         Ok(dropped)
     }
 
+    /// Reload the links if another process changed them since they were loaded.
+    fn refresh_links(&self) {
+        let now = fs::metadata(self.root.join("links"))
+            .and_then(|m| m.modified())
+            .ok();
+        if now.is_some() && now != self.links.read().unwrap().dir_mtime {
+            let _ = self.reload_links();
+        }
+    }
+
     /// Rebuild the in-memory chunk locations from the link records on disk.
     fn reload_links(&self) -> Result<()> {
-        let mut links = Links::default();
+        let mut links = Links {
+            dir_mtime: fs::metadata(self.root.join("links"))
+                .and_then(|m| m.modified())
+                .ok(),
+            ..Default::default()
+        };
         if let Ok(entries) = fs::read_dir(self.root.join("links")) {
             for entry in entries {
                 let name = entry?.file_name().to_string_lossy().into_owned();
@@ -725,6 +743,9 @@ impl Store {
         let Some(key) = hash_bytes(hash) else {
             return false;
         };
+        if !self.links.read().unwrap().chunks.contains_key(&key) {
+            self.refresh_links();
+        }
         let target = {
             let links = self.links.read().unwrap();
             let Some(&(t, _, _)) = links.chunks.get(&key) else {
@@ -750,6 +771,9 @@ impl Store {
     /// A linked chunk as a `Stored` blob, or None if no linked file holds it.
     fn read_linked(&self, hash: &str) -> Option<Result<Vec<u8>>> {
         let key = hash_bytes(hash)?;
+        if !self.links.read().unwrap().chunks.contains_key(&key) {
+            self.refresh_links();
+        }
         // A file that fails its checks is unlinked, and the next file holding the chunk
         // (if any) is tried.
         for _ in 0..8 {
@@ -825,6 +849,24 @@ impl Store {
     /// Small metadata records (Hub model info, file lists), keyed by relative path.
     pub fn put_meta(&self, key: &str, bytes: &[u8]) -> Result<()> {
         write_atomic(&self.meta_path(key)?, bytes)
+    }
+
+    /// Names of the metadata records directly under `dir` (a key prefix, without a
+    /// trailing `/`).
+    pub fn list_meta(&self, dir: &str) -> Vec<String> {
+        let Ok(path) = self.meta_path(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| is_meta_key(n))
+            .collect();
+        out.sort();
+        out
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Vec<u8>> {
@@ -934,6 +976,9 @@ mod tests {
         }]);
         store.put_manifest(&m).unwrap();
         assert!(!store.contains(&chunks[1].hash));
+        // Another process with the same store open.
+        let other = Store::open(&dir.path().join("store")).unwrap();
+        assert!(!other.contains(&chunks[0].hash));
         store
             .add_links(&m.root, vec![Link::new("blob", &file).unwrap()])
             .unwrap();
@@ -949,7 +994,8 @@ mod tests {
             let raw = decode(&store.get(&c.hash).unwrap(), c.len as usize).unwrap();
             assert_eq!(blake3::hash(&raw).to_hex().as_str(), c.hash);
         }
-        // Survives reopening.
+        // Survives reopening, and another open store picks up links added later.
+        assert!(other.contains(&chunks[0].hash));
         let store = Store::open(&dir.path().join("store")).unwrap();
         assert!(store.get(&chunks[0].hash).is_ok());
         assert_eq!(store.links(&m.root).len(), 1);

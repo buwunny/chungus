@@ -148,7 +148,13 @@ On each pull it fetches the manifest from registry.ollama.ai, writes every blob 
 - **Offline**, pulls resolve a tag from this store, or from LAN peers when two agree on its digest (`--trust-peers` accepts one). The shim then writes the manifest itself.
 - **Public models only.** Models that need a login are left to Ollama and never shared.
 
-`chungus ollama pull <name>` does the same without a daemon, and `chungus ollama import` indexes models Ollama already has so this machine seeds them. [deploy/ollama](deploy/ollama) has a compose file and a systemd drop-in for the Linux service.
+`chungus ollama pull <name>` does the same without a daemon, and `chungus ollama import` indexes models Ollama already has so this machine seeds them (and re-indexes models indexed before GGUF files were cut per tensor).
+
+Beyond the LAN:
+
+- **Swarm.** `--swarm` (or `--bootstrap ADDR`) also fetches chunks from internet peers. Machines running `chungus node` on the same store announce the Ollama models they hold, so others find them by manifest digest.
+- **Registry.** `chungus ollama registry` (port 11435) serves the Ollama registry API from the store and fills tags on demand, so a machine without chungus can `ollama pull --insecure host:11435/library/llama3.2`.
+- **Publishing.** `chungus ollama publish my-model --as org/my-model` signs a local model into the chungus registry under `org/my-model`, with the tag as revision. Anyone running the shim can then `ollama pull chungus.io/org/my-model:latest`. Models pulled from ollama.com are refused, so the registry never mirrors them. [deploy/ollama](deploy/ollama) has a compose file and a systemd drop-in for the Linux service.
 
 No model handy? Generate a synthetic BF16 file:
 

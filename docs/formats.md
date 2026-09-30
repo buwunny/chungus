@@ -10,11 +10,11 @@ network. `chungus --version` lists the versions a binary speaks.
 | Store layout | 1 | `<store>/VERSION` | stores made before the file existed (treated as 1) |
 | Chunk blob | 1 | first byte of every blob in `chunks/` | 2 (one zstd frame per byte plane; read now, written from the next release) |
 | Block id | `chungus/block/v1` | domain prefix of the block hash | |
-| Swarm requests | `/chungus/1` | libp2p protocol id | |
-| DHT | `/chungus/kad/1` | libp2p protocol id | |
+| Swarm requests | `/chungus/1` | libp2p protocol id (`Ollama` digest lookups answer with a manifest root; older nodes reject them and are skipped) | |
+| DHT | `/chungus/kad/1` | libp2p protocol id (provider keys: manifest roots, blocks, `ollama/sha256:<hex>` manifest digests) | |
 | Peer HTTP API (`serve`, `hub`, `ollama`) | `/v1/...` | URL prefix | |
 | Linked files | `links/<root>.json` in the store | JSON record (path, target, size, mtime) | ignored by older readers, which just don't serve those chunks |
-| Ollama records | `meta/ollama/tags/<host>/<ns>/<model>/<tag>.json`, `meta/ollama/digests/sha256-<hex>` | JSON record / manifest root | |
+| Ollama records | `meta/ollama/tags/<host>/<ns>/<model>/<tag>.json`, `meta/ollama/digests/sha256-<hex>` | JSON record (with `index`: 2 = GGUF cut per tensor) / manifest root | records without `index` (1), re-indexed by `chungus ollama import` |
 | Registry API | `/v1/...` | URL prefix | |
 | Registry statements and head | `chungus/registry-statement/v1`, `chungus/registry-head/v1` | signature domain prefix | |
 | Leaderboard messages | `chungus/node-registration/v1`, `chungus/receipt/v1`, `chungus/probe-report/v1`, `chungus/anchor-access/v1`, `chungus/hide-node/v1`, `chungus/daily-totals/v1` | signature domain prefix | |
