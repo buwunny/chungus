@@ -44,6 +44,9 @@ services:
     entrypoint: ["chungus", "registry"]
     environment:
       CHUNGUS_REGISTRY_DATA: /data/registry
+      # Only Caddy reaches the registry, and it sets X-Forwarded-For to the client's
+      # address, which download counts go by.
+      CHUNGUS_BEHIND_PROXY: "true"
     restart: unless-stopped
     init: true
     expose:

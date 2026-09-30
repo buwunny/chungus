@@ -14,6 +14,7 @@ use chungus::manifest::{self, Manifest};
 use chungus::net::{self, FetchStats};
 use chungus::ollama;
 use chungus::p2p;
+use chungus::progress;
 use chungus::registry::{self, Claim, Statement};
 use chungus::sign;
 use chungus::store::{self, Store};
@@ -70,6 +71,9 @@ enum Cmd {
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
+        /// Chunk every file whole, without splitting safetensors and GGUF per tensor.
+        #[arg(long)]
+        whole_files: bool,
     },
     /// Share this store with peers on the LAN (read-only HTTP, advertised over mDNS).
     Serve {
@@ -226,6 +230,10 @@ enum Cmd {
         /// With --relay-server: peers that may be reachable through this relay at once.
         #[arg(long, env = "CHUNGUS_RELAY_MAX_RESERVATIONS", default_value_t = RelayLimits::default().max_reservations)]
         relay_max_reservations: usize,
+        /// Serve Prometheus metrics (bytes served, requests, peers, ...) at
+        /// http://<addr>/metrics, e.g. 127.0.0.1:9101.
+        #[arg(long, env = "CHUNGUS_METRICS")]
+        metrics: Option<SocketAddr>,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -238,6 +246,11 @@ enum Cmd {
         data: PathBuf,
         #[arg(long, env = "CHUNGUS_REGISTRY_PORT", default_value_t = registry::DEFAULT_PORT)]
         port: u16,
+        /// The registry is only reachable through a reverse proxy (like the Caddy in
+        /// deploy/) that puts the client's address last in X-Forwarded-For. Download
+        /// counts then go by that address instead of the proxy's.
+        #[arg(long, env = "CHUNGUS_BEHIND_PROXY")]
+        behind_proxy: bool,
     },
     /// Give a model in the store a name (org/model[@rev]) in the registry, signed by you.
     Publish {
@@ -565,7 +578,7 @@ impl FromArgs {
         }
         let (name, rev) = registry::parse_ref(model)?;
         let entry = registry::Client::new(&self.registry)?
-            .resolve(&name, &rev)
+            .resolve_download(&name, &rev)
             .await?;
         let Claim::Publish { root, .. } = entry.statement.claim else {
             unreachable!("resolve returns publishes")
@@ -807,6 +820,21 @@ async fn run_ollama(cmd: OllamaCmd, a: OllamaArgs) -> Result<()> {
     Ok(())
 }
 
+/// Resolves on Ctrl-C, or on SIGTERM (what `docker stop` sends).
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn parse_keys(keys: &[String]) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
     keys.iter().map(|k| sign::parse_public_key(k)).collect()
 }
@@ -878,8 +906,12 @@ async fn main() -> Result<()> {
                 println!("{root}  {:>10.1} MB  {}", mb(size), names.join(", "));
             }
         }
-        Cmd::Bench { inputs, json } => {
-            let r = chungus::bench(&inputs)?;
+        Cmd::Bench {
+            inputs,
+            json,
+            whole_files,
+        } => {
+            let r = chungus::bench(&inputs, whole_files)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
@@ -1021,13 +1053,25 @@ async fn main() -> Result<()> {
         Cmd::Fetch { root, output, from } => {
             let store = Arc::new(Store::open(&from.store)?);
             let (root, trust) = from.resolve(&root, &store).await?;
-            let (manifest, s) = if from.over_swarm() {
+            let bar = progress::Bar::new();
+            let label = format!("fetching {}", &root[..12.min(root.len())]);
+            let result = if from.over_swarm() {
                 let node = from.swarm_node(&store).await?;
-                p2p::fetch(&node, &root, store.clone(), &trust, from.access()).await?
+                let display = progress::show(label, bar.progress());
+                let fetch = p2p::fetch(&node, &root, store.clone(), &trust, from.access());
+                let r = progress::track(bar, fetch).await;
+                progress::done(display, &r).await;
+                r
             } else {
                 let peers = from.lan_peers().await?;
-                net::fetch(&root, store.clone(), &peers, from.origin.as_deref(), &trust).await?
+                let display = progress::show(label, bar.progress());
+                let origin = from.origin.as_deref();
+                let fetch = net::fetch(&root, store.clone(), &peers, origin, &trust);
+                let r = progress::track(bar, fetch).await;
+                progress::done(display, &r).await;
+                r
             };
+            let (manifest, s) = result?;
             report_fetch(&s);
             if let Some(output) = output {
                 tokio::task::spawn_blocking(move || chungus::unpack(&manifest, &store, &output))
@@ -1075,16 +1119,29 @@ async fn main() -> Result<()> {
                     .local_bytes
                     .load(std::sync::atomic::Ordering::Relaxed)),
             );
-            let progress = {
+            let prefetching = {
                 let lazy = lazy.clone();
                 async move {
                     if prefetch == 0 {
                         return std::future::pending().await;
                     }
                     let started = std::time::Instant::now();
+                    let display = progress::show("prefetching", {
+                        let lazy = lazy.clone();
+                        move || {
+                            let local = lazy
+                                .stats
+                                .local_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            (local, lazy.total_bytes())
+                        }
+                    });
                     let ticker = async {
                         loop {
                             tokio::time::sleep(Duration::from_secs(5)).await;
+                            if display.is_some() {
+                                continue;
+                            }
                             let local = lazy
                                 .stats
                                 .local_bytes
@@ -1097,21 +1154,23 @@ async fn main() -> Result<()> {
                             );
                         }
                     };
-                    tokio::select! {
-                        r = lazy.prefetch(prefetch) => match r {
-                            Ok(()) => println!(
-                                "prefetch done in {:.1}s: the whole model is local",
-                                started.elapsed().as_secs_f64()
-                            ),
-                            Err(e) => eprintln!("prefetch stopped: {e:#}"),
-                        },
-                        _ = ticker => {}
+                    let r = tokio::select! {
+                        r = lazy.prefetch(prefetch) => r,
+                        _ = ticker => unreachable!(),
+                    };
+                    progress::done(display, &r).await;
+                    match r {
+                        Ok(()) => println!(
+                            "prefetch done in {:.1}s: the whole model is local",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => eprintln!("prefetch stopped: {e:#}"),
                     }
                     std::future::pending::<()>().await
                 }
             };
             tokio::select! {
-                _ = progress => {}
+                _ = prefetching => {}
                 r = tokio::signal::ctrl_c() => r?,
             }
             mounted.unmount()?;
@@ -1145,6 +1204,7 @@ async fn main() -> Result<()> {
             relay_circuit_mb,
             relay_circuit_secs,
             relay_max_reservations,
+            metrics,
         } => {
             let store = Arc::new(Store::open(&store)?);
             if let Some(url) = anchors_from {
@@ -1201,10 +1261,14 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 },
                 log: true,
+                metrics,
                 ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key, config).await?;
             println!("peer id {}", node.peer_id);
+            if let Some(addr) = metrics {
+                println!("metrics on http://{addr}/metrics");
+            }
             if download_only {
                 println!("download-only: serving and announcing nothing");
             } else {
@@ -1221,8 +1285,12 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
-        Cmd::Registry { data, port } => {
-            let reg = Arc::new(registry::Registry::open(&data)?);
+        Cmd::Registry {
+            data,
+            port,
+            behind_proxy,
+        } => {
+            let reg = Arc::new(registry::Registry::open(&data)?.behind_proxy(behind_proxy));
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -1249,7 +1317,25 @@ async fn main() -> Result<()> {
                      chungus delegate {online} --key <root key> --registry <this registry>"
                 ),
             }
-            axum::serve(listener, registry::router(reg)).await?;
+            // Download counts are kept in memory and written out every minute, and once
+            // more on the way out.
+            let saver = reg.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    every.tick().await;
+                    if let Err(e) = saver.save_downloads() {
+                        eprintln!("saving download counts: {e:#}");
+                    }
+                }
+            });
+            axum::serve(
+                listener,
+                registry::router(reg.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
+            reg.save_downloads()?;
         }
         Cmd::Publish {
             root,
@@ -1280,8 +1366,9 @@ async fn main() -> Result<()> {
             );
             let m = chungus::manifest::parse(&manifest)?;
             let headers = chungus::safetensors_headers(&m, &store)?;
+            let gguf_headers = chungus::gguf_headers(&m, &store)?;
             let entry = registry::Client::new(&registry)?
-                .publish_with_headers(&st, &manifest, headers)
+                .publish_with_headers(&st, &manifest, headers, gguf_headers)
                 .await?;
             println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
         }

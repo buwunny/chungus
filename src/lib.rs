@@ -1,11 +1,13 @@
 //! chungus: content-defined chunking + lossless float transform + zstd, over a
 //! content-addressed store.
 //!
-//! Pipeline for every file: split into segments (per tensor for safetensors), cut each
-//! segment with FastCDC, hash each raw chunk with BLAKE3, then store the chunk once,
-//! encoded with the smallest of {stored, zstd, byte-plane + zstd}.
+//! Pipeline for every file: split into segments (per tensor for safetensors and GGUF),
+//! cut each segment with FastCDC, hash each raw chunk with BLAKE3, then store the chunk
+//! once, encoded with the smallest of {stored, zstd, byte-plane + zstd}.
 
 pub mod chunk;
+pub mod downloads;
+pub mod gguf;
 pub mod hub;
 pub mod lazy;
 pub mod limits;
@@ -15,6 +17,7 @@ pub mod mount;
 pub mod net;
 pub mod ollama;
 pub mod p2p;
+pub mod progress;
 pub mod registry;
 pub mod safetensors;
 pub mod safety;
@@ -34,11 +37,15 @@ use manifest::{ChunkRef, FileEntry, Manifest};
 use segment::{Dtype, Segment};
 use store::Store;
 
-/// Segments for one file: per-tensor for safetensors, a single raw segment otherwise.
+/// Segments for one file: per tensor for safetensors and GGUF, a single raw segment
+/// otherwise, and for a GGUF file chungus can't parse.
 pub fn file_segments(path: &Path, data: &[u8]) -> Result<Vec<Segment>> {
-    if path.extension().is_some_and(|e| e == "safetensors")
-        && let Some(segs) = safetensors::segments(data)?
-    {
+    let segs = match path.extension().and_then(|e| e.to_str()) {
+        Some("safetensors") => safetensors::segments(data)?,
+        Some("gguf") => gguf::segments(data)?,
+        _ => None,
+    };
+    if let Some(segs) = segs {
         return Ok(segs);
     }
     Ok(vec![Segment {
@@ -181,6 +188,39 @@ pub fn safetensors_headers(
     Ok(out)
 }
 
+/// The header of every GGUF file in `manifest` through its tensor info and padding (see
+/// [`gguf::header_len`]), read from the leading chunks in `store`, hex-encoded and keyed
+/// by path, for the registry to check and count parameters from as it does
+/// [`safetensors_headers`]. Files whose header isn't in chunks of its own (packed by a
+/// chungus that didn't split GGUF) or that chungus can't parse are left out, as are all of
+/// them if together they would be more than a publish carries.
+pub fn gguf_headers(
+    manifest: &Manifest,
+    store: &Store,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut total = 0;
+    for f in manifest.files.iter().filter(|f| f.path.ends_with(".gguf")) {
+        let mut data = Vec::new();
+        for c in &f.chunks {
+            data.extend(store::decode(&store.get(&c.hash)?, c.len as usize)?);
+            match gguf::header_len(&data) {
+                Ok(None) => continue,
+                Ok(Some(n)) if n == data.len() => {
+                    total += 2 * n;
+                    out.insert(f.path.clone(), registry::to_hex(&data));
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+            break;
+        }
+    }
+    if total > registry::MAX_HEADERS / 2 {
+        out.clear();
+    }
+    Ok(out)
+}
+
 pub fn unpack(manifest: &Manifest, store: &Store, out: &Path) -> Result<()> {
     if !manifest.verify_root() {
         bail!("manifest root does not match its contents");
@@ -258,8 +298,10 @@ pub struct DtypeReport {
     pub encoded_bytes: u64,
 }
 
-/// Measure the pipeline on inputs without writing a store.
-pub fn bench(inputs: &[PathBuf]) -> Result<BenchReport> {
+/// Measure the pipeline on inputs without writing a store. With `whole_files`, every
+/// file is chunked as one raw segment, as if chungus didn't read weight formats, to show
+/// what splitting per tensor adds.
+pub fn bench(inputs: &[PathBuf], whole_files: bool) -> Result<BenchReport> {
     let mut r = BenchReport::default();
     let mut seen = HashSet::new();
     for input in inputs {
@@ -269,8 +311,17 @@ pub fn bench(inputs: &[PathBuf]) -> Result<BenchReport> {
         };
         for (path, _) in list_files(input)? {
             let data = read(&path)?;
+            let segments = if whole_files {
+                vec![Segment {
+                    start: 0,
+                    end: data.len() as u64,
+                    dtype: Dtype::Raw,
+                }]
+            } else {
+                file_segments(&path, &data)?
+            };
             let t = std::time::Instant::now();
-            let spans = chunk::chunk(&data, &file_segments(&path, &data)?);
+            let spans = chunk::chunk(&data, &segments);
             r.chunk_secs += t.elapsed().as_secs_f64();
 
             let t = std::time::Instant::now();

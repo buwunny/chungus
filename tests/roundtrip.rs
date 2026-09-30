@@ -127,7 +127,7 @@ fn bench_counts_each_input_against_the_ones_before() {
     }
     fs::write(tuned.join("model.safetensors"), bytes).unwrap();
 
-    let r = chungus::bench(&[base.clone(), tuned.clone()]).unwrap();
+    let r = chungus::bench(&[base.clone(), tuned.clone()], false).unwrap();
     assert_eq!(r.inputs.len(), 2);
     let (a, b) = (&r.inputs[0], &r.inputs[1]);
     assert_eq!(a.new_raw_bytes, a.raw_bytes);
@@ -143,7 +143,7 @@ fn bench_counts_each_input_against_the_ones_before() {
     assert!(bf16.encoded_bytes < bf16.zstd_bytes, "{bf16:?}");
 
     // The same model twice is entirely deduplicated.
-    let r = chungus::bench(&[base.clone(), base.clone()]).unwrap();
+    let r = chungus::bench(&[base.clone(), base.clone()], false).unwrap();
     assert_eq!(r.inputs[1].new_raw_bytes, 0);
 
     fs::remove_dir_all(&dir).unwrap();

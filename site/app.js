@@ -140,9 +140,11 @@ function count(x) {
 // Stats and files of the latest rev, from the registry's summary of its manifest. The
 // index snapshot deployed with the site has no summaries, so this can come back empty.
 async function renderSummary(name, root) {
-  let s;
+  // Download counts are optional: an older registry doesn't keep them.
+  const downloads = getJSON(`${registryUrl}/v1/downloads/${name}`).catch(() => null);
+  let s, d;
   try {
-    s = await getJSON(`${registryUrl}/v1/summary/${root}`);
+    [s, d] = await Promise.all([getJSON(`${registryUrl}/v1/summary/${root}`), downloads]);
   } catch {
     return;
   }
@@ -156,6 +158,7 @@ async function renderSummary(name, root) {
   const dtypes = Object.keys(s.dtypes || {});
   const tiles = [
     s.params != null ? ["Parameters", count(s.params), `${n(s.params)} exactly`] : null,
+    d && d.total ? ["Downloads", count(d.total), `${n(d.last_30_days)} in the last 30 days`] : null,
     ["Size", bytes(s.size), `${bytes(s.weights)} of weights`],
     [
       "Format",

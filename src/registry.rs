@@ -33,11 +33,13 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::downloads::{Downloads, ModelDownloads};
 use crate::sign::{self, Signature};
 use crate::store;
 
 pub const DEFAULT_PORT: u16 = 7450;
-pub const DEFAULT_URL: &str = "http://localhost:7450";
+/// The project's public registry. `--registry` or `CHUNGUS_REGISTRY` points elsewhere.
+pub const DEFAULT_URL: &str = "https://chungus.io";
 const STATEMENT_DOMAIN: &[u8] = b"chungus/registry-statement/v1\0";
 const HEAD_DOMAIN: &[u8] = b"chungus/registry-head/v1\0";
 const TICKET_DOMAIN: &[u8] = b"chungus/access-ticket/v1\0";
@@ -700,10 +702,12 @@ pub struct Summary {
     /// before compression.
     pub unique_bytes: u64,
     /// Parameters across the safetensors files, when the publisher sent every file's
-    /// header (see [`Registry::publish`]).
+    /// header (see [`Registry::publish`]). For a GGUF-only model, the parameters of one
+    /// quantization, when every quantization in it has the same count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<u64>,
-    /// Those parameters by dtype, e.g. `{"BF16": 3821079552}`.
+    /// Those parameters by dtype, e.g. `{"BF16": 3821079552}`, or by ggml type for a
+    /// model with a single GGUF quantization (`{"Q8_0": ..., "F32": ...}`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dtypes: BTreeMap<String, u64>,
     pub files: Vec<SummaryFile>,
@@ -716,8 +720,14 @@ pub struct SummaryFile {
 }
 
 impl Summary {
-    /// Summarize `m`, counting parameters from `headers` (checked with [`check_headers`]).
-    pub fn of(m: &crate::manifest::Manifest, headers: &BTreeMap<String, String>) -> Summary {
+    /// Summarize `m`, counting parameters from `headers` (checked with [`check_headers`])
+    /// or, failing that, from `gguf` (parameters per ggml type of each GGUF file, from
+    /// [`check_gguf_headers`]).
+    pub fn of(
+        m: &crate::manifest::Manifest,
+        headers: &BTreeMap<String, String>,
+        gguf: &BTreeMap<String, BTreeMap<String, u64>>,
+    ) -> Summary {
         let mut seen = HashSet::new();
         let (mut chunks, mut unique_bytes, mut weights) = (0, 0, 0);
         let mut formats = std::collections::BTreeSet::new();
@@ -754,11 +764,12 @@ impl Summary {
             .iter()
             .filter(|f| f.path.ends_with(".safetensors"))
             .count();
+        let mut params = (!dtypes.is_empty()).then(|| dtypes.values().sum());
         if counted < shards || shards == 0 {
-            dtypes.clear();
+            (params, dtypes) = gguf_params(m, gguf);
         }
         Summary {
-            params: (!dtypes.is_empty()).then(|| dtypes.values().sum()),
+            params,
             dtypes,
             size: m.files.iter().map(|f| f.size).sum(),
             weights,
@@ -778,6 +789,65 @@ impl Summary {
     }
 }
 
+/// The parameters of a model's GGUF files, from each file's counts in `gguf`.
+///
+/// A GGUF repo usually holds one model in several quantizations, each a file (or a set
+/// of shards named `...-00001-of-00003.gguf`), so summing every file would multiply the
+/// count. Each set is counted on its own, and there is no count unless every set was
+/// counted in full and all agree. Counts per type are given only for a single set, since
+/// the quantizations' types differ.
+fn gguf_params(
+    m: &crate::manifest::Manifest,
+    gguf: &BTreeMap<String, BTreeMap<String, u64>>,
+) -> (Option<u64>, BTreeMap<String, u64>) {
+    let none = (None, BTreeMap::new());
+    let mut sets: BTreeMap<&str, (u32, Vec<&str>)> = BTreeMap::new();
+    for f in m.files.iter().filter(|f| f.path.ends_with(".gguf")) {
+        let (key, total) = gguf_shard(&f.path).unwrap_or((&f.path, 1));
+        sets.entry(key)
+            .or_insert((total, Vec::new()))
+            .1
+            .push(&f.path);
+    }
+    let mut counts = Vec::new();
+    for (total, files) in sets.values() {
+        if files.len() != *total as usize {
+            return none;
+        }
+        let mut set = BTreeMap::new();
+        for path in files {
+            let Some(p) = gguf.get(*path) else {
+                return none;
+            };
+            for (ty, n) in p {
+                *set.entry(ty.clone()).or_default() += n;
+            }
+        }
+        counts.push(set);
+    }
+    let total = |c: &BTreeMap<String, u64>| c.values().sum::<u64>();
+    match counts.as_slice() {
+        [one] => (Some(total(one)), one.clone()),
+        [first, rest @ ..] if rest.iter().all(|c| total(c) == total(first)) => {
+            (Some(total(first)), BTreeMap::new())
+        }
+        _ => none,
+    }
+}
+
+/// For a shard named `<stem>-00001-of-00003.gguf`, its set (the path up to the shard
+/// number) and the set's number of shards.
+fn gguf_shard(path: &str) -> Option<(&str, u32)> {
+    let rest = path.strip_suffix(".gguf")?;
+    let (rest, total) = rest.rsplit_once("-of-")?;
+    let (stem, index) = rest.rsplit_once('-')?;
+    let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(index) || !digits(total) {
+        return None;
+    }
+    Some((stem, total.parse().ok()?))
+}
+
 /// Check that each of `headers` (safetensors header JSON by path) is exactly the start
 /// of that file in `m`: prefixed with its length, it must split into the file's leading
 /// chunks and hash to them. Packing puts a header in chunks of its own, so this holds for
@@ -794,28 +864,99 @@ pub fn check_headers(
             .with_context(|| format!("{path} isn't a safetensors file of this model"))?;
         let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
         bytes.extend_from_slice(json.as_bytes());
-        let mut at = 0;
-        for c in &f.chunks {
-            if at == bytes.len() {
-                break;
-            }
-            let end = at + c.len as usize;
-            let ok = bytes
-                .get(at..end)
-                .is_some_and(|b| blake3::hash(b).to_hex().as_str() == c.hash);
-            if !ok {
-                bail!("the header sent for {path} doesn't match its chunks");
-            }
-            at = end;
-        }
-        if at != bytes.len() {
-            bail!("the header sent for {path} is longer than the file");
-        }
+        check_prefix(f, &bytes)?;
     }
     Ok(())
 }
 
+/// Check that each of `headers` (a GGUF file's header through its tensor info and
+/// padding, hex-encoded, by path) is exactly the start of that file in `m`, as
+/// [`check_headers`] does for safetensors, and return the parameters per ggml type each
+/// lists.
+pub fn check_gguf_headers(
+    m: &crate::manifest::Manifest,
+    headers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, BTreeMap<String, u64>>> {
+    let mut out = BTreeMap::new();
+    for (path, hex) in headers {
+        let f = m
+            .files
+            .iter()
+            .find(|f| &f.path == path && path.ends_with(".gguf"))
+            .with_context(|| format!("{path} isn't a GGUF file of this model"))?;
+        let bytes =
+            from_hex(hex).with_context(|| format!("the header sent for {path} isn't hex"))?;
+        check_prefix(f, &bytes)?;
+        if crate::gguf::header_len(&bytes)? != Some(bytes.len()) {
+            bail!("the header sent for {path} isn't a whole GGUF header");
+        }
+        let p =
+            crate::gguf::params(&bytes).with_context(|| format!("the header sent for {path}"))?;
+        out.insert(path.clone(), p);
+    }
+    Ok(out)
+}
+
+/// Check that `bytes` split into `f`'s leading chunks and hash to them.
+fn check_prefix(f: &crate::manifest::FileEntry, bytes: &[u8]) -> Result<()> {
+    let path = &f.path;
+    let mut at = 0;
+    for c in &f.chunks {
+        if at == bytes.len() {
+            break;
+        }
+        let end = at + c.len as usize;
+        let ok = bytes
+            .get(at..end)
+            .is_some_and(|b| blake3::hash(b).to_hex().as_str() == c.hash);
+        if !ok {
+            bail!("the header sent for {path} doesn't match its chunks");
+        }
+        at = end;
+    }
+    if at != bytes.len() {
+        bail!("the header sent for {path} is longer than the file");
+    }
+    Ok(())
+}
+
+/// Hex-encode `bytes`, as GGUF headers travel in a [`Publication`].
+pub fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
+        .collect()
+}
+
 // ---------- server ----------
+
+/// A JSON map kept beside a manifest, or an empty one if there is none.
+fn read_json<T: serde::de::DeserializeOwned + Default>(path: &FsPath) -> T {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn write_json(path: &FsPath, value: &impl Serialize) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec(value)?)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 /// A registry backed by a directory: `log.jsonl` (one entry per line), the operator's
 /// public root key in `operator.pub`, signing keys (see [`Registry::open`]), and
@@ -831,12 +972,20 @@ pub struct Registry {
     manifests: PathBuf,
     /// `<root>.json` for each model whose publisher sent its safetensors headers.
     headers: PathBuf,
+    /// `<root>.json` for each model whose publisher sent GGUF headers: the parameters
+    /// per ggml type they list, by path (the headers themselves aren't kept).
+    gguf: PathBuf,
     /// Roots whose manifest the registry holds and has checked (see [`crate::safety`]),
     /// with a summary of each. Only these are listed in search and the index.
     checked: RwLock<HashMap<String, Arc<Summary>>>,
     /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
     hf: String,
     http: reqwest::Client,
+    downloads: Downloads,
+    /// Whether requests come through a reverse proxy that puts the client's address last
+    /// in `X-Forwarded-For` (Caddy does). Otherwise that header is ignored, since
+    /// clients could set it to anything.
+    behind_proxy: bool,
 }
 
 pub const DEFAULT_HF: &str = "https://huggingface.co";
@@ -855,6 +1004,11 @@ pub const DEFAULT_DELEGATION_DAYS: u64 = 90;
 
 /// Largest manifest the registry accepts: about a 1 TB model.
 pub const MAX_MANIFEST: usize = 256 << 20;
+
+/// Largest total of headers (safetensors JSON and hex-encoded GGUF) a publish carries
+/// beside its manifest. A GGUF header is mostly the tokenizer, repeated in every
+/// quantization: 5.9 MB, or 11.8 MB as hex, for each file of Qwen2.5 0.5B.
+pub const MAX_HEADERS: usize = 256 << 20;
 
 impl Registry {
     /// Open the registry in `dir`, creating it if new.
@@ -919,6 +1073,9 @@ impl Registry {
         fs::create_dir_all(&manifests)?;
         let headers = dir.join("headers");
         fs::create_dir_all(&headers)?;
+        let gguf = dir.join("gguf");
+        fs::create_dir_all(&gguf)?;
+        let downloads = Downloads::open(&dir.join("downloads.json"))?;
         let mut checked = HashMap::new();
         for e in fs::read_dir(&manifests)? {
             let e = e?;
@@ -928,11 +1085,9 @@ impl Registry {
             {
                 let m = crate::manifest::parse(&fs::read(e.path())?)
                     .with_context(|| format!("{}", e.path().display()))?;
-                let h = match fs::read(headers.join(&name)) {
-                    Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
-                    Err(_) => BTreeMap::new(),
-                };
-                checked.insert(root.to_string(), Arc::new(Summary::of(&m, &h)));
+                let h = read_json(&headers.join(&name));
+                let g = read_json(&gguf.join(&name));
+                checked.insert(root.to_string(), Arc::new(Summary::of(&m, &h, &g)));
             }
         }
         Ok(Registry {
@@ -943,11 +1098,14 @@ impl Registry {
             file: Mutex::new(file),
             manifests,
             headers,
+            gguf,
             checked: RwLock::new(checked),
             hf: DEFAULT_HF.into(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
+            downloads,
+            behind_proxy: false,
         })
     }
 
@@ -966,6 +1124,22 @@ impl Registry {
     pub fn with_hf(mut self, url: &str) -> Registry {
         self.hf = url.trim_end_matches('/').to_string();
         self
+    }
+
+    /// Take the client's address from the last `X-Forwarded-For` entry, for a registry
+    /// only reachable through a reverse proxy that sets it.
+    pub fn behind_proxy(mut self, yes: bool) -> Registry {
+        self.behind_proxy = yes;
+        self
+    }
+
+    pub fn downloads(&self) -> &Downloads {
+        &self.downloads
+    }
+
+    /// Write download counts to disk if they changed. Call it now and then, and on exit.
+    pub fn save_downloads(&self) -> Result<()> {
+        self.downloads.save()
     }
 
     /// Issue a ticket for `req.peer` to download `req.root`, if Hugging Face says the
@@ -1065,12 +1239,14 @@ impl Registry {
     /// verify, and it must list only files chungus carries (no pickles). The registry keeps
     /// the manifest, so anyone can see what a name contains before fetching it.
     /// Publish `st` with the manifest it names, and optionally the header JSON of each
-    /// safetensors file (by path), from which the model page counts parameters.
+    /// safetensors file and the header of each GGUF file (hex; both by path), from
+    /// which the model page counts parameters.
     pub fn publish(
         &self,
         st: Statement,
         manifest: &[u8],
         headers: &BTreeMap<String, String>,
+        gguf_headers: &BTreeMap<String, String>,
     ) -> Result<Entry> {
         let Claim::Publish { root, .. } = &st.claim else {
             bail!("not a publish statement");
@@ -1081,6 +1257,7 @@ impl Registry {
         }
         crate::safety::check_manifest(&m)?;
         check_headers(&m, headers)?;
+        let gguf = check_gguf_headers(&m, gguf_headers)?;
         // Check the statement before writing anything, so strangers can't fill the disk.
         self.log.lock().unwrap().check(&st)?;
         let path = self.manifests.join(format!("{root}.json"));
@@ -1089,17 +1266,16 @@ impl Registry {
         fs::rename(&tmp, &path)?;
         // Republishing a model without headers keeps the ones sent before.
         if !headers.is_empty() {
-            let path = self.headers.join(format!("{root}.json"));
-            let tmp = path.with_extension("tmp");
-            fs::write(&tmp, serde_json::to_vec(headers)?)?;
-            fs::rename(&tmp, &path)?;
+            write_json(&self.headers.join(format!("{root}.json")), headers)?;
+        }
+        if !gguf.is_empty() {
+            write_json(&self.gguf.join(format!("{root}.json")), &gguf)?;
         }
         let entry = self.submit(st)?;
-        let headers = match fs::read(self.headers.join(format!("{}.json", m.root))) {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
-            Err(_) => BTreeMap::new(),
-        };
-        let summary = Arc::new(Summary::of(&m, &headers));
+        let name = format!("{}.json", m.root);
+        let headers = read_json(&self.headers.join(&name));
+        let gguf = read_json(&self.gguf.join(&name));
+        let summary = Arc::new(Summary::of(&m, &headers, &gguf));
         self.checked.write().unwrap().insert(m.root, summary);
         Ok(entry)
     }
@@ -1159,7 +1335,12 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 
 /// `POST /v1/statements`, `POST /v1/publish`, `GET /v1/manifests/{root}`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
 /// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
-/// `GET /v1/owners/{org}`, `GET /v1/anchors` and `POST /v1/access`.
+/// `GET /v1/owners/{org}`, `GET /v1/anchors`, `POST /v1/access`, `GET /v1/downloads` and
+/// `GET /v1/downloads/{org}/{model}`.
+///
+/// `GET /v1/resolve/...?download=1` also counts a download of the name (see
+/// [`crate::downloads`]). Serve with `into_make_service_with_connect_info::<SocketAddr>()`
+/// so the client's address is known; without it, nothing is counted.
 ///
 /// Everything it serves is public and signed, so any web page may read it: responses
 /// allow every origin. Browsers can't submit statements, since there is no CORS
@@ -1170,7 +1351,7 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route(
             "/v1/publish",
             post(publish).layer(axum::extract::DefaultBodyLimit::max(
-                MAX_MANIFEST + (1 << 16),
+                MAX_MANIFEST + MAX_HEADERS + (1 << 16),
             )),
         )
         .route("/v1/manifests/{root}", get(manifest))
@@ -1183,6 +1364,8 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/v1/owners/{org}", get(owners))
         .route("/v1/anchors", get(anchors))
         .route("/v1/access", post(access))
+        .route("/v1/downloads", get(download_totals))
+        .route("/v1/downloads/{org}/{model}", get(model_downloads))
         .layer(axum::middleware::map_response(allow_any_origin))
         .with_state(reg)
 }
@@ -1222,6 +1405,11 @@ pub struct Publication {
     /// manifest's chunks.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Header of each GGUF file through its tensor info (see
+    /// [`crate::gguf::header_len`]), hex-encoded, by path. Optional; checked like
+    /// `headers`. Registries that predate it ignore it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gguf_headers: BTreeMap<String, String>,
 }
 
 async fn publish(
@@ -1229,7 +1417,12 @@ async fn publish(
     axum::Json(p): axum::Json<Publication>,
 ) -> Response {
     match tokio::task::spawn_blocking(move || {
-        reg.publish(p.statement, p.manifest.as_bytes(), &p.headers)
+        reg.publish(
+            p.statement,
+            p.manifest.as_bytes(),
+            &p.headers,
+            &p.gguf_headers,
+        )
     })
     .await
     {
@@ -1291,13 +1484,41 @@ async fn log_entries(State(reg): State<Arc<Registry>>, Query(p): Query<Page>) ->
     axum::Json(page).into_response()
 }
 
+#[derive(Deserialize)]
+struct ResolveQuery {
+    #[serde(default)]
+    download: u8,
+}
+
+/// The address of the client that sent `req`, if it can be trusted.
+fn client_ip(reg: &Registry, req: &axum::extract::Request) -> Option<std::net::IpAddr> {
+    if reg.behind_proxy {
+        // The proxy appends the address it saw; anything before it came from the client.
+        let xff = req.headers().get("x-forwarded-for")?.to_str().ok()?;
+        return xff.rsplit(',').next()?.trim().parse().ok();
+    }
+    let info = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()?;
+    Some(info.0.ip())
+}
+
 async fn resolve(
     State(reg): State<Arc<Registry>>,
     Path((org, model, rev)): Path<(String, String, String)>,
+    Query(q): Query<ResolveQuery>,
+    req: axum::extract::Request,
 ) -> Response {
     let name = format!("{org}/{model}");
     match reg.with_log(|log| log.resolve(&name, &rev).cloned()) {
-        Some(entry) => axum::Json(entry).into_response(),
+        Some(entry) => {
+            if q.download == 1
+                && let Some(ip) = client_ip(&reg, &req)
+            {
+                reg.downloads.count(&name, ip, now());
+            }
+            axum::Json(entry).into_response()
+        }
         None => err(
             StatusCode::NOT_FOUND,
             format!("{name}@{rev} is not published"),
@@ -1309,6 +1530,17 @@ async fn resolve(
 struct SearchQuery {
     #[serde(default)]
     q: String,
+}
+
+async fn model_downloads(
+    State(reg): State<Arc<Registry>>,
+    Path((org, model)): Path<(String, String)>,
+) -> Response {
+    axum::Json(reg.downloads.of(&format!("{org}/{model}"), now())).into_response()
+}
+
+async fn download_totals(State(reg): State<Arc<Registry>>) -> Response {
+    axum::Json(reg.downloads.totals(now())).into_response()
 }
 
 async fn search(State(reg): State<Arc<Registry>>, Query(q): Query<SearchQuery>) -> Response {
@@ -1420,22 +1652,25 @@ impl Client {
 
     /// Publish a model with its manifest (see [`Registry::publish`]).
     pub async fn publish(&self, st: &Statement, manifest: &[u8]) -> Result<Entry> {
-        self.publish_with_headers(st, manifest, BTreeMap::new())
+        self.publish_with_headers(st, manifest, BTreeMap::new(), BTreeMap::new())
             .await
     }
 
-    /// [`Client::publish`], also sending safetensors headers (see
-    /// [`crate::safetensors_headers`]) so the registry can count parameters.
+    /// [`Client::publish`], also sending safetensors and GGUF headers (see
+    /// [`crate::safetensors_headers`] and [`crate::gguf_headers`]) so the registry can
+    /// count parameters.
     pub async fn publish_with_headers(
         &self,
         st: &Statement,
         manifest: &[u8],
         headers: BTreeMap<String, String>,
+        gguf_headers: BTreeMap<String, String>,
     ) -> Result<Entry> {
         let body = Publication {
             statement: st.clone(),
             manifest: String::from_utf8(manifest.to_vec()).context("manifest isn't UTF-8")?,
             headers,
+            gguf_headers,
         };
         let resp = self
             .http
@@ -1467,7 +1702,23 @@ impl Client {
 
     /// The entry that currently defines `name@rev`, with its signature checked.
     pub async fn resolve(&self, name: &str, rev: &str) -> Result<Entry> {
-        let entry: Entry = self.get(&format!("/v1/resolve/{name}/{rev}")).await?;
+        self.resolve_at(&format!("/v1/resolve/{name}/{rev}"), name, rev)
+            .await
+    }
+
+    /// [`Client::resolve`], counting a download of `name` in the registry's stats.
+    pub async fn resolve_download(&self, name: &str, rev: &str) -> Result<Entry> {
+        self.resolve_at(&format!("/v1/resolve/{name}/{rev}?download=1"), name, rev)
+            .await
+    }
+
+    /// How often `name` has been downloaded, as counted by [`Client::resolve_download`].
+    pub async fn downloads(&self, name: &str) -> Result<ModelDownloads> {
+        self.get(&format!("/v1/downloads/{name}")).await
+    }
+
+    async fn resolve_at(&self, path: &str, name: &str, rev: &str) -> Result<Entry> {
+        let entry: Entry = self.get(path).await?;
         match &entry.statement.claim {
             Claim::Publish {
                 name: n,
@@ -1655,6 +1906,43 @@ pub fn follow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gguf_shards_count_as_one_set() {
+        assert_eq!(
+            gguf_shard("q4/m-Q4_K_M-00002-of-00003.gguf"),
+            Some(("q4/m-Q4_K_M", 3))
+        );
+        assert_eq!(gguf_shard("m-q4_k_m.gguf"), None);
+        assert_eq!(gguf_shard("m-2-of-3.gguf"), None);
+
+        let file = |path: &str| crate::manifest::FileEntry {
+            path: path.into(),
+            size: 0,
+            hash: String::new(),
+            chunks: vec![],
+        };
+        let counts = |n| BTreeMap::from([("Q4_K".to_string(), n)]);
+        let m = crate::manifest::Manifest::new(vec![
+            file("m-00001-of-00002.gguf"),
+            file("m-00002-of-00002.gguf"),
+            file("m-q8_0.gguf"),
+        ]);
+        let mut gguf = BTreeMap::from([
+            ("m-00001-of-00002.gguf".to_string(), counts(60)),
+            ("m-00002-of-00002.gguf".to_string(), counts(40)),
+            ("m-q8_0.gguf".to_string(), counts(100)),
+        ]);
+        assert_eq!(gguf_params(&m, &gguf), (Some(100), BTreeMap::new()));
+        // A shard's count missing: no count at all.
+        gguf.remove("m-00002-of-00002.gguf");
+        assert_eq!(gguf_params(&m, &gguf).0, None);
+        // A shard missing from the model: no count either.
+        let m = crate::manifest::Manifest::new(vec![file("m-00001-of-00002.gguf")]);
+        assert_eq!(gguf_params(&m, &gguf).0, None);
+        assert_eq!(from_hex(&to_hex(b"\x00\xffab")).unwrap(), b"\x00\xffab");
+        assert_eq!(from_hex("0g"), None);
+    }
 
     fn key(dir: &FsPath, name: &str) -> SigningKey {
         sign::generate_key(&dir.join(name)).unwrap()

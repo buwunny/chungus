@@ -22,10 +22,9 @@ curl -L https://github.com/buwunny/chungus/releases/download/$v/chungus-$v-$t.ta
 sudo mv chungus-$v-$t/chungus /usr/local/bin/ && chungus --version
 ```
 
-**2. Find a model and download it** from the swarm. Every chunk is checked against its hash, and the publisher's signature is required:
+**2. Find a model and download it** from the swarm. Names come from the public registry at chungus.io (set `CHUNGUS_REGISTRY` to use another). Every chunk is checked against its hash, and the publisher's signature is required:
 
 ```sh
-export CHUNGUS_REGISTRY=https://<the registry's address>
 chungus search llama
 chungus fetch acme/tiny-llama --swarm -o tiny-llama/
 ```
@@ -56,7 +55,7 @@ model files ─► segments ─► FastCDC chunks ─► BLAKE3 ─► float tra
               (per tensor)   (~64 KiB)       (raw bytes)  (exponent split)
 ```
 
-1. **Segments.** Safetensors files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
+1. **Segments.** Safetensors and GGUF files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
 2. **Content-defined chunking.** FastCDC cuts each segment into chunks of 16–256 KiB (64 KiB average). Cut points inside float tensors are rounded to whole elements.
 3. **Hashing.** Each chunk is addressed by the BLAKE3 hash of its *raw* bytes. Identical chunks are stored once, across files and across models.
 4. **Float transform.** For BF16 and F32 tensors, each element is rearranged into an exponent byte and sign+mantissa bytes, then grouped into planes. Exponents are low-entropy and compress well. This is lossless: unpacking gives back the exact bits. The split and unshuffle run SIMD kernels (SSSE3 on x86-64, NEON on ARM) at 4 to 9 GB/s per core, faster than zstd decodes; `cargo run --release --example transform_speed` measures them.
@@ -107,6 +106,8 @@ One machine packs a model and serves its store. It advertises itself over mDNS, 
 ```
 
 `fetch` downloads only the chunks it doesn't already have, so a second model that shares chunks with the first transfers less, and an interrupted fetch picks up where it stopped. Every chunk is checked against its BLAKE3 hash on arrival. A peer that sends bad data is skipped and the chunk is taken from the next peer. With several peers, chunks are spread across them. `--peer http://host:7447` adds a peer by hand (for networks that block multicast), and `--origin URL` names a server to use only when no peer has a chunk. `chungus list` shows the models in a store.
+
+While a download runs in a terminal, a bunny hops along a progress bar, jumping cacti like the Chrome dinosaur game, with the percentage, speed and time left beside it (`mount --prefetch` shows it too). It draws on stderr only when that is a terminal; `CHUNGUS_NO_PROGRESS=1` turns it off.
 
 `serve` exposes the store read-only over plain HTTP to anyone who can reach the port. Run it only on networks you trust; encrypted, authenticated transport comes with the internet milestone.
 
@@ -204,6 +205,8 @@ A node behind NAT is reached through its relay, and the two ends then try to hol
 
 `node` logs what it connects to, so you can tell it joined: `connected to bootstrap <peer>`, `joined the DHT`, and with `--relay`, `relay reservation accepted by <peer>` followed by a `/p2p-circuit` address that others can reach you at. `could not reach bootstrap <peer>: <error>` means the bootstrap node's port is closed or the address is wrong. The public node logs a line for each peer that connects to it.
 
+`--metrics 127.0.0.1:9101` serves counters in Prometheus format at `/metrics`: bytes served, requests, requests answered busy, connected peers, and circuits relayed. They start from zero whenever the node restarts.
+
 ### Limits and attack resistance
 
 A node is someone's desktop, so it protects its owner. `--max-upload <MB/s>` caps upload bandwidth (on `serve` too), `--max-connections`, `--max-requests-per-peer` and `--max-uploads` bound how many peers and requests it serves at once (a peer over its share is told to come back later), and `--download-only` fetches through the swarm without serving or announcing anything. A one-off `chungus fetch` is always download-only.
@@ -278,9 +281,11 @@ chungus audit --operator chungus1<operator key>
 
 The registry operator can block a model's root or a single chunk hash (`chungus block <hash> --key operator.key`), so re-packing a banned model with a small change is still caught by its chunks. Nodes that follow the blocklist (`--blocklist <registry url>` on `serve`, `hub` and `node`) delete blocked data, stop announcing it and refuse to serve or store it. Blocks are log entries too, so they are public and auditable.
 
+The registry also counts downloads. Peers move the bytes, so it counts what it can see: `chungus fetch` and `chungus mount` looking up a name (`chungus resolve` doesn't count). Each model counts at most once per client network (IPv4 /24 or IPv6 /48) per UTC day, so re-running a fetch or looping on the endpoint adds at most one a day, and inflating a count takes many networks. No addresses are stored: a network is remembered only as a hash under a random key, and both are discarded at the end of the day. `GET /v1/downloads/<org>/<model>` returns a model's total and last-30-day counts, and `GET /v1/downloads` the totals across models with a count per day. The counts live in `downloads.json` in the data directory and are saved every minute and on shutdown. Behind a reverse proxy, pass `--behind-proxy` so counts go by the client's address in `X-Forwarded-For`. Without the flag that header is ignored, since a client could set it to anything.
+
 ### A public registry and website
 
-`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
+`site/` is a static website for a registry: a landing page with install commands, live numbers and recently published models, and a model search (`search.html`) that downloads the list of published models (`GET /v1/index`) and searches it in the browser. Each model's page shows its parameters, downloads, size, format and files, its revisions, and the commands to fetch or mount it. The registry allows cross-origin reads, so the site can live anywhere, but it only talks to a registry over HTTPS.
 
 To run a public registry on the same server as the public node, with the website on the same domain, HTTPS only (Caddy gets the certificate, redirects HTTP to HTTPS and sends HSTS):
 
@@ -291,7 +296,7 @@ docker compose --profile registry up -d
 docker compose logs registry   # the operator key: nodes pin it with --operator
 ```
 
-Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log and keys live in the `registry-data` volume.
+Open TCP ports 80 and 443 (and UDP 443 for HTTP/3). The registry's log, keys and download counts live in the `registry-data` volume.
 
 ### Keeping the operator key offline
 
