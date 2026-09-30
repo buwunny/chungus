@@ -13,6 +13,7 @@ use chungus::limits::{Limits, RateLimiter, RelayLimits};
 use chungus::manifest::{self, Manifest};
 use chungus::net::{self, FetchStats};
 use chungus::p2p;
+use chungus::progress;
 use chungus::registry::{self, Claim, Statement};
 use chungus::sign;
 use chungus::store::{self, Store};
@@ -793,13 +794,25 @@ async fn main() -> Result<()> {
         Cmd::Fetch { root, output, from } => {
             let store = Arc::new(Store::open(&from.store)?);
             let (root, trust) = from.resolve(&root, &store).await?;
-            let (manifest, s) = if from.over_swarm() {
+            let bar = progress::Bar::new();
+            let label = format!("fetching {}", &root[..12.min(root.len())]);
+            let result = if from.over_swarm() {
                 let node = from.swarm_node(&store).await?;
-                p2p::fetch(&node, &root, store.clone(), &trust, from.access()).await?
+                let display = progress::show(label, bar.progress());
+                let fetch = p2p::fetch(&node, &root, store.clone(), &trust, from.access());
+                let r = progress::track(bar, fetch).await;
+                progress::done(display, &r).await;
+                r
             } else {
                 let peers = from.lan_peers().await?;
-                net::fetch(&root, store.clone(), &peers, from.origin.as_deref(), &trust).await?
+                let display = progress::show(label, bar.progress());
+                let origin = from.origin.as_deref();
+                let fetch = net::fetch(&root, store.clone(), &peers, origin, &trust);
+                let r = progress::track(bar, fetch).await;
+                progress::done(display, &r).await;
+                r
             };
+            let (manifest, s) = result?;
             report_fetch(&s);
             if let Some(output) = output {
                 tokio::task::spawn_blocking(move || chungus::unpack(&manifest, &store, &output))
@@ -847,16 +860,29 @@ async fn main() -> Result<()> {
                     .local_bytes
                     .load(std::sync::atomic::Ordering::Relaxed)),
             );
-            let progress = {
+            let prefetching = {
                 let lazy = lazy.clone();
                 async move {
                     if prefetch == 0 {
                         return std::future::pending().await;
                     }
                     let started = std::time::Instant::now();
+                    let display = progress::show("prefetching", {
+                        let lazy = lazy.clone();
+                        move || {
+                            let local = lazy
+                                .stats
+                                .local_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            (local, lazy.total_bytes())
+                        }
+                    });
                     let ticker = async {
                         loop {
                             tokio::time::sleep(Duration::from_secs(5)).await;
+                            if display.is_some() {
+                                continue;
+                            }
                             let local = lazy
                                 .stats
                                 .local_bytes
@@ -869,21 +895,23 @@ async fn main() -> Result<()> {
                             );
                         }
                     };
-                    tokio::select! {
-                        r = lazy.prefetch(prefetch) => match r {
-                            Ok(()) => println!(
-                                "prefetch done in {:.1}s: the whole model is local",
-                                started.elapsed().as_secs_f64()
-                            ),
-                            Err(e) => eprintln!("prefetch stopped: {e:#}"),
-                        },
-                        _ = ticker => {}
+                    let r = tokio::select! {
+                        r = lazy.prefetch(prefetch) => r,
+                        _ = ticker => unreachable!(),
+                    };
+                    progress::done(display, &r).await;
+                    match r {
+                        Ok(()) => println!(
+                            "prefetch done in {:.1}s: the whole model is local",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => eprintln!("prefetch stopped: {e:#}"),
                     }
                     std::future::pending::<()>().await
                 }
             };
             tokio::select! {
-                _ = progress => {}
+                _ = prefetching => {}
                 r = tokio::signal::ctrl_c() => r?,
             }
             mounted.unmount()?;
