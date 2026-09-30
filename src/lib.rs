@@ -8,6 +8,7 @@
 pub mod chunk;
 pub mod hub;
 pub mod lazy;
+pub mod leaderboard;
 pub mod limits;
 pub mod manifest;
 #[cfg(target_os = "linux")]

@@ -39,7 +39,7 @@ fn from_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-fn to_hex(b: &[u8]) -> String {
+pub fn to_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

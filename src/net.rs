@@ -198,6 +198,8 @@ pub struct FetchStats {
     pub already_local: usize,
     /// Compressed bytes received from each source that served at least one chunk.
     pub bytes_by_source: BTreeMap<String, u64>,
+    /// Chunks received from each of those sources.
+    pub chunks_by_source: BTreeMap<String, u64>,
     /// Chunks a source sent that failed verification.
     pub rejected: usize,
     pub secs: f64,
@@ -416,6 +418,7 @@ where
 
     for r in results {
         let (source, bytes, rejected) = r?;
+        *stats.chunks_by_source.entry(source.clone()).or_default() += 1;
         *stats.bytes_by_source.entry(source).or_default() += bytes;
         stats.rejected += rejected;
     }

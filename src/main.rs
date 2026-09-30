@@ -216,6 +216,19 @@ enum Cmd {
         /// With --relay-server: peers that may be reachable through this relay at once.
         #[arg(long, env = "CHUNGUS_RELAY_MAX_RESERVATIONS", default_value_t = RelayLimits::default().max_reservations)]
         relay_max_reservations: usize,
+        /// List this node on the registry's leaderboard under this display name. It
+        /// registers every 24 hours and is ranked only on what others can confirm:
+        /// anchors' probes and downloaders' receipts.
+        #[arg(long, env = "CHUNGUS_LEADERBOARD")]
+        leaderboard: Option<String>,
+        /// The registry to register with and to submit downloaders' receipts to.
+        /// Default: the --blocklist registry. Without either, receipts are refused.
+        #[arg(long, env = "CHUNGUS_REGISTRY")]
+        registry: Option<String>,
+        /// Probe the registry's listed nodes for the leaderboard, from a separate
+        /// download-only identity. Only counts for the registry's anchor nodes.
+        #[arg(long, env = "CHUNGUS_PROBE")]
+        probe: bool,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -228,6 +241,11 @@ enum Cmd {
         data: PathBuf,
         #[arg(long, env = "CHUNGUS_REGISTRY_PORT", default_value_t = registry::DEFAULT_PORT)]
         port: u16,
+        /// The registry is reachable only through a reverse proxy (like deploy/'s Caddy),
+        /// so take each client's address, for counting downloads, from the last
+        /// X-Forwarded-For entry. Never set this on a registry clients can reach directly.
+        #[arg(long, env = "CHUNGUS_BEHIND_PROXY")]
+        behind_proxy: bool,
     },
     /// Give a model in the store a name (org/model[@rev]) in the registry, signed by you.
     Publish {
@@ -335,6 +353,20 @@ enum Cmd {
         root: String,
         /// The Hugging Face repo, e.g. meta-llama/Llama-3.2-1B. Omit to lift the gate.
         repo: Option<String>,
+        /// The operator's root key, or the registry's online key (online.key) while
+        /// delegated.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+        registry: String,
+    },
+    /// Hide a node's display name on the leaderboard, keeping its numbers (or show it
+    /// again with --unhide). Operator only.
+    HideNode {
+        /// The node's peer id.
+        peer: String,
+        #[arg(long)]
+        unhide: bool,
         /// The operator's root key, or the registry's online key (online.key) while
         /// delegated.
         #[arg(long)]
@@ -470,6 +502,11 @@ struct FromArgs {
     /// With --swarm, don't join through the project's public node.
     #[arg(long, env = "CHUNGUS_NO_DEFAULT_BOOTSTRAP")]
     no_default_bootstrap: bool,
+    /// Don't sign receipts for the peers that served this download. Receipts credit
+    /// them on the registry's leaderboard and carry nothing but this download's one-run
+    /// peer id.
+    #[arg(long, env = "CHUNGUS_NO_RECEIPTS")]
+    no_receipts: bool,
 }
 
 impl FromArgs {
@@ -486,20 +523,34 @@ impl FromArgs {
         })
     }
 
+    /// The one-run identity for a swarm download, made before the name lookup so the
+    /// lookup can be bound to it (see [`FromArgs::resolve`]).
+    fn swarm_key(&self) -> Option<libp2p::identity::Keypair> {
+        self.over_swarm()
+            .then(libp2p::identity::Keypair::generate_ed25519)
+    }
+
     /// The manifest root for `model` (a root or a registry name) and the keys that must
     /// have signed it. A name trusts its publisher, and syncs the registry's blocklist.
+    /// The lookup counts as a download; unless `--no-receipts`, it is bound to `key`, the
+    /// swarm download's identity, so the receipts it signs are credited. Returns whether
+    /// it was.
     async fn resolve(
         &self,
         model: &str,
         store: &Store,
-    ) -> Result<(String, Vec<ed25519_dalek::VerifyingKey>)> {
+        key: Option<&libp2p::identity::Keypair>,
+    ) -> Result<(String, Vec<ed25519_dalek::VerifyingKey>, bool)> {
         let mut trust = parse_keys(&self.trust)?;
         if store::is_hash(model) {
-            return Ok((model.to_string(), trust));
+            return Ok((model.to_string(), trust, false));
         }
         let (name, rev) = registry::parse_ref(model)?;
+        let peer = key
+            .filter(|_| !self.no_receipts)
+            .map(|k| k.public().to_peer_id().to_string());
         let entry = registry::Client::new(&self.registry)?
-            .resolve(&name, &rev)
+            .resolve_download(&name, &rev, peer.as_deref())
             .await?;
         let Claim::Publish { root, .. } = entry.statement.claim else {
             unreachable!("resolve returns publishes")
@@ -512,7 +563,7 @@ impl FromArgs {
         registry::Follower::new(&self.registry, None)?
             .sync(store)
             .await?;
-        Ok((root, trust))
+        Ok((root, trust, peer.is_some()))
     }
 
     /// `--peer`s plus, unless `--no-mdns`, peers found on the LAN.
@@ -536,7 +587,11 @@ impl FromArgs {
 
     /// A download-only swarm node joined through `--bootstrap` and, with `--swarm`, the
     /// project's public node and the registry's anchors.
-    async fn swarm_node(&self, store: &Arc<Store>) -> Result<p2p::Node> {
+    async fn swarm_node(
+        &self,
+        store: &Arc<Store>,
+        key: libp2p::identity::Keypair,
+    ) -> Result<p2p::Node> {
         let mut bootstrap = self.bootstrap.clone();
         let mut anchors = Vec::new();
         if self.swarm {
@@ -559,9 +614,9 @@ impl FromArgs {
                 );
             }
         }
-        // A fresh identity: a one-off download needs none of its own, and reusing the
-        // store's would clash with a node serving the same store (and skip it as "self").
-        let key = libp2p::identity::Keypair::generate_ed25519();
+        // `key` is a fresh identity: a one-off download needs none of its own, and reusing
+        // the store's would clash with a node serving the same store (and skip it as
+        // "self").
         let config = p2p::Config {
             listen: vec![
                 "/ip4/0.0.0.0/tcp/0".parse()?,
@@ -792,10 +847,15 @@ async fn main() -> Result<()> {
         }
         Cmd::Fetch { root, output, from } => {
             let store = Arc::new(Store::open(&from.store)?);
-            let (root, trust) = from.resolve(&root, &store).await?;
-            let (manifest, s) = if from.over_swarm() {
-                let node = from.swarm_node(&store).await?;
-                p2p::fetch(&node, &root, store.clone(), &trust, from.access()).await?
+            let key = from.swarm_key();
+            let (root, trust, bound) = from.resolve(&root, &store, key.as_ref()).await?;
+            let (manifest, s) = if let Some(key) = key {
+                let node = from.swarm_node(&store, key).await?;
+                let (m, s) = p2p::fetch(&node, &root, store.clone(), &trust, from.access()).await?;
+                if bound {
+                    p2p::send_receipts(&node, &root, &p2p::served_by(&s)).await;
+                }
+                (m, s)
             } else {
                 let peers = from.lan_peers().await?;
                 net::fetch(&root, store.clone(), &peers, from.origin.as_deref(), &trust).await?
@@ -815,12 +875,19 @@ async fn main() -> Result<()> {
             from,
         } => {
             let store = Arc::new(Store::open(&from.store)?);
-            let (root, trust) = from.resolve(&model, &store).await?;
+            let key = from.swarm_key();
+            let (root, trust, bound) = from.resolve(&model, &store, key.as_ref()).await?;
+            // The swarm's sources, when receipts are to be sent for what they serve.
+            let mut receipts: Option<Arc<p2p::ModelSources>> = None;
             let (manifest, source): (Manifest, Arc<dyn chungus::lazy::ChunkSource>) =
-                if from.over_swarm() {
-                    let node = from.swarm_node(&store).await?;
+                if let Some(key) = key {
+                    let node = from.swarm_node(&store, key).await?;
                     let (m, s) = p2p::prepare(&node, &root, &store, &trust, from.access()).await?;
-                    (m, Arc::new(s))
+                    let s = Arc::new(s);
+                    if bound {
+                        receipts = Some(s.clone());
+                    }
+                    (m, s)
                 } else {
                     let client = net::client()?;
                     let peers = from.lan_peers().await?;
@@ -882,12 +949,29 @@ async fn main() -> Result<()> {
                     std::future::pending::<()>().await
                 }
             };
+            // Receipts every few minutes while prefetching, since a mount can run for days.
+            let every_few_minutes = {
+                let receipts = receipts.clone();
+                async move {
+                    let Some(sources) = receipts else {
+                        return std::future::pending().await;
+                    };
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(300)).await;
+                        sources.send_receipts().await;
+                    }
+                }
+            };
             tokio::select! {
                 _ = progress => {}
+                _ = every_few_minutes => {}
                 r = tokio::signal::ctrl_c() => r?,
             }
             mounted.unmount()?;
             println!("unmounted");
+            if let Some(sources) = receipts {
+                sources.send_receipts().await;
+            }
         }
         #[cfg(not(target_os = "linux"))]
         Cmd::Mount { .. } => bail!(
@@ -917,8 +1001,12 @@ async fn main() -> Result<()> {
             relay_circuit_mb,
             relay_circuit_secs,
             relay_max_reservations,
+            leaderboard,
+            registry,
+            probe,
         } => {
             let store = Arc::new(Store::open(&store)?);
+            let registry = registry.or_else(|| blocklist.clone());
             if let Some(url) = anchors_from {
                 let found = registry::Client::new(&url)?
                     .anchors(operator.as_deref())
@@ -928,6 +1016,24 @@ async fn main() -> Result<()> {
             }
             follow_blocklist(&store, blocklist, operator)?;
             let key = p2p::load_or_create_identity(&store.dir().join("node.key"))?;
+            if let Some(name) = &leaderboard
+                && !chungus::leaderboard::valid_display_name(name)
+            {
+                bail!(
+                    "--leaderboard takes a display name of 1 to {} printable characters",
+                    chungus::leaderboard::MAX_NAME
+                );
+            }
+            if (leaderboard.is_some() || probe) && registry.is_none() {
+                bail!("--leaderboard and --probe need a --registry (or --blocklist)");
+            }
+            // Receipts downloaders hand this node go to the registry, and are kept as
+            // proof of the node's work.
+            let receipts = registry.clone().map(|url| {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                chungus::leaderboard::forward_receipts(url, rx, store.dir().join("receipts.json"));
+                tx
+            });
             let listen = if listen.is_empty() {
                 vec![
                     format!("/ip4/0.0.0.0/tcp/{}", p2p::DEFAULT_PORT).parse()?,
@@ -949,6 +1055,27 @@ async fn main() -> Result<()> {
             } else {
                 relay
             };
+            // Probes go out from a separate download-only identity, so a node can't tell
+            // them from any other download and answer only those.
+            let prober = if probe {
+                let config = p2p::Config {
+                    listen: vec![
+                        "/ip4/0.0.0.0/tcp/0".parse()?,
+                        "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
+                    ],
+                    bootstrap: bootstrap.clone(),
+                    anchors: anchor.clone(),
+                    limits: Limits {
+                        download_only: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let fresh = libp2p::identity::Keypair::generate_ed25519();
+                Some(p2p::Node::start(store.clone(), fresh, config).await?)
+            } else {
+                None
+            };
             let config = p2p::Config {
                 listen,
                 bootstrap,
@@ -957,6 +1084,7 @@ async fn main() -> Result<()> {
                 public,
                 relay_server,
                 anchors: anchor,
+                receipts,
                 limits: Limits {
                     upload_bytes_per_sec: max_upload.map(mb_per_sec).transpose()?,
                     max_connections,
@@ -975,8 +1103,15 @@ async fn main() -> Result<()> {
                 log: true,
                 ..Default::default()
             };
-            let node = p2p::Node::start(store.clone(), key, config).await?;
+            let node = p2p::Node::start(store.clone(), key.clone(), config).await?;
             println!("peer id {}", node.peer_id);
+            if let (Some(name), Some(url)) = (leaderboard, &registry) {
+                chungus::leaderboard::register_loop(url.clone(), key.clone(), name, store.clone());
+            }
+            if let (Some(prober), Some(url)) = (prober, &registry) {
+                println!("probing {url}'s listed nodes as {}", prober.peer_id);
+                chungus::leaderboard::probe_loop(url.clone(), key, prober);
+            }
             if download_only {
                 println!("download-only: serving and announcing nothing");
             } else {
@@ -993,8 +1128,12 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
-        Cmd::Registry { data, port } => {
-            let reg = Arc::new(registry::Registry::open(&data)?);
+        Cmd::Registry {
+            data,
+            port,
+            behind_proxy,
+        } => {
+            let reg = Arc::new(registry::Registry::open(&data)?.with_behind_proxy(behind_proxy));
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -1021,7 +1160,7 @@ async fn main() -> Result<()> {
                      chungus delegate {online} --key <root key> --registry <this registry>"
                 ),
             }
-            axum::serve(listener, registry::router(reg)).await?;
+            registry::serve(listener, reg).await?;
         }
         Cmd::Publish {
             root,
@@ -1223,6 +1362,19 @@ async fn main() -> Result<()> {
                     println!("{a}");
                 }
             }
+        }
+        Cmd::HideNode {
+            peer,
+            unhide,
+            key,
+            registry,
+        } => {
+            let k = sign::load_key(&key)?;
+            registry::Client::new(&registry)?
+                .hide(&chungus::leaderboard::Hide::new(&k, &peer, !unhide))
+                .await?;
+            let verb = if unhide { "showed" } else { "hid" };
+            println!("{verb} {peer}'s name on the leaderboard");
         }
         Cmd::Keygen { key } => {
             let path = key_path(key)?;

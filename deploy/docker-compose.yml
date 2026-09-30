@@ -44,6 +44,8 @@ services:
     entrypoint: ["chungus", "registry"]
     environment:
       CHUNGUS_REGISTRY_DATA: /data/registry
+      # Only Caddy can reach it, so count downloads by the address Caddy forwards.
+      CHUNGUS_BEHIND_PROXY: "true"
     restart: unless-stopped
     init: true
     expose:

@@ -837,6 +837,10 @@ pub struct Registry {
     /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
     hf: String,
     http: reqwest::Client,
+    /// Registrations, probes, receipts and download counts (see [`crate::leaderboard`]).
+    board: Mutex<crate::leaderboard::Board>,
+    /// Take client addresses from `X-Forwarded-For` (see [`Registry::behind_proxy`]).
+    behind_proxy: bool,
 }
 
 pub const DEFAULT_HF: &str = "https://huggingface.co";
@@ -948,6 +952,49 @@ impl Registry {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
+            board: Mutex::new(crate::leaderboard::Board::open(dir)?),
+            behind_proxy: false,
+        })
+    }
+
+    /// Take each client's address from the last `X-Forwarded-For` entry, which a reverse
+    /// proxy in front of the registry adds. Only for a registry that can't be reached
+    /// except through such a proxy: otherwise clients could claim any address.
+    pub fn with_behind_proxy(mut self, on: bool) -> Registry {
+        self.behind_proxy = on;
+        self
+    }
+
+    pub fn behind_proxy(&self) -> bool {
+        self.behind_proxy
+    }
+
+    pub fn board<T>(&self, f: impl FnOnce(&mut crate::leaderboard::Board) -> T) -> T {
+        f(&mut self.board.lock().unwrap())
+    }
+
+    /// The peer ids of the operator's anchor nodes, which run the leaderboard's probes.
+    pub fn anchor_peers(&self) -> HashSet<String> {
+        self.with_log(|log| match log.anchors().map(|e| &e.statement.claim) {
+            Some(Claim::Anchors { addrs }) => addrs
+                .iter()
+                .filter_map(|a| valid_anchor(a).ok())
+                .filter_map(|a| match a.iter().last() {
+                    Some(libp2p::multiaddr::Protocol::P2p(p)) => Some(p.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => HashSet::new(),
+        })
+    }
+
+    /// Sign the leaderboard's finished days and save its state. [`serve`] does this every
+    /// minute.
+    pub fn flush(&self) -> Result<()> {
+        let key = self.operator_key().cloned();
+        self.board(|b| {
+            b.finalize(now(), key.as_ref())?;
+            b.save()
         })
     }
 
@@ -1159,7 +1206,8 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 
 /// `POST /v1/statements`, `POST /v1/publish`, `GET /v1/manifests/{root}`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
 /// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
-/// `GET /v1/owners/{org}`, `GET /v1/anchors` and `POST /v1/access`.
+/// `GET /v1/owners/{org}`, `GET /v1/anchors` and `POST /v1/access`, plus the
+/// leaderboard's routes (see [`crate::leaderboard`]).
 ///
 /// Everything it serves is public and signed, so any web page may read it: responses
 /// allow every origin. Browsers can't submit statements, since there is no CORS
@@ -1183,8 +1231,31 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .route("/v1/owners/{org}", get(owners))
         .route("/v1/anchors", get(anchors))
         .route("/v1/access", post(access))
+        .merge(crate::leaderboard::routes())
         .layer(axum::middleware::map_response(allow_any_origin))
         .with_state(reg)
+}
+
+/// Serve [`router`] on `listener`, with each connection's address (for counting
+/// downloads) and the leaderboard's state saved every minute.
+pub async fn serve(listener: tokio::net::TcpListener, reg: Arc<Registry>) -> std::io::Result<()> {
+    let r = reg.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let r = r.clone();
+            match tokio::task::spawn_blocking(move || r.flush()).await {
+                Ok(Err(e)) => eprintln!("leaderboard: {e:#}"),
+                Err(e) => eprintln!("leaderboard: {e}"),
+                Ok(Ok(())) => {}
+            }
+        }
+    });
+    axum::serve(
+        listener,
+        router(reg).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 async fn allow_any_origin(mut resp: Response) -> Response {
@@ -1291,13 +1362,37 @@ async fn log_entries(State(reg): State<Arc<Registry>>, Query(p): Query<Page>) ->
     axum::Json(page).into_response()
 }
 
+/// `?download=1` marks a lookup made to download the model, which the registry counts;
+/// `peer` names the downloader's one-run peer id, so its receipts can be credited.
+#[derive(Deserialize)]
+struct ResolveQuery {
+    #[serde(default)]
+    download: Option<String>,
+    #[serde(default)]
+    peer: Option<String>,
+}
+
 async fn resolve(
     State(reg): State<Arc<Registry>>,
     Path((org, model, rev)): Path<(String, String, String)>,
+    Query(q): Query<ResolveQuery>,
+    headers: axum::http::HeaderMap,
+    conn: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
 ) -> Response {
     let name = format!("{org}/{model}");
     match reg.with_log(|log| log.resolve(&name, &rev).cloned()) {
-        Some(entry) => axum::Json(entry).into_response(),
+        Some(entry) => {
+            if q.download.as_deref() == Some("1")
+                && let Claim::Publish { root, .. } = &entry.statement.claim
+                && let Some(ip) =
+                    crate::leaderboard::client_ip(&reg, &headers, conn.as_ref().map(|c| &c.0))
+            {
+                let cap = reg.summary(root).map(|s| s.unique_bytes).unwrap_or(0);
+                let network = crate::leaderboard::network_of(ip);
+                reg.board(|b| b.count_lookup(now(), root, &network, q.peer.as_deref(), cap));
+            }
+            axum::Json(entry).into_response()
+        }
         None => err(
             StatusCode::NOT_FOUND,
             format!("{name}@{rev} is not published"),
@@ -1467,7 +1562,28 @@ impl Client {
 
     /// The entry that currently defines `name@rev`, with its signature checked.
     pub async fn resolve(&self, name: &str, rev: &str) -> Result<Entry> {
-        let entry: Entry = self.get(&format!("/v1/resolve/{name}/{rev}")).await?;
+        self.lookup(name, rev, &format!("/v1/resolve/{name}/{rev}"))
+            .await
+    }
+
+    /// [`Client::resolve`] for a download, which the registry counts. `peer` binds the
+    /// lookup to the downloader's one-run peer id, so the registry credits the receipts it
+    /// signs (see [`crate::leaderboard`]).
+    pub async fn resolve_download(
+        &self,
+        name: &str,
+        rev: &str,
+        peer: Option<&str>,
+    ) -> Result<Entry> {
+        let mut path = format!("/v1/resolve/{name}/{rev}?download=1");
+        if let Some(p) = peer {
+            path.push_str(&format!("&peer={p}"));
+        }
+        self.lookup(name, rev, &path).await
+    }
+
+    async fn lookup(&self, name: &str, rev: &str, path: &str) -> Result<Entry> {
+        let entry: Entry = self.get(path).await?;
         match &entry.statement.claim {
             Claim::Publish {
                 name: n,
@@ -1479,6 +1595,84 @@ impl Client {
             }
             _ => Err(anyhow!("the registry sent a bad entry for {name}@{rev}")),
         }
+    }
+
+    async fn post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(body)?)
+            .send()
+            .await
+            .with_context(|| format!("reach the registry at {}", self.base))?;
+        let status = resp.status();
+        let body = resp.bytes().await?;
+        if !status.is_success() {
+            bail!(
+                "registry refused ({status}): {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        Ok(body.to_vec())
+    }
+
+    /// Register a node for the leaderboard, or refresh its registration.
+    pub async fn register(&self, r: &crate::leaderboard::Registration) -> Result<()> {
+        self.post("/v1/nodes", r).await.map(drop)
+    }
+
+    /// Registered nodes, for probing.
+    pub async fn nodes(&self) -> Result<Vec<crate::leaderboard::Listing>> {
+        self.get("/v1/nodes").await
+    }
+
+    /// Submit receipts downloaders handed this node. Returns how many were credited.
+    pub async fn receipts(&self, rs: &[crate::leaderboard::Receipt]) -> Result<usize> {
+        let v: serde_json::Value = serde_json::from_slice(&self.post("/v1/receipts", rs).await?)?;
+        Ok(v["credited"].as_u64().unwrap_or(0) as usize)
+    }
+
+    /// Report probe results (anchors only). Returns how many were counted.
+    pub async fn probes(&self, rep: &crate::leaderboard::ProbeReport) -> Result<usize> {
+        let v: serde_json::Value = serde_json::from_slice(&self.post("/v1/probes", rep).await?)?;
+        Ok(v["counted"].as_u64().unwrap_or(0) as usize)
+    }
+
+    /// A ticket for an anchor's probing node to get past a model's gate.
+    pub async fn anchor_access(
+        &self,
+        req: &crate::leaderboard::AnchorAccess,
+    ) -> Result<AccessTicket> {
+        Ok(serde_json::from_slice(
+            &self.post("/v1/anchor-access", req).await?,
+        )?)
+    }
+
+    /// Hide or show a node's display name (operator only).
+    pub async fn hide(&self, h: &crate::leaderboard::Hide) -> Result<()> {
+        self.post("/v1/nodes/hide", h).await.map(drop)
+    }
+
+    /// The manifest the registry holds for `root`, checked against it.
+    pub async fn manifest(&self, root: &str) -> Result<crate::manifest::Manifest> {
+        if !store::is_hash(root) {
+            bail!("{root:?} is not a manifest root");
+        }
+        let resp = self
+            .http
+            .get(format!("{}/v1/manifests/{root}", self.base))
+            .send()
+            .await
+            .with_context(|| format!("reach the registry at {}", self.base))?;
+        if !resp.status().is_success() {
+            bail!("no manifest for {root}: {}", resp.status());
+        }
+        let m = crate::manifest::parse(&resp.bytes().await?)?;
+        if m.root != root || !m.verify_root() {
+            bail!("the registry sent a manifest that doesn't match {root}");
+        }
+        Ok(m)
     }
 
     pub async fn index(&self) -> Result<Vec<Hit>> {
