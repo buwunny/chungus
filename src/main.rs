@@ -24,7 +24,7 @@ use chungus::store::{self, Store};
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nmanifest: chungus/manifest/v2 (also reads v1)",
-    "\nstore: v1, chunk blobs: v1",
+    "\nstore: v1, chunk blobs: v1 (also reads v2)",
     "\nwire: /chungus/1, /chungus/kad/1, HTTP /v1",
 );
 
@@ -418,6 +418,44 @@ enum Cmd {
     },
 }
 
+/// Sign manifest `root` (in `store`) and publish it as `name@rev`.
+#[allow(clippy::too_many_arguments)]
+async fn publish(
+    store: &Store,
+    root: &str,
+    name: &str,
+    rev: &str,
+    description: String,
+    gated_by: Option<String>,
+    key: Option<PathBuf>,
+    registry: &str,
+) -> Result<()> {
+    let manifest = store
+        .get_manifest_bytes(root)
+        .context("publish a model that is in your store (see `chungus list`)")?;
+    let k = sign::load_key(&key_path(key)?)?;
+    // Sign the manifest too, so peers can prove it came from the name's owner.
+    store.add_signatures(root, &[sign::sign(&k, root)])?;
+    let st = Statement::new(
+        &k,
+        Claim::Publish {
+            name: name.to_string(),
+            rev: rev.to_string(),
+            root: root.to_string(),
+            description,
+            gated: gated_by,
+        },
+    );
+    let m = chungus::manifest::parse(&manifest)?;
+    let headers = chungus::safetensors_headers(&m, store)?;
+    let gguf_headers = chungus::gguf_headers(&m, store)?;
+    let entry = registry::Client::new(registry)?
+        .publish_with_headers(&st, &manifest, headers, gguf_headers)
+        .await?;
+    println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
+    Ok(())
+}
+
 fn key_path(key: Option<PathBuf>) -> Result<PathBuf> {
     match key {
         Some(k) => Ok(k),
@@ -502,6 +540,28 @@ enum OllamaCmd {
     Import { names: Vec<String> },
     /// Forget indexed blobs that Ollama has since deleted or changed.
     Gc,
+    /// Serve this machine's Ollama models as a registry, for machines that can't run
+    /// the shim: `ollama pull --insecure <host>:11435/library/llama3.2`. Models it lacks
+    /// are pulled first.
+    Registry {
+        #[arg(long, default_value_t = 11435)]
+        port: u16,
+    },
+    /// Publish a model you made (`ollama create`) to the chungus registry, so others can
+    /// `ollama pull chungus.io/<org>/<model>:<tag>` through the shim. Models from
+    /// ollama.com are refused: they are already pinned by ollama.com.
+    Publish {
+        /// The Ollama model, e.g. my-assistant:latest.
+        model: String,
+        /// The registry name, org/model. Its tag becomes the model's tag.
+        #[arg(long = "as")]
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Signing key (default: ~/.chungus/key).
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -542,6 +602,19 @@ struct OllamaArgs {
     /// Port for the peer API other machines fetch chunks from (all interfaces).
     #[arg(long, global = true, default_value_t = net::DEFAULT_PORT)]
     peer_port: u16,
+    /// The chungus registry, for chungus.io/... names and the swarm's anchors.
+    #[arg(long, global = true, env = "CHUNGUS_REGISTRY", default_value = registry::DEFAULT_URL)]
+    registry: String,
+    /// Also find models on the internet swarm (joining through the project's public node
+    /// and the registry's anchors). Seed with `chungus node` on the same store.
+    #[arg(long, global = true)]
+    swarm: bool,
+    /// Join the swarm through this node instead. Repeatable.
+    #[arg(long, global = true, env = "CHUNGUS_BOOTSTRAP", value_delimiter = ',')]
+    bootstrap: Vec<Multiaddr>,
+    /// With --swarm, don't join through the project's public node.
+    #[arg(long, global = true, env = "CHUNGUS_NO_DEFAULT_BOOTSTRAP")]
+    no_default_bootstrap: bool,
 }
 
 #[derive(clap::Args)]
@@ -666,47 +739,61 @@ impl FromArgs {
         store: &Arc<Store>,
         key: libp2p::identity::Keypair,
     ) -> Result<p2p::Node> {
-        let mut bootstrap = self.bootstrap.clone();
-        let mut anchors = Vec::new();
-        if self.swarm {
-            if bootstrap.is_empty() && !self.no_default_bootstrap {
-                bootstrap = p2p::default_bootstrap();
-            }
-            // The public node is enough to join, so a registry that can't be reached
-            // only costs the anchors.
-            match registry::Client::new(&self.registry)?.anchors(None).await {
-                Ok(found) => anchors = found,
-                Err(e) if !bootstrap.is_empty() => {
-                    eprintln!("no anchor nodes from {}: {e:#}", self.registry)
-                }
-                Err(e) => return Err(e),
-            }
-            if anchors.is_empty() && bootstrap.is_empty() {
-                bail!(
-                    "{} lists no anchor nodes; join with --bootstrap",
-                    self.registry
-                );
-            }
-        }
-        // `key` is a fresh identity: a one-off download needs none of its own, and reusing
-        // the store's would clash with a node serving the same store (and skip it as
-        // "self").
-        let config = p2p::Config {
-            listen: vec![
-                "/ip4/0.0.0.0/tcp/0".parse()?,
-                "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
-            ],
-            bootstrap,
-            anchors,
-            // A one-off download leaves before it could usefully serve anyone.
-            limits: Limits {
-                download_only: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        p2p::Node::start(store.clone(), key, config).await
+        swarm_node(
+            store,
+            key,
+            &self.registry,
+            self.bootstrap.clone(),
+            self.swarm,
+            self.no_default_bootstrap,
+        )
+        .await
     }
+}
+
+/// A download-only swarm node joined through `bootstrap` and, with `swarm`, the project's
+/// public node and the registry's anchors.
+async fn swarm_node(
+    store: &Arc<Store>,
+    key: libp2p::identity::Keypair,
+    registry_url: &str,
+    mut bootstrap: Vec<Multiaddr>,
+    swarm: bool,
+    no_default_bootstrap: bool,
+) -> Result<p2p::Node> {
+    let mut anchors = Vec::new();
+    if swarm {
+        if bootstrap.is_empty() && !no_default_bootstrap {
+            bootstrap = p2p::default_bootstrap();
+        }
+        // The public node is enough to join, so a registry that can't be reached
+        // only costs the anchors.
+        match registry::Client::new(registry_url)?.anchors(None).await {
+            Ok(found) => anchors = found,
+            Err(e) if !bootstrap.is_empty() => {
+                eprintln!("no anchor nodes from {registry_url}: {e:#}")
+            }
+            Err(e) => return Err(e),
+        }
+        if anchors.is_empty() && bootstrap.is_empty() {
+            bail!("{registry_url} lists no anchor nodes; join with --bootstrap");
+        }
+    }
+    let config = p2p::Config {
+        listen: vec![
+            "/ip4/0.0.0.0/tcp/0".parse()?,
+            "/ip4/0.0.0.0/udp/0/quic-v1".parse()?,
+        ],
+        bootstrap,
+        anchors,
+        // Seeding is `chungus node`'s job; this node only fetches.
+        limits: Limits {
+            download_only: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    p2p::Node::start(store.clone(), key, config).await
 }
 
 /// Keep `set` up to date with `extra` plus peers found on the LAN, every 30 seconds.
@@ -759,27 +846,41 @@ async fn run_ollama(cmd: OllamaCmd, a: OllamaArgs) -> Result<()> {
         peers,
         a.trust_peers,
     )?);
+    o.set_registry(&a.registry);
+    let needs_swarm = matches!(
+        cmd,
+        OllamaCmd::Serve | OllamaCmd::Pull { .. } | OllamaCmd::Registry { .. }
+    );
+    if needs_swarm && !a.offline && (a.swarm || !a.bootstrap.is_empty()) {
+        // A fresh identity: reusing the store's would clash with a `chungus node`
+        // serving the same store (and skip it as "self").
+        let node = swarm_node(
+            &store,
+            libp2p::identity::Keypair::generate_ed25519(),
+            &a.registry,
+            a.bootstrap.clone(),
+            a.swarm,
+            a.no_default_bootstrap,
+        )
+        .await?;
+        o.set_swarm(node);
+    }
     match cmd {
         OllamaCmd::Pull { name } => {
             let name = ollama::Name::parse(&name)?;
             ollama::check_access(&models)?;
             let progress = Arc::new(ollama::Progress::default());
-            let ticker = {
+            let display = {
                 let progress = progress.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        let (done, total) = progress
-                            .snapshot()
-                            .iter()
-                            .fold((0, 0), |(d, t), (_, total, c)| (d + c, t + total));
-                        eprint!("\rpulling {:.1} / {:.1} MB", mb(done), mb(total));
-                    }
+                chungus::progress::show(format!("pulling {name}"), move || {
+                    progress
+                        .snapshot()
+                        .iter()
+                        .fold((0, 0), |(d, t), (_, total, c)| (d + c, t + total))
                 })
             };
             let filled = o.fill(&name, &progress).await;
-            ticker.abort();
-            eprintln!();
+            chungus::progress::done(display, &filled).await;
             let f = filled?;
             o.write_tag(&name, &f.manifest_bytes)?;
             let s = &f.stats;
@@ -812,6 +913,63 @@ async fn run_ollama(cmd: OllamaCmd, a: OllamaArgs) -> Result<()> {
             if failed > 0 {
                 bail!("{failed} model(s) not imported");
             }
+        }
+        OllamaCmd::Registry { port } => {
+            ollama::check_access(&models)?;
+            let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind {addr}"))?;
+            let id = net::node_id();
+            let _mdns = if a.no_mdns {
+                None
+            } else {
+                let o2 = o.clone();
+                discover_forever(id.clone(), a.peer.clone(), move |p| o2.set_peers(p));
+                Some(net::advertise(a.peer_port, &id)?)
+            };
+            let peer_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, a.peer_port));
+            let peer_listener = tokio::net::TcpListener::bind(peer_addr)
+                .await
+                .with_context(|| format!("bind {peer_addr}"))?;
+            tokio::spawn(net::serve_on(peer_listener, store.clone()));
+            println!("Ollama registry on port {port}; from another machine:");
+            println!("  ollama pull --insecure <this host>:{port}/library/<model>");
+            axum::serve(listener, ollama::registry_router(o)).await?;
+        }
+        OllamaCmd::Publish {
+            model,
+            name: as_name,
+            description,
+            key,
+        } => {
+            let name = ollama::Name::parse(&model)?;
+            let (org_model, rev) = (as_name.as_str(), name.tag.clone());
+            if !registry::valid_name(org_model) {
+                bail!("--as must be org/model");
+            }
+            if !registry::valid_rev(&rev) {
+                bail!(
+                    "the tag {rev:?} can't be a registry rev (at most 64 letters, digits, \
+                     '-', '_' or '.'); copy the model to a shorter tag first"
+                );
+            }
+            let root = o.publishable(&name).await?;
+            publish(
+                &store,
+                &root,
+                org_model,
+                &rev,
+                description,
+                None,
+                key,
+                &a.registry,
+            )
+            .await?;
+            println!(
+                "pull it through the shim with: ollama pull {}/{org_model}:{rev}",
+                ollama::REGISTRY_HOST
+            );
         }
         OllamaCmd::Gc => {
             let n = store.gc_links()?;
@@ -1482,29 +1640,17 @@ async fn main() -> Result<()> {
         } => {
             let (name, rev) = registry::parse_ref(&name)?;
             let store = Store::open(&store)?;
-            let manifest = store
-                .get_manifest_bytes(&root)
-                .context("publish a model that is in your store (see `chungus list`)")?;
-            let k = sign::load_key(&key_path(key)?)?;
-            // Sign the manifest too, so peers can prove it came from the name's owner.
-            store.add_signatures(&root, &[sign::sign(&k, &root)])?;
-            let st = Statement::new(
-                &k,
-                Claim::Publish {
-                    name: name.clone(),
-                    rev: rev.clone(),
-                    root: root.clone(),
-                    description,
-                    gated: gated_by,
-                },
-            );
-            let m = chungus::manifest::parse(&manifest)?;
-            let headers = chungus::safetensors_headers(&m, &store)?;
-            let gguf_headers = chungus::gguf_headers(&m, &store)?;
-            let entry = registry::Client::new(&registry)?
-                .publish_with_headers(&st, &manifest, headers, gguf_headers)
-                .await?;
-            println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
+            publish(
+                &store,
+                &root,
+                &name,
+                &rev,
+                description,
+                gated_by,
+                key,
+                &registry,
+            )
+            .await?;
         }
         Cmd::Resolve { name, registry } => {
             let (name, rev) = registry::parse_ref(&name)?;

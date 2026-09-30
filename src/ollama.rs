@@ -42,6 +42,9 @@ use std::time::Duration;
 
 use crate::manifest::{ChunkRef, FileEntry, Manifest};
 use crate::net;
+use crate::p2p;
+use crate::registry;
+use crate::sign;
 use crate::store::{self, Link, Store};
 
 /// Where the shim listens: Ollama's own default, so clients need no settings.
@@ -49,6 +52,12 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:11434";
 /// Where the real Ollama listens once moved aside (`OLLAMA_HOST=127.0.0.1:11433`).
 pub const DEFAULT_BACKEND: &str = "http://127.0.0.1:11433";
 pub const DEFAULT_HOST: &str = "registry.ollama.ai";
+/// Names under this host (`chungus.io/<org>/<model>:<tag>`) are models published to the
+/// chungus registry, resolved there and fetched from peers only.
+pub const REGISTRY_HOST: &str = "chungus.io";
+/// How blobs are chunked when indexed. Bumped when chunking changes (2: GGUF files are
+/// cut per tensor), so `import` re-indexes models indexed the old way.
+pub const INDEX_VERSION: u32 = 2;
 pub const DEFAULT_UPSTREAM: &str = "https://registry.ollama.ai";
 const MANIFEST_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 /// Blobs smaller than this (templates, params, licenses) are copied into the store like
@@ -241,12 +250,56 @@ pub struct TagRecord {
     pub manifest_digest: String,
     pub root: String,
     pub checked_at: u64,
+    /// The [`INDEX_VERSION`] `root` was made with.
+    #[serde(default = "first_index")]
+    pub index: u32,
+}
+
+fn first_index() -> u32 {
+    1
 }
 
 /// Store metadata key mapping an Ollama manifest digest to its chungus manifest root.
 /// Peers answer `GET /v1/ollama/<digest>` from it.
 pub fn digest_key(digest: &str) -> Result<String> {
     Ok(format!("ollama/digests/sha256-{}", hex_of(digest)?))
+}
+
+/// The manifest root indexing Ollama manifest `digest`, if the store has that manifest.
+pub fn root_for_digest(store: &Store, digest: &str) -> Option<String> {
+    let root = String::from_utf8(store.get_meta(&digest_key(digest).ok()?).ok()?).ok()?;
+    store.get_manifest(root.trim()).ok().map(|m| m.root)
+}
+
+/// Every (Ollama manifest digest, manifest root) pair the store has indexed.
+pub fn digest_records(store: &Store) -> Vec<(String, String)> {
+    store
+        .list_meta("ollama/digests")
+        .into_iter()
+        .filter_map(|name| {
+            let digest = name.replacen('-', ":", 1);
+            hex_of(&digest).ok()?;
+            let root = store.get_meta(&format!("ollama/digests/{name}")).ok()?;
+            let root = String::from_utf8(root).ok()?.trim().to_string();
+            store::is_hash(&root).then_some((digest, root))
+        })
+        .collect()
+}
+
+/// Where a fill gets chunks: this store, LAN peers, then swarm peers holding the model.
+struct Sources {
+    lan: Vec<String>,
+    swarm: Option<p2p::ModelSources>,
+}
+
+/// What a fill will write: Ollama's manifest, and what is known about its blobs.
+struct Plan {
+    manifest_bytes: Vec<u8>,
+    /// The registry has the blobs, and Ollama can finish the pull itself.
+    online: bool,
+    /// A chungus manifest for this Ollama manifest, giving each blob's chunks.
+    known: Option<Manifest>,
+    sources: Sources,
 }
 
 // ---------- progress ----------
@@ -313,6 +366,10 @@ pub struct Ollama {
     distrust: Mutex<HashSet<String>>,
     /// One fill at a time, so two pulls of the same model don't write the same blob.
     fill_lock: tokio::sync::Mutex<()>,
+    /// A swarm node to find models on beyond the LAN.
+    swarm: RwLock<Option<p2p::Node>>,
+    /// The chungus registry, for `chungus.io/...` names.
+    registry_url: RwLock<String>,
 }
 
 impl Ollama {
@@ -338,7 +395,23 @@ impl Ollama {
             peer_client: net::client()?,
             distrust: Default::default(),
             fill_lock: Default::default(),
+            swarm: Default::default(),
+            registry_url: RwLock::new(registry::DEFAULT_URL.to_string()),
         })
+    }
+
+    /// Also look for models on the internet swarm, through `node`.
+    pub fn set_swarm(&self, node: p2p::Node) {
+        *self.swarm.write().unwrap() = Some(node);
+    }
+
+    /// The chungus registry that `chungus.io/...` names resolve in.
+    pub fn set_registry(&self, url: &str) {
+        *self.registry_url.write().unwrap() = url.trim_end_matches('/').to_string();
+    }
+
+    fn swarm(&self) -> Option<p2p::Node> {
+        self.swarm.read().unwrap().clone()
     }
 
     pub fn set_peers(&self, peers: Vec<String>) {
@@ -463,8 +536,76 @@ impl Ollama {
 
     // ----- resolving a tag -----
 
+    /// What to fill for `name`: its manifest, and whoever has its chunks.
+    async fn resolve(&self, name: &Name, token: &mut Option<String>) -> Result<Plan> {
+        if name.host == REGISTRY_HOST {
+            return self.resolve_published(name).await;
+        }
+        let (manifest_bytes, online) = self.resolve_tag(name, token).await?;
+        let (known, swarm) = self.find_chungus(&sha256_digest(&manifest_bytes)).await;
+        Ok(Plan {
+            manifest_bytes,
+            online,
+            known,
+            sources: Sources {
+                lan: self.peers(),
+                swarm,
+            },
+        })
+    }
+
+    /// A model published to the chungus registry as `org/model@tag`: its manifest must be
+    /// signed by the publisher, and its blobs come from peers and the swarm only.
+    async fn resolve_published(&self, name: &Name) -> Result<Plan> {
+        if !registry::valid_rev(&name.tag) {
+            bail!("{name}: chungus registry tags are at most 64 letters, digits, '-', '_' or '.'");
+        }
+        let reg = self.registry_url.read().unwrap().clone();
+        let entry = registry::Client::new(&reg)?
+            .resolve(&name.repo(), &name.tag)
+            .await
+            .with_context(|| format!("resolve {name} in {reg}"))?;
+        let registry::Claim::Publish { root, .. } = entry.statement.claim else {
+            bail!("{name} is not a published model");
+        };
+        let trust = [sign::parse_public_key(&entry.statement.signature.key)?];
+        let lan = self.peers();
+        let signed = |store: &Store| {
+            store.get_manifest(&root).is_ok()
+                && sign::trusted_by(&store.signatures(&root).unwrap_or_default(), &root, &trust)
+        };
+        let mut swarm = None;
+        if !signed(&self.store) {
+            let from_lan = !lan.is_empty()
+                && net::prepare(&self.peer_client, &root, &self.store, &lan, &[], &trust)
+                    .await
+                    .is_ok();
+            if !from_lan {
+                let node = self
+                    .swarm()
+                    .with_context(|| format!("no LAN peer has {name}; try --swarm"))?;
+                let (_, src) = p2p::prepare(&node, &root, &self.store, &trust, None).await?;
+                swarm = Some(src);
+            }
+        }
+        let m = self.store.get_manifest(&root)?;
+        let sources = Sources { lan, swarm };
+        let manifest_bytes = self.read_small(&m, MANIFEST_FILE, &sources).await?;
+        OllamaManifest::parse(&manifest_bytes)?;
+        Ok(Plan {
+            manifest_bytes,
+            online: false,
+            known: Some(m),
+            sources,
+        })
+    }
+
     /// The manifest `name` points to: from the registry, else this store, else peers.
-    async fn resolve(&self, name: &Name, token: &mut Option<String>) -> Result<(Vec<u8>, bool)> {
+    async fn resolve_tag(
+        &self,
+        name: &Name,
+        token: &mut Option<String>,
+    ) -> Result<(Vec<u8>, bool)> {
         if let Some(bytes) = self.upstream_manifest(name, token).await? {
             return Ok((bytes, true));
         }
@@ -515,30 +656,89 @@ impl Ollama {
     /// Ollama's manifest from chungus manifest `root`, checked against `digest`.
     async fn manifest_file(&self, root: &str, digest: &str) -> Result<Vec<u8>> {
         let m = self.chungus_manifest(root).await?;
-        let f = m
-            .files
-            .iter()
-            .find(|f| f.path == MANIFEST_FILE)
-            .context("not an Ollama model")?;
-        if f.size > 1 << 20 {
-            bail!("manifest file too big");
-        }
-        net::fetch_chunks(
-            &self.peer_client,
-            &self.store,
-            &f.chunks,
-            &self.peers(),
-            &[],
-        )
-        .await?;
-        let mut bytes = Vec::with_capacity(f.size as usize);
-        for c in &f.chunks {
-            bytes.extend(store::decode(&self.store.get(&c.hash)?, c.len as usize)?);
-        }
+        let sources = Sources {
+            lan: self.peers(),
+            swarm: None,
+        };
+        let bytes = self.read_small(&m, MANIFEST_FILE, &sources).await?;
         if sha256_digest(&bytes) != digest {
             bail!("manifest in {root} doesn't match {digest}");
         }
         Ok(bytes)
+    }
+
+    /// A small file of `m`, kept in the store's own chunks.
+    async fn read_small(&self, m: &Manifest, path: &str, sources: &Sources) -> Result<Vec<u8>> {
+        let f = m
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .with_context(|| format!("{} has no {path}; not an Ollama model", m.root))?;
+        if f.size > LINK_MIN {
+            bail!("{path} is too big");
+        }
+        let mut bytes = Vec::with_capacity(f.size as usize);
+        for c in &f.chunks {
+            let (blob, raw, local) = self
+                .chunk(&c.hash, c.len as usize, sources)
+                .await
+                .with_context(|| format!("no peer has chunk {} of {path}", c.hash))?;
+            if !local {
+                self.store.put(&c.hash, &blob)?;
+            }
+            bytes.extend(raw);
+        }
+        if blake3::hash(&bytes).to_hex().as_str() != f.hash {
+            bail!("{path} failed verification");
+        }
+        Ok(bytes)
+    }
+
+    /// Chunk `hash` (`len` raw bytes): its blob, its verified raw bytes, and whether it
+    /// came from this store. A source that sends bad data is skipped for the next.
+    async fn chunk(
+        &self,
+        hash: &str,
+        len: usize,
+        sources: &Sources,
+    ) -> Option<(Bytes, Vec<u8>, bool)> {
+        let check = |blob: Bytes| {
+            let hash = hash.to_string();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let raw = store::decode(&blob, len).ok()?;
+                    (blake3::hash(&raw).to_hex().as_str() == hash).then_some((blob, raw))
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        };
+        if self.store.contains(hash) {
+            let (store, h) = (self.store.clone(), hash.to_string());
+            if let Ok(Ok(b)) = tokio::task::spawn_blocking(move || store.get(&h)).await
+                && let Some((blob, raw)) = check(Bytes::from(b)).await
+            {
+                return Some((blob, raw, true));
+            }
+        }
+        for peer in net::rotated(&sources.lan, hash) {
+            if let Some(b) = net::download_chunk(&self.peer_client, &peer, hash).await
+                && let Some((blob, raw)) = check(b).await
+            {
+                return Some((blob, raw, false));
+            }
+        }
+        if let Some(src) = &sources.swarm {
+            for peer in src.sources(hash) {
+                if let Some(b) = src.get(peer, hash.to_string()).await
+                    && let Some((blob, raw)) = check(b).await
+                {
+                    return Some((blob, raw, false));
+                }
+            }
+        }
+        None
     }
 
     /// Chungus manifest `root`, from the store or a peer.
@@ -554,15 +754,13 @@ impl Ollama {
         net::prepare(&self.peer_client, root, &store, &peers, &[], &[]).await
     }
 
-    /// The chungus manifest some peer (or this store) has for Ollama manifest `digest`.
-    async fn find_chungus(&self, digest: &str) -> Option<Manifest> {
-        let key = digest_key(digest).ok()?;
-        if let Ok(root) = self.store.get_meta(&key)
-            && let Ok(m) = self
-                .store
-                .get_manifest(String::from_utf8_lossy(&root).trim())
+    /// The chungus manifest this store, a LAN peer or a swarm peer has for Ollama
+    /// manifest `digest`, and the swarm peers holding it when it came from the swarm.
+    async fn find_chungus(&self, digest: &str) -> (Option<Manifest>, Option<p2p::ModelSources>) {
+        if let Some(root) = root_for_digest(&self.store, digest)
+            && let Ok(m) = self.store.get_manifest(&root)
         {
-            return Some(m);
+            return (Some(m), None);
         }
         for peer in self.peers() {
             let url = format!("{peer}/v1/ollama/{}", digest.replace(':', "-"));
@@ -574,10 +772,31 @@ impl Ollama {
             }
             let Ok(root) = r.text().await else { continue };
             if let Ok(m) = self.chungus_manifest(root.trim()).await {
-                return Some(m);
+                return (Some(m), None);
             }
         }
-        None
+        let Some(node) = self.swarm() else {
+            return (None, None);
+        };
+        for peer in node.ollama_providers(digest).await.unwrap_or_default() {
+            if let Ok(p2p::Response::Root(Some(root))) = node
+                .request(peer, p2p::Request::Ollama(digest.to_string()))
+                .await
+                && let Ok((m, src)) = p2p::prepare(&node, &root, &self.store, &[], None).await
+            {
+                return (Some(m), Some(src));
+            }
+        }
+        (None, None)
+    }
+
+    /// Swarm peers holding the chunks of `root`, when this node is on the swarm.
+    async fn swarm_sources(&self, root: &str) -> Option<p2p::ModelSources> {
+        let node = self.swarm()?;
+        p2p::prepare(&node, root, &self.store, &[], None)
+            .await
+            .ok()
+            .map(|(_, src)| src)
     }
 
     // ----- filling -----
@@ -586,7 +805,12 @@ impl Ollama {
     pub async fn fill(&self, name: &Name, progress: &Progress) -> Result<Filled> {
         let _one = self.fill_lock.lock().await;
         let mut token = None;
-        let (manifest_bytes, online) = self.resolve(name, &mut token).await?;
+        let Plan {
+            manifest_bytes,
+            online,
+            known,
+            mut sources,
+        } = self.resolve(name, &mut token).await?;
         let digest = sha256_digest(&manifest_bytes);
         let om = OllamaManifest::parse(&manifest_bytes)?;
         let blobs_dir = self.models.join("blobs");
@@ -596,12 +820,28 @@ impl Ollama {
         // A chungus manifest for this exact Ollama manifest, from anyone, tells us each
         // blob's chunks. Its files are only used where path and size match; the bytes
         // are checked by sha256 anyway.
-        let known = self.find_chungus(&digest).await;
-        // Blobs this store already links, unchanged, needn't be read again.
+        // Blobs this store already links, unchanged and indexed the current way, needn't
+        // be read again.
+        let current = self
+            .store
+            .get_meta(&name.meta_key())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<TagRecord>(&b).ok())
+            .is_some_and(|r| r.manifest_digest == digest && r.index == INDEX_VERSION);
         let linked: Vec<Link> = known
             .as_ref()
+            .filter(|_| current)
             .map(|m| self.store.links(&m.root))
             .unwrap_or_default();
+        // A model known from here or the LAN may still have chunks only the swarm has.
+        if sources.swarm.is_none()
+            && let Some(m) = &known
+            && om.blobs().iter().any(|l| {
+                !fs::metadata(blobs_dir.join(l.file_name())).is_ok_and(|md| md.len() == l.size)
+            })
+        {
+            sources.swarm = self.swarm_sources(&m.root).await;
+        }
         let known: HashMap<&str, &FileEntry> = known
             .as_ref()
             .map(|m| m.files.iter().map(|f| (f.path.as_str(), f)).collect())
@@ -644,19 +884,24 @@ impl Ollama {
                         &partial,
                         blob_url.as_deref(),
                         &token,
+                        &sources,
                         &done,
                         &mut stats,
                     )
                     .await
                 {
-                    Ok(()) if file_sha256(&partial).await? == layer.digest => {
-                        entries.insert(layer.digest.clone(), (*entry).clone());
-                        ok = true;
-                    }
-                    Ok(()) => {
-                        eprintln!("{}: copy from peers failed its sha256 check", layer.digest);
-                        self.distrust.lock().unwrap().insert(layer.digest.clone());
-                    }
+                    // Indexed here rather than taken from the peer: the same read checks
+                    // the blob, and its chunks come out the way this version cuts them.
+                    Ok(()) => match index_blob(&partial, &layer.store_path()).await? {
+                        (fresh, sha) if sha == layer.digest => {
+                            entries.insert(layer.digest.clone(), fresh);
+                            ok = true;
+                        }
+                        _ => {
+                            eprintln!("{}: copy from peers failed its sha256 check", layer.digest);
+                            self.distrust.lock().unwrap().insert(layer.digest.clone());
+                        }
+                    },
                     Err(e) if blob_url.is_some() => {
                         eprintln!("{}: {e:#}; downloading it instead", layer.digest)
                     }
@@ -680,9 +925,7 @@ impl Ollama {
                     .with_context(|| format!("download {}", layer.digest))?;
                 stats.upstream_bytes += layer.size;
                 // Index it now: the same read checks it before Ollama can see it.
-                let (p, sp) = (partial.clone(), layer.store_path());
-                let (entry, sha) =
-                    tokio::task::spawn_blocking(move || index_file(&p, &sp)).await??;
+                let (entry, sha) = index_blob(&partial, &layer.store_path()).await?;
                 if sha != layer.digest {
                     let _ = fs::remove_file(&partial);
                     bail!("download of {} doesn't match its digest", layer.digest);
@@ -719,12 +962,14 @@ impl Ollama {
 
     /// Rebuild a blob in `partial` from `entry`'s chunks: from this store, then peers, then
     /// ranges of the registry's copy for whatever nobody had.
+    #[allow(clippy::too_many_arguments)]
     async fn assemble(
         &self,
         entry: &FileEntry,
         partial: &Path,
         blob_url: Option<&str>,
         token: &Option<String>,
+        sources: &Sources,
         done: &AtomicU64,
         stats: &mut FillStats,
     ) -> Result<()> {
@@ -740,52 +985,26 @@ impl Ollama {
             slot.1.push(offset);
             offset += c.len as u64;
         }
-        let peers = self.peers();
         let at = &at;
         let results = stream::iter(order)
             .map(|hash: String| {
                 let (len, offsets) = at[hash.as_str()].clone();
                 let bytes = len as u64 * offsets.len() as u64;
-                let (file, peers) = (file.clone(), &peers);
+                let file = file.clone();
                 async move {
-                    let local = self.store.contains(&hash);
-                    let blob = if local {
-                        let (store, h) = (self.store.clone(), hash.to_string());
-                        tokio::task::spawn_blocking(move || store.get(&h))
-                            .await
-                            .ok()?
-                            .ok()
-                            .map(Bytes::from)
-                    } else {
-                        let mut got = None;
-                        for peer in net::rotated(peers, &hash) {
-                            if let Some(b) =
-                                net::download_chunk(&self.peer_client, &peer, &hash).await
-                            {
-                                got = Some(b);
-                                break;
-                            }
-                        }
-                        got
-                    };
-                    let blob = blob?;
+                    let (blob, raw, local) = self.chunk(&hash, len as usize, sources).await?;
                     let wire = blob.len() as u64;
-                    let hash_owned = hash.clone();
-                    let written = tokio::task::spawn_blocking(move || -> Result<()> {
-                        let raw = store::decode(&blob, len as usize)?;
-                        if blake3::hash(&raw).to_hex().as_str() != hash {
-                            bail!("chunk {hash} failed verification");
-                        }
+                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                         for o in &offsets {
                             file.write_all_at(&raw, *o)?;
                         }
                         Ok(())
                     })
                     .await
+                    .ok()?
                     .ok()?;
-                    written.ok()?;
                     done.fetch_add(bytes, Ordering::Relaxed);
-                    Some((hash_owned, local, wire, bytes))
+                    Some((hash, local, wire, bytes))
                 }
             })
             .buffer_unordered(CONCURRENCY)
@@ -981,6 +1200,7 @@ impl Ollama {
             manifest_digest: digest,
             root: m.root.clone(),
             checked_at: crate::registry::now(),
+            index: INDEX_VERSION,
         };
         self.store
             .put_meta(&name.meta_key(), &serde_json::to_vec(&rec)?)?;
@@ -1011,26 +1231,25 @@ impl Ollama {
         let bytes = fs::read(path)?;
         let om = OllamaManifest::parse(&bytes)?;
         let digest = sha256_digest(&bytes);
-        // Already indexed, and every linked blob unchanged: nothing to read.
-        if let Ok(root) = self.store.get_meta(&digest_key(&digest)?) {
-            let root = String::from_utf8_lossy(&root).trim().to_string();
-            if let Ok(m) = self.store.get_manifest(&root) {
-                let linked = self.store.links(&root).len();
-                let big = om.blobs().iter().filter(|l| l.size >= LINK_MIN).count();
-                if linked == big
-                    && m.files
-                        .iter()
-                        .all(|f| f.chunks.iter().all(|c| self.store.contains(&c.hash)))
-                {
-                    let rec = TagRecord {
-                        manifest_digest: digest,
-                        root: root.clone(),
-                        checked_at: crate::registry::now(),
-                    };
-                    self.store
-                        .put_meta(&name.meta_key(), &serde_json::to_vec(&rec)?)?;
-                    return Ok(root);
-                }
+        // Already indexed the current way, and every linked blob unchanged: nothing to
+        // read. Indexed by an older chungus: read again, since the chunks now differ.
+        let current = self
+            .store
+            .get_meta(&name.meta_key())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<TagRecord>(&b).ok())
+            .filter(|r| r.manifest_digest == digest && r.index == INDEX_VERSION);
+        if let Some(rec) = current
+            && let Ok(m) = self.store.get_manifest(&rec.root)
+        {
+            let linked = self.store.links(&rec.root).len();
+            let big = om.blobs().iter().filter(|l| l.size >= LINK_MIN).count();
+            if linked == big
+                && m.files
+                    .iter()
+                    .all(|f| f.chunks.iter().all(|c| self.store.contains(&c.hash)))
+            {
+                return Ok(rec.root);
             }
         }
         for l in om.blobs() {
@@ -1040,6 +1259,29 @@ impl Ollama {
             }
         }
         self.record(name, &bytes, &om, HashMap::new()).await
+    }
+
+    /// Index `name` for publishing and return its root. Refused for models ollama.com
+    /// serves: they are pinned by ollama.com's digests already, and a copy in the chungus
+    /// registry would only let someone pass it off under another name.
+    pub async fn publishable(&self, name: &Name) -> Result<String> {
+        if name.host == REGISTRY_HOST {
+            bail!("{name} is already in the chungus registry");
+        }
+        let path = name.manifest_path(&self.models);
+        let bytes = fs::read(&path).with_context(|| format!("Ollama has no {name}"))?;
+        let mut token = None;
+        match self.upstream_manifest(name, &mut token).await {
+            Ok(Some(up)) if up == bytes => {
+                bail!("{name} is ollama.com's own model; publish models you made (ollama create)")
+            }
+            Ok(None) if self.upstream.is_some() => bail!(
+                "can't reach {} to check {name} isn't one of its models",
+                name.host
+            ),
+            _ => {}
+        }
+        self.import_one(name, &path).await
     }
 
     /// Every tag Ollama has a manifest for.
@@ -1119,23 +1361,10 @@ fn create_sized(path: &Path, size: u64) -> Result<fs::File> {
     Ok(file)
 }
 
-/// `sha256:<hex>` of a file, read once.
-async fn file_sha256(path: &Path) -> Result<String> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        let mut h = sha2::Sha256::new();
-        let mut f = fs::File::open(&path)?;
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = std::io::Read::read(&mut f, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            h.update(&buf[..n]);
-        }
-        Ok(format!("sha256:{}", to_hex(&h.finalize())))
-    })
-    .await?
+/// [`index_file`] off the async runtime.
+async fn index_blob(file: &Path, path: &str) -> Result<(FileEntry, String)> {
+    let (file, path) = (file.to_path_buf(), path.to_string());
+    tokio::task::spawn_blocking(move || index_file(&file, &path)).await?
 }
 
 /// Chunk a file where it lies, without storing anything: its manifest entry (as `path`)
@@ -1359,6 +1588,8 @@ async fn pull(State(shim): State<Arc<Shim>>, headers: HeaderMap, body: Bytes) ->
         return forward_bytes(&shim, &headers, body).await;
     };
     let streaming = req.stream.unwrap_or(true);
+    // Ollama can't finish these pulls itself, so errors are answered here.
+    let final_here = shim.ollama.is_offline() || name.host == REGISTRY_HOST;
     let progress = Arc::new(Progress::default());
 
     if !streaming {
@@ -1368,7 +1599,7 @@ async fn pull(State(shim): State<Arc<Shim>>, headers: HeaderMap, body: Bytes) ->
                 Ok(()) => axum::Json(serde_json::json!({"status": "success"})).into_response(),
                 Err(e) => error_json(&e),
             },
-            Err(e) if shim.ollama.is_offline() => error_json(&e),
+            Err(e) if final_here => error_json(&e),
             Err(e) => {
                 eprintln!("pull {name}: {e:#}; leaving it to Ollama");
                 forward_bytes(&shim, &headers, body).await
@@ -1418,7 +1649,7 @@ async fn pull(State(shim): State<Arc<Shim>>, headers: HeaderMap, body: Bytes) ->
                 };
                 let _ = tx.send(line(last)).await;
             }
-            Err(e) if shim.ollama.is_offline() => {
+            Err(e) if final_here => {
                 let _ = tx
                     .send(line(serde_json::json!({"error": format!("{e:#}")})))
                     .await;
@@ -1467,6 +1698,151 @@ fn error_json(e: &anyhow::Error) -> Response {
         axum::Json(serde_json::json!({"error": format!("{e:#}")})),
     )
         .into_response()
+}
+
+// ---------- a registry for `ollama pull --insecure` ----------
+
+/// Registry routes (`/v2/...`) serving this machine's Ollama models, for machines that
+/// can't run the shim: `ollama pull --insecure <this host>:11435/library/llama3.2`. A
+/// model this machine lacks is filled first (from peers, the swarm, then the registry),
+/// so it works as a pull-through cache for the LAN.
+pub fn registry_router(ollama: Arc<Ollama>) -> Router {
+    use axum::routing::get;
+    Router::new()
+        .route("/v2/", get(|| async { axum::Json(serde_json::json!({})) }))
+        .route("/v2/{ns}/{model}/manifests/{tag}", get(registry_manifest))
+        .route("/v2/{ns}/{model}/blobs/{digest}", get(registry_blob))
+        .with_state(ollama)
+}
+
+async fn registry_manifest(
+    State(o): State<Arc<Ollama>>,
+    axum::extract::Path((ns, model, tag)): axum::extract::Path<(String, String, String)>,
+) -> Response {
+    let Ok(name) = Name::parse(&format!("{ns}/{model}:{tag}")) else {
+        return registry_error(StatusCode::BAD_REQUEST, "NAME_INVALID", "bad name");
+    };
+    let path = name.manifest_path(&o.models);
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => {
+            let filled = match o.fill(&name, &Progress::default()).await {
+                Ok(f) => f,
+                Err(e) => {
+                    return registry_error(
+                        StatusCode::NOT_FOUND,
+                        "MANIFEST_UNKNOWN",
+                        &format!("{e:#}"),
+                    );
+                }
+            };
+            if let Err(e) = o.write_tag(&name, &filled.manifest_bytes) {
+                eprintln!("{name}: couldn't write Ollama's manifest: {e:#}");
+            }
+            filled.manifest_bytes
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, MANIFEST_TYPE.to_string()),
+            (
+                header::HeaderName::from_static("docker-content-digest"),
+                sha256_digest(&bytes),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn registry_blob(
+    State(o): State<Arc<Ollama>>,
+    axum::extract::Path((_, _, digest)): axum::extract::Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if hex_of(&digest).is_err() {
+        return registry_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "bad digest");
+    }
+    let path = o.models.join("blobs").join(digest.replace(':', "-"));
+    let Ok(file) = fs::File::open(&path) else {
+        return registry_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "no such blob");
+    };
+    let size = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|r| parse_range(r, size));
+    let (status, start, end) = match range {
+        None => (StatusCode::OK, 0, size),
+        Some(Some((a, b))) => (StatusCode::PARTIAL_CONTENT, a, b),
+        Some(None) => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{size}"))],
+            )
+                .into_response();
+        }
+    };
+    let file = Arc::new(file);
+    let body = stream::unfold(start, move |pos| {
+        let file = file.clone();
+        async move {
+            if pos >= end {
+                return None;
+            }
+            let n = (end - pos).min(1 << 20) as usize;
+            let read = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; n];
+                file.read_exact_at(&mut buf, pos).map(|_| buf)
+            })
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|r| r);
+            Some((read.map(Bytes::from), pos + n as u64))
+        }
+    });
+    let mut h = HeaderMap::new();
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(end - start));
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(v) = HeaderValue::from_str(&digest) {
+        h.insert("docker-content-digest", v);
+    }
+    if status == StatusCode::PARTIAL_CONTENT
+        && let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{}/{size}", end - 1))
+    {
+        h.insert(header::CONTENT_RANGE, v);
+    }
+    (status, h, Body::from_stream(body)).into_response()
+}
+
+/// An error in the registry API's JSON shape.
+fn registry_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({"errors": [{"code": code, "message": message}]})),
+    )
+        .into_response()
+}
+
+/// `bytes=a-b`, `bytes=a-` or `bytes=-n` as a half-open range within `size`.
+fn parse_range(h: &str, size: u64) -> Option<(u64, u64)> {
+    let (a, b) = h.strip_prefix("bytes=")?.split_once('-')?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        ("", n) => (size.saturating_sub(n.parse().ok()?), size),
+        (a, "") => (a.parse().ok()?, size),
+        (a, b) => (
+            a.parse().ok()?,
+            b.parse::<u64>().ok()?.saturating_add(1).min(size),
+        ),
+    };
+    (start < end).then_some((start, end))
 }
 
 #[cfg(test)]

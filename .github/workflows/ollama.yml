@@ -1,0 +1,66 @@
+# chungus in front of the latest Ollama release, pulling a small model from
+# registry.ollama.ai. Runs weekly, so a change in Ollama's pull path shows up here before
+# users hit it, and on pull requests that touch the Ollama code.
+name: Ollama
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/ollama.rs
+      - src/store.rs
+      - tests/ollama.rs
+      - .github/workflows/ollama.yml
+
+env:
+  MODEL: smollm:135m
+
+jobs:
+  real-ollama:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked --bin chungus
+      - name: Install the latest Ollama, moved to port 11433
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama || true
+          mkdir -p "$HOME/models"
+          OLLAMA_HOST=127.0.0.1:11433 OLLAMA_MODELS="$HOME/models" nohup ollama serve > ollama.log 2>&1 &
+          for i in $(seq 30); do curl -sf http://127.0.0.1:11433/api/version && break; sleep 1; done
+          ollama --version
+      - name: chungus ollama pull, then Ollama sees and runs the model
+        env:
+          OLLAMA_HOST: 127.0.0.1:11433
+        run: |
+          ./target/release/chungus ollama --models "$HOME/models" --store a --no-mdns pull "$MODEL"
+          ollama list | grep -F "$MODEL"
+          ollama show --modelfile "$MODEL" > from-chungus.txt
+          ollama run "$MODEL" "Say hi" | tee out.txt
+          test -s out.txt
+          # Ollama's own pull finds every blob in place and changes nothing.
+          ollama pull "$MODEL"
+          ollama show --modelfile "$MODEL" | diff from-chungus.txt -
+          du -sh a
+      - name: The shim on 11434 fills a pull that the stock CLI makes
+        run: |
+          OLLAMA_HOST=127.0.0.1:11433 ollama rm "$MODEL"
+          ./target/release/chungus ollama --models "$HOME/models" --store a --no-mdns > shim.log 2>&1 &
+          for i in $(seq 30); do curl -sf http://127.0.0.1:11434/api/version && break; sleep 1; done
+          ollama pull "$MODEL"
+          ollama run "$MODEL" "Say hi" | tee out.txt
+          test -s out.txt
+      - name: A second machine pulls from the first with no registry blob bytes
+        run: |
+          ./target/release/chungus ollama --models "$HOME/models-b" --store b --no-mdns \
+            --peer http://127.0.0.1:7447 pull "$MODEL" | tee b.txt
+          grep -F "0.0 MB from the registry" b.txt
+          cmp <(ls "$HOME/models/blobs" | grep -v partial | sort) <(ls "$HOME/models-b/blobs" | sort)
+      - if: failure()
+        run: tail -n 100 ollama.log shim.log || true

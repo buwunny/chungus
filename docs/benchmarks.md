@@ -94,3 +94,20 @@ The sandbox can't reach Hugging Face, so the data was Whisper tiny.en's trained 
 | best per chunk, with the exponent split | 69.4 MB | 92.0% |
 
 The exponent split never wins a chunk, so it saves nothing. One thing did stand out: compressing each byte plane as its own zstd frame, rather than one frame over all planes, took the byte planes to 64.2 MB (85.1%), about 7% smaller, and the exponent split to 65.2 MB. zstd shares one entropy table across a block, and the near-random mantissa plane spoils it for the skewed exponent plane. That would be a blob format change for every float dtype, so it needs its own measurement on BF16 and F32 and on real F16 checkpoints (pythia-160m, Qwen2.5 0.5B's F16 GGUF) before it goes anywhere.
+
+## One zstd frame per plane
+
+Measured on 2026-09-30 and adopted as blob v2. Hugging Face was still out of reach, so the data came from GitHub releases: YOLOv8x (Ultralytics, stored as F16), and Whisper tiny and base (sherpa-onnx's export) as their original F32, as F16, and as BF16 rounded to nearest even. Every file was chunked as one float segment and each chunk encoded both ways, keeping the smaller as `encode` does.
+
+| Data | Raw | Blob v1 | Blob v2 | Saved |
+|---|--:|--:|--:|--:|
+| YOLOv8x, F16 | 136.6 MB | 92.0% | 85.2% | 7.4% |
+| Whisper base, F16 | 145.1 MB | 90.3% | 83.3% | 7.7% |
+| Whisper tiny, F16 | 75.5 MB | 90.5% | 83.6% | 7.6% |
+| Whisper base, BF16 | 145.1 MB | 71.8% | 68.7% | 4.3% |
+| Whisper tiny, BF16 | 75.5 MB | 72.1% | 68.8% | 4.5% |
+| Whisper base, F32 | 290.1 MB | 50.3% | 45.0% | 10.7% |
+
+Almost every chunk picks v2 (1,709 of 1,710 for YOLOv8x). F16 uses plain byte planes; BF16 and F32 use the exponent split, which beats plain planes by about 0.5% once each plane has its own frame. Decoding on one core: F16 700 → 880 MB/s and BF16 about 600 MB/s both ways, since smaller frames decompress faster, but F32 680 → 470 MB/s, from four frames and the exponent join per chunk. That is still well past any network link.
+
+Peers send each other blobs, so this ships in two releases: the first reads v2 and writes v1 (`WRITE_PLANE_FRAMES` in src/store.rs is off), and the next turns writing on. Existing stores keep their v1 blobs, which stay valid; only newly packed chunks get smaller.
