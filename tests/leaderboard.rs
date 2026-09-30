@@ -57,11 +57,7 @@ async fn receipts_and_probes_rank_a_node() {
     let reg = Arc::new(Registry::open(&tmp.path().join("reg")).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(registry::serve(
-        listener,
-        reg.clone(),
-        std::future::pending(),
-    ));
+    tokio::spawn(registry::serve(listener, reg.clone()));
     let client = Client::new(&url).unwrap();
 
     // A model, packed into the seed's store and published.

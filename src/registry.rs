@@ -981,10 +981,12 @@ pub struct Registry {
     /// Where access to gated repos is checked: huggingface.co, or a fake in tests.
     hf: String,
     http: reqwest::Client,
-    /// Registrations, probes, receipts and counted lookups (see [`crate::leaderboard`]).
+    /// Registrations, probes and receipts (see [`crate::leaderboard`]).
     board: Mutex<crate::leaderboard::Board>,
     downloads: Downloads,
-    /// Take client addresses from `X-Forwarded-For` (see [`Registry::with_behind_proxy`]).
+    /// Whether requests come through a reverse proxy that puts the client's address last
+    /// in `X-Forwarded-For` (Caddy does). Otherwise that header is ignored, since
+    /// clients could set it to anything.
     behind_proxy: bool,
 }
 
@@ -1110,15 +1112,8 @@ impl Registry {
         })
     }
 
-    /// Take each client's address from the last `X-Forwarded-For` entry, which a reverse
-    /// proxy in front of the registry adds. Only for a registry that can't be reached
-    /// except through such a proxy: otherwise clients could claim any address.
-    pub fn with_behind_proxy(mut self, on: bool) -> Registry {
-        self.behind_proxy = on;
-        self
-    }
-
-    pub fn behind_proxy(&self) -> bool {
+    /// Whether client addresses come from `X-Forwarded-For`.
+    pub fn is_behind_proxy(&self) -> bool {
         self.behind_proxy
     }
 
@@ -1141,15 +1136,15 @@ impl Registry {
         })
     }
 
-    /// Sign the leaderboard's finished days and save its state. [`serve`] does this every
-    /// minute.
+    /// Save download counts, sign the leaderboard's finished days and save its state.
+    /// Call it every minute or so ([`serve`] does), and on exit.
     pub fn flush(&self) -> Result<()> {
+        self.downloads.save()?;
         let key = self.operator_key().cloned();
         self.board(|b| {
             b.finalize(now(), key.as_ref())?;
             b.save()
-        })?;
-        self.downloads.save()
+        })
     }
 
     /// The key that acts as the operator now: the online key while the log delegates to
@@ -1166,6 +1161,13 @@ impl Registry {
     /// Check gated access against `url` instead of huggingface.co.
     pub fn with_hf(mut self, url: &str) -> Registry {
         self.hf = url.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Take the client's address from the last `X-Forwarded-For` entry, for a registry
+    /// only reachable through a reverse proxy that sets it.
+    pub fn behind_proxy(mut self, yes: bool) -> Registry {
+        self.behind_proxy = yes;
         self
     }
 
@@ -1372,12 +1374,12 @@ fn err(code: StatusCode, e: impl std::fmt::Display) -> Response {
 /// `POST /v1/statements`, `POST /v1/publish`, `GET /v1/manifests/{root}`, `GET /v1/head`, `GET /v1/log?from=&limit=`,
 /// `GET /v1/resolve/{org}/{model}/{rev}`, `GET /v1/search?q=`, `GET /v1/index`,
 /// `GET /v1/owners/{org}`, `GET /v1/anchors`, `POST /v1/access`, `GET /v1/downloads` and
-/// `GET /v1/downloads/{org}/{model}`, plus the leaderboard's routes (see
-/// [`crate::leaderboard`]).
+/// `GET /v1/downloads/{org}/{model}`.
 ///
 /// `GET /v1/resolve/...?download=1` also counts a download of the name (see
 /// [`crate::downloads`]). Serve with `into_make_service_with_connect_info::<SocketAddr>()`
-/// so the client's address is known; without it, nothing is counted.
+/// so the client's address is known; without it, nothing is counted. Plus the
+/// leaderboard's routes (see [`crate::leaderboard`]).
 ///
 /// Everything it serves is public and signed, so any web page may read it: responses
 /// allow every origin. Browsers can't submit statements, since there is no CORS
@@ -1410,32 +1412,24 @@ pub fn router(reg: Arc<Registry>) -> Router {
 
 /// Serve [`router`] on `listener`, with each connection's address (for counting
 /// downloads) and the leaderboard's state saved every minute.
-/// Serve [`router`] until `shutdown` resolves, saving the leaderboard and download counts
-/// every minute and once more on the way out.
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    reg: Arc<Registry>,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Result<()> {
+pub async fn serve(listener: tokio::net::TcpListener, reg: Arc<Registry>) -> std::io::Result<()> {
     let r = reg.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let r = r.clone();
             match tokio::task::spawn_blocking(move || r.flush()).await {
-                Ok(Err(e)) => eprintln!("saving registry state: {e:#}"),
-                Err(e) => eprintln!("saving registry state: {e}"),
+                Ok(Err(e)) => eprintln!("leaderboard: {e:#}"),
+                Err(e) => eprintln!("leaderboard: {e}"),
                 Ok(Ok(())) => {}
             }
         }
     });
     axum::serve(
         listener,
-        router(reg.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        router(reg).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await?;
-    reg.flush()
+    .await
 }
 
 async fn allow_any_origin(mut resp: Response) -> Response {
@@ -1552,20 +1546,26 @@ async fn log_entries(State(reg): State<Arc<Registry>>, Query(p): Query<Page>) ->
     axum::Json(page).into_response()
 }
 
-/// `?download=1` marks a lookup made to download the model, which the registry counts;
-/// `peer` names the downloader's one-run peer id, so its receipts can be credited.
 #[derive(Deserialize)]
 struct ResolveQuery {
     #[serde(default)]
     download: u8,
-    /// The downloader's one-run peer id, so its receipts can be credited.
+    /// The downloader's one-run peer id, so the receipts it signs can be credited.
     #[serde(default)]
     peer: Option<String>,
 }
 
 /// The address of the client that sent `req`, if it can be trusted.
 fn client_ip(reg: &Registry, req: &axum::extract::Request) -> Option<std::net::IpAddr> {
-    crate::leaderboard::client_ip(reg, req.headers(), req.extensions().get())
+    if reg.behind_proxy {
+        // The proxy appends the address it saw; anything before it came from the client.
+        let xff = req.headers().get("x-forwarded-for")?.to_str().ok()?;
+        return xff.rsplit(',').next()?.trim().parse().ok();
+    }
+    let info = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()?;
+    Some(info.0.ip())
 }
 
 async fn resolve(
@@ -1580,11 +1580,13 @@ async fn resolve(
             if q.download == 1
                 && let Some(ip) = client_ip(&reg, &req)
             {
-                reg.downloads.count(&name, ip, now());
-                if let Claim::Publish { root, .. } = &entry.statement.claim {
+                let t = now();
+                if reg.downloads.count(&name, ip, t)
+                    && let Claim::Publish { root, .. } = &entry.statement.claim
+                {
                     let cap = reg.summary(root).map(|s| s.unique_bytes).unwrap_or(0);
                     let network = crate::leaderboard::network_of(ip);
-                    reg.board(|b| b.count_lookup(now(), root, &network, q.peer.as_deref(), cap));
+                    reg.board(|b| b.bind_lookup(t, root, &network, q.peer.as_deref(), cap));
                 }
             }
             axum::Json(entry).into_response()
@@ -1610,8 +1612,9 @@ async fn model_downloads(
 }
 
 async fn download_totals(State(reg): State<Arc<Registry>>) -> Response {
-    let mut totals = reg.downloads.totals(now());
-    totals.bytes_served = reg.board(|b| b.bytes_served(now()));
+    let t = now();
+    let mut totals = reg.downloads.totals(t);
+    totals.bytes_served = reg.board(|b| b.bytes_served(t));
     axum::Json(totals).into_response()
 }
 
@@ -1778,9 +1781,9 @@ impl Client {
             .await
     }
 
-    /// [`Client::resolve`], counting a download of `name` in the registry's stats. `peer`
-    /// binds the lookup to the downloader's one-run peer id, so the registry credits the
-    /// receipts it signs (see [`crate::leaderboard`]).
+    /// [`Client::resolve`], counting a download of `name` in the registry's stats.
+    /// `peer` binds the lookup to the downloader's one-run peer id, so the registry
+    /// credits the receipts it signs (see [`crate::leaderboard`]).
     pub async fn resolve_download(
         &self,
         name: &str,

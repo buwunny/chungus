@@ -259,9 +259,9 @@ enum Cmd {
         data: PathBuf,
         #[arg(long, env = "CHUNGUS_REGISTRY_PORT", default_value_t = registry::DEFAULT_PORT)]
         port: u16,
-        /// The registry is reachable only through a reverse proxy (like deploy/'s Caddy),
-        /// so take each client's address, for counting downloads, from the last
-        /// X-Forwarded-For entry. Never set this on a registry clients can reach directly.
+        /// The registry is only reachable through a reverse proxy (like the Caddy in
+        /// deploy/) that puts the client's address last in X-Forwarded-For. Download
+        /// counts then go by that address instead of the proxy's.
         #[arg(long, env = "CHUNGUS_BEHIND_PROXY")]
         behind_proxy: bool,
     },
@@ -1577,7 +1577,7 @@ async fn main() -> Result<()> {
             port,
             behind_proxy,
         } => {
-            let reg = Arc::new(registry::Registry::open(&data)?.with_behind_proxy(behind_proxy));
+            let reg = Arc::new(registry::Registry::open(&data)?.behind_proxy(behind_proxy));
             let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -1604,7 +1604,30 @@ async fn main() -> Result<()> {
                      chungus delegate {online} --key <root key> --registry <this registry>"
                 ),
             }
-            registry::serve(listener, reg, shutdown()).await?;
+            // Download counts and the leaderboard are kept in memory and written out
+            // every minute (signing finished days), and once more on the way out.
+            let saver = reg.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    every.tick().await;
+                    let saver = saver.clone();
+                    match tokio::task::spawn_blocking(move || saver.flush()).await {
+                        Ok(Err(e)) => {
+                            eprintln!("saving download counts and the leaderboard: {e:#}")
+                        }
+                        Err(e) => eprintln!("saving download counts and the leaderboard: {e}"),
+                        Ok(Ok(())) => {}
+                    }
+                }
+            });
+            axum::serve(
+                listener,
+                registry::router(reg.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
+            reg.flush()?;
         }
         Cmd::Publish {
             root,

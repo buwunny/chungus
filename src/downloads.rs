@@ -56,8 +56,7 @@ pub struct Totals {
     pub last_30_days: u64,
     /// Every day with downloads, oldest first: (days since the epoch, downloads).
     pub daily: Vec<(u64, u64)>,
-    /// Bytes nodes served, as credited from downloaders' receipts (see
-    /// [`crate::leaderboard`]). Filled in by the registry.
+    /// Bytes nodes served, as credited by downloaders' receipts (see [`crate::leaderboard`]).
     #[serde(default)]
     pub bytes_served: u64,
 }
