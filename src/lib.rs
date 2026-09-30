@@ -6,6 +6,7 @@
 //! once, encoded with the smallest of {stored, zstd, byte-plane + zstd}.
 
 pub mod chunk;
+pub mod downloads;
 pub mod gguf;
 pub mod hub;
 pub mod lazy;

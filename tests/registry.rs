@@ -1,6 +1,7 @@
 //! A registry over HTTP: publishing, resolving, searching and auditing the log.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use chungus::registry::{self, Claim, Client, Registry, Statement};
@@ -9,7 +10,8 @@ use chungus::sign;
 async fn spawn(reg: Arc<Registry>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, registry::router(reg)).await });
+    let app = registry::router(reg).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move { axum::serve(listener, app).await });
     url
 }
 
@@ -96,6 +98,38 @@ async fn publish_resolve_search_audit() {
         sign::public_key_string(&alice.verifying_key())
     );
     assert!(client.resolve("acme/tiny-llama", "v2").await.is_err());
+
+    // Fetches count as downloads, once a day per network; plain lookups don't count.
+    assert_eq!(client.downloads("acme/tiny-llama").await.unwrap().total, 0);
+    for _ in 0..3 {
+        client
+            .resolve_download("acme/tiny-llama", "main", None)
+            .await
+            .unwrap();
+    }
+    assert!(
+        client
+            .resolve_download("acme/nope", "main", None)
+            .await
+            .is_err()
+    );
+    // A client can't pose as another network: X-Forwarded-For counts only behind a proxy.
+    reqwest::Client::new()
+        .get(format!("{url}/v1/resolve/acme/tiny-llama/main?download=1"))
+        .header("x-forwarded-for", "198.51.100.7")
+        .send()
+        .await
+        .unwrap();
+    let d = client.downloads("acme/tiny-llama").await.unwrap();
+    assert_eq!((d.total, d.last_30_days), (1, 1));
+    let body = reqwest::get(format!("{url}/v1/downloads"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let totals: chungus::downloads::Totals = serde_json::from_slice(&body).unwrap();
+    assert_eq!(totals.total, 1);
 
     let hits = client.search("llama").await.unwrap();
     assert_eq!(hits.len(), 1);

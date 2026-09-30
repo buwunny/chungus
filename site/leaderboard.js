@@ -59,7 +59,7 @@ async function renderBoard() {
         ),
         el("div", {},
           el("div", { class: "label", text: "Downloads" }),
-          el("div", { class: "value", text: totals.downloads.toLocaleString() }),
+          el("div", { class: "value", text: totals.total.toLocaleString() }),
           el("div", { class: "note", text: "one per model, network and day" }),
         ),
         el("div", {},

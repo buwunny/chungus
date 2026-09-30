@@ -14,9 +14,9 @@
 //!   credited downloader costs a real network. Credit per downloader is capped at the
 //!   model's `unique_bytes`.
 //!
-//! The registry keeps registrations in `nodes.json`, download counts in `downloads.json`
-//! and the rest in `ledger.json`, and signs each day's totals once no more receipts can
-//! arrive for it (`days/<date>.json`), so published numbers can't be quietly revised.
+//! The registry keeps registrations in `nodes.json` and the rest in `ledger.json` (download
+//! counts are [`crate::downloads`]), and signs each day's totals once no more receipts
+//! can arrive for it (`days/<date>.json`), so published numbers can't be quietly revised.
 //! Client networks are only ever stored as hashes under a key that changes every UTC day
 //! and is never written down.
 
@@ -515,15 +515,6 @@ pub struct HistoryDay {
     pub signed: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Downloads {
-    /// Counted downloads by manifest root.
-    pub models: BTreeMap<String, u64>,
-    pub downloads: u64,
-    /// Credited bytes served, by every node, registered or not.
-    pub bytes_served: u64,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
@@ -537,7 +528,6 @@ pub enum Metric {
 pub struct Board {
     dir: PathBuf,
     nodes: BTreeMap<String, NodeRecord>,
-    downloads: BTreeMap<String, u64>,
     ledger: Ledger,
     days: BTreeMap<u64, DayTotals>,
     /// The day the network key is for, and the key. Never written down.
@@ -608,7 +598,6 @@ impl Board {
         getrandom::fill(&mut day_key).map_err(|e| anyhow!("no randomness: {e}"))?;
         Ok(Board {
             nodes: read_json(&dir.join("nodes.json"))?,
-            downloads: read_json(&dir.join("downloads.json"))?,
             ledger: read_json(&dir.join("ledger.json"))?,
             days,
             dir: dir.to_path_buf(),
@@ -627,7 +616,6 @@ impl Board {
             return Ok(());
         }
         write_json(&self.dir.join("nodes.json"), &self.nodes)?;
-        write_json(&self.dir.join("downloads.json"), &self.downloads)?;
         write_json(&self.dir.join("ledger.json"), &self.ledger)?;
         self.dirty = false;
         Ok(())
@@ -661,7 +649,6 @@ impl Board {
         if !self.counted_today.insert((root.to_string(), hash.clone())) {
             return false;
         }
-        *self.downloads.entry(root.to_string()).or_default() += 1;
         *self.ledger.counted.entry(day_of(t)).or_default() += 1;
         // A peer id binds once: a later lookup naming someone else's peer id can't take
         // over its receipts.
@@ -979,7 +966,8 @@ impl Board {
         })
     }
 
-    pub fn downloads(&self, t: u64) -> Downloads {
+    /// Credited bytes served by every node, registered or not.
+    pub fn bytes_served(&self, t: u64) -> u64 {
         let today = day_of(t);
         let signed: u64 = self.days.values().map(|d| d.bytes_served).sum();
         let live: u64 = self
@@ -992,11 +980,7 @@ impl Board {
             .filter(|d| !self.days.contains_key(d) && *d <= today)
             .map(|d| self.day(d).values().map(|n| n.bytes).sum::<u64>())
             .sum();
-        Downloads {
-            downloads: self.downloads.values().sum(),
-            models: self.downloads.clone(),
-            bytes_served: signed + live,
-        }
+        signed + live
     }
 
     pub fn totals(&self, day: u64) -> Option<&DayTotals> {
@@ -1133,7 +1117,6 @@ pub(crate) fn routes() -> Router<Arc<Registry>> {
         .route("/v1/probes", post(probes))
         .route("/v1/anchor-access", post(anchor_access))
         .route("/v1/leaderboard", get(leaderboard))
-        .route("/v1/downloads", get(downloads))
         .route("/v1/totals", get(signed_days))
         .route("/v1/totals/{day}", get(totals))
 }
@@ -1242,10 +1225,6 @@ async fn leaderboard(State(reg): State<Arc<Registry>>, Query(q): Query<BoardQuer
     let metric = q.metric.unwrap_or(Metric::Bytes);
     let days = q.days.unwrap_or(DEFAULT_DAYS);
     axum::Json(reg.board(|b| b.leaderboard(metric, days, now()))).into_response()
-}
-
-async fn downloads(State(reg): State<Arc<Registry>>) -> Response {
-    axum::Json(reg.board(|b| b.downloads(now()))).into_response()
 }
 
 async fn signed_days(State(reg): State<Arc<Registry>>) -> Response {
@@ -1645,7 +1624,7 @@ mod tests {
         let rows = b.leaderboard(Metric::Bytes, 30, t);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bytes, 400);
-        assert_eq!(b.downloads(t).bytes_served, 1000);
+        assert_eq!(b.bytes_served(t), 1000);
 
         // Two days on, the day is signed and frozen.
         let op = sign::generate_key(&dir.path().join("op.key")).unwrap();
@@ -1658,7 +1637,6 @@ mod tests {
         b.save().unwrap();
         let reopened = Board::open(dir.path()).unwrap();
         assert_eq!(reopened.day(day_of(t))[&s1p.to_string()].bytes, 400);
-        assert_eq!(reopened.downloads(t).downloads, 1);
     }
 
     #[test]

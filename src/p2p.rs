@@ -30,8 +30,10 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -128,6 +130,99 @@ pub struct Config {
     pub log: bool,
     /// Where to send receipts downloaders hand this node. Without it they are refused.
     pub receipts: Option<mpsc::UnboundedSender<Receipt>>,
+    /// Serve counters as Prometheus text at `http://<addr>/metrics`.
+    pub metrics: Option<SocketAddr>,
+}
+
+/// What a node has been doing since it started. Counters only grow; gauges are the
+/// current value.
+#[derive(Default)]
+pub struct Metrics {
+    /// Bytes sent to peers in responses.
+    pub bytes_served: AtomicU64,
+    /// Requests peers have sent us.
+    pub requests: AtomicU64,
+    /// Requests answered "busy" because of the upload limits.
+    pub busy: AtomicU64,
+    /// Peers connected right now (gauge).
+    pub peers: AtomicU64,
+    /// Connections this node is relaying right now, as a relay server (gauge).
+    pub relay_circuits: AtomicU64,
+    /// Connections this node has agreed to relay.
+    pub relay_circuits_accepted: AtomicU64,
+}
+
+impl Metrics {
+    /// The Prometheus text exposition format.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for (name, kind, help, v) in [
+            (
+                "bytes_served_total",
+                "counter",
+                "Bytes sent to peers in responses.",
+                &self.bytes_served,
+            ),
+            (
+                "requests_total",
+                "counter",
+                "Requests received from peers.",
+                &self.requests,
+            ),
+            (
+                "busy_total",
+                "counter",
+                "Requests answered busy because of upload limits.",
+                &self.busy,
+            ),
+            ("peers", "gauge", "Peers connected now.", &self.peers),
+            (
+                "relay_circuits",
+                "gauge",
+                "Connections being relayed now.",
+                &self.relay_circuits,
+            ),
+            (
+                "relay_circuits_total",
+                "counter",
+                "Connections accepted for relaying.",
+                &self.relay_circuits_accepted,
+            ),
+        ] {
+            let v = v.load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "# HELP chungus_{name} {help}\n# TYPE chungus_{name} {kind}\nchungus_{name} {v}\n"
+            ));
+        }
+        out
+    }
+}
+
+fn add(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Serve `metrics` at `http://<addr>/metrics` until the process exits.
+async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind metrics on {addr}"))?;
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || async move {
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                metrics.render(),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok(())
 }
 
 enum Command {
@@ -147,6 +242,7 @@ pub struct Node {
     block_bytes: u64,
     anchors: Vec<PeerId>,
     key: Keypair,
+    pub metrics: Arc<Metrics>,
 }
 
 /// Load this node's identity from `path`, creating it on first use.
@@ -364,6 +460,10 @@ impl Node {
                 via.push(addr.clone());
             }
         }
+        let metrics = Arc::new(Metrics::default());
+        if let Some(addr) = cfg.metrics {
+            serve_metrics(addr, metrics.clone()).await?;
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let runner = Runner {
             swarm,
@@ -395,6 +495,7 @@ impl Node {
             granted: HashMap::new(),
             closest: HashMap::new(),
             receipts: cfg.receipts.clone(),
+            metrics: metrics.clone(),
         };
         tokio::spawn(runner.run());
         Ok(Node {
@@ -403,6 +504,7 @@ impl Node {
             block_bytes,
             anchors,
             key: signing_key,
+            metrics,
         })
     }
 
@@ -509,6 +611,7 @@ struct Runner {
     /// DHT lookups of a peer's address, from [`Node::find`].
     closest: HashMap<kad::QueryId, oneshot::Sender<()>>,
     receipts: Option<mpsc::UnboundedSender<Receipt>>,
+    metrics: Arc<Metrics>,
 }
 
 type Reply = (PeerId, ResponseChannel<Response>, Response);
@@ -525,7 +628,10 @@ impl Runner {
                     None => return,
                 },
                 Some((peer, channel, resp)) = resp_rx.recv() => {
-                    let _ = self.swarm.behaviour_mut().rr.send_response(channel, resp);
+                    let size = resp.size() as u64;
+                    if self.swarm.behaviour_mut().rr.send_response(channel, resp).is_ok() {
+                        add(&self.metrics.bytes_served, size);
+                    }
                     if let Some(n) = self.serving.get_mut(&peer) {
                         *n -= 1;
                         if *n == 0 {
@@ -709,7 +815,9 @@ impl Runner {
     }
 
     fn peers(&self) -> usize {
-        self.swarm.connected_peers().count()
+        let n = self.swarm.connected_peers().count();
+        self.metrics.peers.store(n as u64, Ordering::Relaxed);
+        n
     }
 
     fn learn(&mut self, peer: PeerId, addr: Multiaddr) {
@@ -745,6 +853,7 @@ impl Runner {
                 ..
             } => {
                 if num_established.get() == 1 {
+                    self.peers();
                     let how = if endpoint.is_relayed() {
                         "through a relay"
                     } else if endpoint.is_dialer() {
@@ -777,6 +886,7 @@ impl Runner {
                 cause,
                 ..
             } => {
+                self.peers();
                 let why = cause.map(|c| format!(": {c}")).unwrap_or_default();
                 self.say(format_args!(
                     "disconnected from {}{why}; {} peer(s) connected",
@@ -842,9 +952,20 @@ impl Runner {
                 relay::Event::CircuitReqAccepted {
                     src_peer_id,
                     dst_peer_id,
-                } => self.say(format_args!(
-                    "relaying a connection from {src_peer_id} to {dst_peer_id}"
-                )),
+                } => {
+                    add(&self.metrics.relay_circuits, 1);
+                    add(&self.metrics.relay_circuits_accepted, 1);
+                    self.say(format_args!(
+                        "relaying a connection from {src_peer_id} to {dst_peer_id}"
+                    ))
+                }
+                relay::Event::CircuitClosed { .. } => {
+                    let _ = self.metrics.relay_circuits.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |n| n.checked_sub(1),
+                    );
+                }
                 relay::Event::CircuitReqDenied {
                     src_peer_id,
                     dst_peer_id,
@@ -974,12 +1095,14 @@ impl Runner {
                     request_response::Message::Request {
                         request, channel, ..
                     } => {
+                        add(&self.metrics.requests, 1);
                         let mine = self.serving.get(&peer).copied().unwrap_or(0);
                         let total: usize = self.serving.values().sum();
                         *self.serving.entry(peer).or_default() += 1;
                         if mine >= self.limits.max_requests_per_peer
                             || total >= self.limits.max_uploads
                         {
+                            add(&self.metrics.busy, 1);
                             let _ = resp_tx.send((peer, channel, Response::Busy));
                             return;
                         }

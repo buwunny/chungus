@@ -233,6 +233,10 @@ enum Cmd {
         /// download-only identity. Only counts for the registry's anchor nodes.
         #[arg(long, env = "CHUNGUS_PROBE")]
         probe: bool,
+        /// Serve Prometheus metrics (bytes served, requests, peers, ...) at
+        /// http://<addr>/metrics, e.g. 127.0.0.1:9101.
+        #[arg(long, env = "CHUNGUS_METRICS")]
+        metrics: Option<SocketAddr>,
     },
     /// Run a registry: model names, a signed append-only log of every change, and search.
     Registry {
@@ -639,6 +643,21 @@ impl FromArgs {
     }
 }
 
+/// Resolves on Ctrl-C, or on SIGTERM (what `docker stop` sends).
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn parse_keys(keys: &[String]) -> Result<Vec<ed25519_dalek::VerifyingKey>> {
     keys.iter().map(|k| sign::parse_public_key(k)).collect()
 }
@@ -1038,6 +1057,7 @@ async fn main() -> Result<()> {
             leaderboard,
             registry,
             probe,
+            metrics,
         } => {
             let store = Arc::new(Store::open(&store)?);
             let registry = registry.or_else(|| blocklist.clone());
@@ -1135,6 +1155,7 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 },
                 log: true,
+                metrics,
                 ..Default::default()
             };
             let node = p2p::Node::start(store.clone(), key.clone(), config).await?;
@@ -1145,6 +1166,9 @@ async fn main() -> Result<()> {
             if let (Some(prober), Some(url)) = (prober, &registry) {
                 println!("probing {url}'s listed nodes as {}", prober.peer_id);
                 chungus::leaderboard::probe_loop(url.clone(), key, prober);
+            }
+            if let Some(addr) = metrics {
+                println!("metrics on http://{addr}/metrics");
             }
             if download_only {
                 println!("download-only: serving and announcing nothing");
@@ -1194,7 +1218,7 @@ async fn main() -> Result<()> {
                      chungus delegate {online} --key <root key> --registry <this registry>"
                 ),
             }
-            registry::serve(listener, reg).await?;
+            registry::serve(listener, reg, shutdown()).await?;
         }
         Cmd::Publish {
             root,
