@@ -1,0 +1,22 @@
+# chungus in front of the stock Ollama Linux service, as the `ollama` user so it can write
+# Ollama's blobs. See README.md in this directory.
+[Unit]
+Description=chungus in front of Ollama
+Wants=network-online.target
+After=network-online.target ollama.service
+
+[Service]
+User=ollama
+Group=ollama
+ExecStart=/usr/local/bin/chungus ollama --models /usr/share/ollama/.ollama/models --store /var/lib/chungus-ollama/store
+StateDirectory=chungus-ollama
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/usr/share/ollama/.ollama/models
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
