@@ -1,5 +1,6 @@
 //! A registry over HTTP: publishing, resolving, searching and auditing the log.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chungus::registry::{self, Claim, Client, Registry, Statement};
@@ -417,7 +418,12 @@ async fn parameters_are_counted_from_checked_headers() {
     let h = forged.get_mut("model-2.safetensors").unwrap();
     *h = h.replace("[64,1000]", "[64,9000]");
     let err = client
-        .publish_with_headers(&publish(&alice, "acme/model", &m.root, ""), &bytes, forged)
+        .publish_with_headers(
+            &publish(&alice, "acme/model", &m.root, ""),
+            &bytes,
+            forged,
+            BTreeMap::new(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -426,7 +432,12 @@ async fn parameters_are_counted_from_checked_headers() {
     );
 
     client
-        .publish_with_headers(&publish(&alice, "acme/model", &m.root, ""), &bytes, headers)
+        .publish_with_headers(
+            &publish(&alice, "acme/model", &m.root, ""),
+            &bytes,
+            headers,
+            BTreeMap::new(),
+        )
         .await
         .unwrap();
     let s = reg.summary(&m.root).unwrap();
@@ -446,4 +457,131 @@ async fn parameters_are_counted_from_checked_headers() {
     drop(reg);
     let reopened = Registry::open(&dir).unwrap();
     assert_eq!(reopened.summary(&m.root).unwrap().params, Some(128_064));
+}
+
+/// A GGUF file with a tokenizer-like array, a Q8_0 matrix and an F32 vector.
+fn gguf(path: &std::path::Path, quant: u32, rows: u64) {
+    use chungus::gguf::testing::{Tensor, Value, write};
+    // Q8_0 and Q4_0 blocks: 32 elements in 34 or 18 bytes.
+    let block = if quant == 8 { 34 } else { 18 };
+    let tokens = (0..2000).map(|i| Value::Str(format!("tok{i}"))).collect();
+    let file = write(
+        vec![("tokenizer.ggml.tokens", Value::Array(8, tokens))],
+        &[
+            Tensor {
+                name: "token_embd.weight".into(),
+                dims: vec![64, rows],
+                ty: quant,
+                data: vec![quant as u8; (rows * 2 * block) as usize],
+            },
+            Tensor {
+                name: "norm.weight".into(),
+                dims: vec![64],
+                ty: 0,
+                data: vec![1; 256],
+            },
+        ],
+        32,
+    );
+    std::fs::write(path, file).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gguf_parameters_count_one_quantization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("reg");
+    let reg = Arc::new(Registry::open(&dir).unwrap());
+    let url = spawn(reg.clone()).await;
+    let client = Client::new(&url).unwrap();
+    let alice = sign::generate_key(&tmp.path().join("alice")).unwrap();
+    let store = chungus::store::Store::open(&tmp.path().join("store")).unwrap();
+
+    // One quantization: its count, by ggml type.
+    let one = tmp.path().join("one");
+    std::fs::create_dir(&one).unwrap();
+    gguf(&one.join("model-q8_0.gguf"), 8, 1000);
+    let (m, _) = chungus::pack(&one, &store).unwrap();
+    let bytes = serde_json::to_vec(&m).unwrap();
+    let headers = chungus::gguf_headers(&m, &store).unwrap();
+    assert_eq!(headers.len(), 1);
+
+    // A header that doesn't match the file's chunks is refused, with the publish.
+    let mut forged = headers.clone();
+    let h = forged.get_mut("model-q8_0.gguf").unwrap();
+    let at = h.len() - 200;
+    h.replace_range(at..at + 2, if &h[at..at + 2] == "00" { "01" } else { "00" });
+    let err = client
+        .publish_with_headers(
+            &publish(&alice, "acme/gguf", &m.root, ""),
+            &bytes,
+            BTreeMap::new(),
+            forged,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("doesn't match its chunks"),
+        "{err}"
+    );
+
+    client
+        .publish_with_headers(
+            &publish(&alice, "acme/gguf", &m.root, ""),
+            &bytes,
+            BTreeMap::new(),
+            headers,
+        )
+        .await
+        .unwrap();
+    let s = reg.summary(&m.root).unwrap();
+    assert_eq!(s.params, Some(64_064));
+    assert_eq!(
+        s.dtypes,
+        BTreeMap::from([("F32".into(), 64), ("Q8_0".into(), 64_000)])
+    );
+
+    // Two quantizations of one model: one count, not the sum, and no types.
+    let two = tmp.path().join("two");
+    std::fs::create_dir(&two).unwrap();
+    gguf(&two.join("model-q8_0.gguf"), 8, 1000);
+    gguf(&two.join("model-q4_0.gguf"), 2, 1000);
+    let (m2, _) = chungus::pack(&two, &store).unwrap();
+    let headers = chungus::gguf_headers(&m2, &store).unwrap();
+    assert_eq!(headers.len(), 2);
+    client
+        .publish_with_headers(
+            &publish(&alice, "acme/gguf2", &m2.root, ""),
+            &serde_json::to_vec(&m2).unwrap(),
+            BTreeMap::new(),
+            headers,
+        )
+        .await
+        .unwrap();
+    let s = reg.summary(&m2.root).unwrap();
+    assert_eq!(s.params, Some(64_064));
+    assert!(s.dtypes.is_empty());
+
+    // Quantizations that disagree (not one model after all): no count.
+    let odd = tmp.path().join("odd");
+    std::fs::create_dir(&odd).unwrap();
+    gguf(&odd.join("a.gguf"), 8, 1000);
+    gguf(&odd.join("b.gguf"), 8, 2000);
+    let (m3, _) = chungus::pack(&odd, &store).unwrap();
+    let headers = chungus::gguf_headers(&m3, &store).unwrap();
+    client
+        .publish_with_headers(
+            &publish(&alice, "acme/gguf3", &m3.root, ""),
+            &serde_json::to_vec(&m3).unwrap(),
+            BTreeMap::new(),
+            headers,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg.summary(&m3.root).unwrap().params, None);
+
+    // The counts are kept, so a restarted registry still has them.
+    drop(reg);
+    let reopened = Registry::open(&dir).unwrap();
+    assert_eq!(reopened.summary(&m.root).unwrap().params, Some(64_064));
+    assert_eq!(reopened.summary(&m2.root).unwrap().params, Some(64_064));
 }

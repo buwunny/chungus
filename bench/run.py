@@ -63,6 +63,10 @@ class Model:
     patterns: list[str] = field(default_factory=lambda: list(WEIGHTS))
 
     @property
+    def is_gguf(self) -> bool:
+        return any(p.endswith(".gguf") for p in self.patterns)
+
+    @property
     def label(self) -> str:
         return self.repo + (f"@{self.revision[:12]}" if self.revision else "")
 
@@ -94,7 +98,11 @@ MODELS = {
 SETS = {
     "quick": {
         "compress": ["smollm2-135m-instruct", "gpt2", "minilm", "pythia-160m", "qwen2.5-0.5b-q4"],
-        "pairs": [("smollm2-135m", "smollm2-135m-instruct")],
+        # The GGUF pair fetches the Q8_0 file too (676 MB).
+        "pairs": [
+            ("smollm2-135m", "smollm2-135m-instruct"),
+            ("qwen2.5-0.5b-q4", "qwen2.5-0.5b-q8"),
+        ],
         "download": ["smollm2-135m-instruct"],
     },
     "full": {
@@ -114,6 +122,7 @@ SETS = {
             ("smollm2-135m", "smollm2-135m-instruct"),
             ("qwen2.5-0.5b", "qwen2.5-0.5b-instruct"),
             ("qwen3-0.6b", "qwen3-0.6b-fp8"),
+            ("qwen2.5-0.5b-q4", "qwen2.5-0.5b-q8"),
         ],
         "download": ["smollm2-135m-instruct", "qwen2.5-0.5b-instruct"],
     },
@@ -211,9 +220,10 @@ class Runner:
             (own / rel).symlink_to((snapshot / rel).resolve())
         return own
 
-    def bench(self, *paths: Path) -> dict:
+    def bench(self, *paths: Path, whole_files: bool = False) -> dict:
+        flags = ["--whole-files"] if whole_files else []
         out = subprocess.run(
-            [self.chungus, "bench", "--json", *map(str, paths)],
+            [self.chungus, "bench", "--json", *flags, *map(str, paths)],
             check=True,
             capture_output=True,
             text=True,
@@ -340,6 +350,13 @@ class Runner:
                     "fetch_bytes": second["new_stored_bytes"],
                     "fetch_bytes_alone": alone["dedup_bytes"],
                 }
+                if parse_model(a).is_gguf or parse_model(b).is_gguf:
+                    # The same pair chunked as whole files, to show what splitting GGUF
+                    # per tensor adds.
+                    log(f"bench {a} then {b}, whole files")
+                    whole = self.bench(pa, pb, whole_files=True)["inputs"][1]
+                    row["new_raw_bytes_whole"] = whole["new_raw_bytes"]
+                    row["fetch_bytes_whole"] = whole["new_stored_bytes"]
                 xa, xb = self.try_xet(a), self.try_xet(b)
                 if xa and xb:
                     # A client that kept every chunk of the first model fetches only the
@@ -552,11 +569,12 @@ def report(
             "What fetching the second model costs when the first is already in the store. "
             "The Xet columns assume a client that kept every Xet chunk of the first model "
             "(the most Xet's chunk cache could save); a Xet fetch range's bytes are split "
-            "evenly across its chunks.",
+            "evenly across its chunks. *Whole files* is the transfer when chungus chunks "
+            "each file whole instead of per tensor (GGUF pairs only).",
             "",
-            "| Have | Fetch | Size | Already have | Transfer | Without dedup "
+            "| Have | Fetch | Size | Already have | Transfer | Whole files | Without dedup "
             "| Xet transfer | Xet without dedup |",
-            "|---|---|--:|--:|--:|--:|--:|--:|",
+            "|---|---|--:|--:|--:|--:|--:|--:|--:|",
         ]
         for r in dedup:
             xet = (
@@ -564,10 +582,11 @@ def report(
                 if "xet_fetch_bytes" in r
                 else "n/a | n/a"
             )
+            whole = mb(r["fetch_bytes_whole"]) if "fetch_bytes_whole" in r else "n/a"
             out.append(
                 f"| {r['first']} | {r['second']} | {mb(r['raw_bytes'])} | "
                 f"{pct(r['raw_bytes'] - r['new_raw_bytes'], r['raw_bytes'])} | "
-                f"{mb(r['fetch_bytes'])} | {mb(r['fetch_bytes_alone'])} | {xet} |"
+                f"{mb(r['fetch_bytes'])} | {whole} | {mb(r['fetch_bytes_alone'])} | {xet} |"
             )
     if dl:
         out += [

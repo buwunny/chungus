@@ -56,7 +56,7 @@ model files ─► segments ─► FastCDC chunks ─► BLAKE3 ─► float tra
               (per tensor)   (~64 KiB)       (raw bytes)  (exponent split)
 ```
 
-1. **Segments.** Safetensors files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
+1. **Segments.** Safetensors and GGUF files are split at tensor boundaries using the file's header, so a chunk never spans two tensors. Other files are one segment.
 2. **Content-defined chunking.** FastCDC cuts each segment into chunks of 16–256 KiB (64 KiB average). Cut points inside float tensors are rounded to whole elements.
 3. **Hashing.** Each chunk is addressed by the BLAKE3 hash of its *raw* bytes. Identical chunks are stored once, across files and across models.
 4. **Float transform.** For BF16 and F32 tensors, each element is rearranged into an exponent byte and sign+mantissa bytes, then grouped into planes. Exponents are low-entropy and compress well. This is lossless: unpacking gives back the exact bits. The split and unshuffle run SIMD kernels (SSSE3 on x86-64, NEON on ARM) at 4 to 9 GB/s per core, faster than zstd decodes; `cargo run --release --example transform_speed` measures them.
