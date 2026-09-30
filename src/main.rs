@@ -70,6 +70,9 @@ enum Cmd {
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
+        /// Chunk every file whole, without splitting safetensors and GGUF per tensor.
+        #[arg(long)]
+        whole_files: bool,
     },
     /// Share this store with peers on the LAN (read-only HTTP, advertised over mDNS).
     Serve {
@@ -652,8 +655,12 @@ async fn main() -> Result<()> {
                 println!("{root}  {:>10.1} MB  {}", mb(size), names.join(", "));
             }
         }
-        Cmd::Bench { inputs, json } => {
-            let r = chungus::bench(&inputs)?;
+        Cmd::Bench {
+            inputs,
+            json,
+            whole_files,
+        } => {
+            let r = chungus::bench(&inputs, whole_files)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
@@ -1080,8 +1087,9 @@ async fn main() -> Result<()> {
             );
             let m = chungus::manifest::parse(&manifest)?;
             let headers = chungus::safetensors_headers(&m, &store)?;
+            let gguf_headers = chungus::gguf_headers(&m, &store)?;
             let entry = registry::Client::new(&registry)?
-                .publish_with_headers(&st, &manifest, headers)
+                .publish_with_headers(&st, &manifest, headers, gguf_headers)
                 .await?;
             println!("published {name}@{rev} -> {root} (log entry {})", entry.seq);
         }

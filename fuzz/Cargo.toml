@@ -47,6 +47,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gguf"
+path = "fuzz_targets/gguf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "registry_log"
 path = "fuzz_targets/registry_log.rs"
 test = false
