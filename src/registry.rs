@@ -1073,12 +1073,9 @@ impl Registry {
         fs::create_dir_all(&manifests)?;
         let headers = dir.join("headers");
         fs::create_dir_all(&headers)?;
-<<<<<<< HEAD
         let gguf = dir.join("gguf");
         fs::create_dir_all(&gguf)?;
-=======
         let downloads = Downloads::open(&dir.join("downloads.json"))?;
->>>>>>> d807142 (Registry download stats)
         let mut checked = HashMap::new();
         for e in fs::read_dir(&manifests)? {
             let e = e?;

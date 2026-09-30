@@ -1,10 +1,7 @@
 //! A registry over HTTP: publishing, resolving, searching and auditing the log.
 
-<<<<<<< HEAD
 use std::collections::BTreeMap;
-=======
 use std::net::SocketAddr;
->>>>>>> d807142 (Registry download stats)
 use std::sync::Arc;
 
 use chungus::registry::{self, Claim, Client, Registry, Statement};
