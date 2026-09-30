@@ -71,6 +71,9 @@ pub enum Request {
     /// Hand the node a downloader's receipt for what it served, to submit to the
     /// registry (see [`crate::leaderboard`]). Older nodes fail the request.
     Receipt(Receipt),
+    /// Which manifest root indexes this Ollama manifest digest (`sha256:<hex>`). Added
+    /// after the first release; older nodes fail the request.
+    Ollama(String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -87,6 +90,8 @@ pub enum Response {
     Granted(bool),
     /// Whether a receipt was taken.
     Receipt(bool),
+    /// The manifest root for an Ollama manifest digest, if this node has one.
+    Root(Option<String>),
 }
 
 #[derive(NetworkBehaviour)]
@@ -309,6 +314,11 @@ fn holder_key(root: &str) -> String {
     format!("manifest/{root}")
 }
 
+/// DHT key announced by nodes that hold a whole Ollama model with manifest `digest`.
+fn ollama_key(digest: &str) -> String {
+    format!("ollama/{digest}")
+}
+
 /// What this node knows it holds of one model.
 struct Held {
     blocks: Vec<String>,
@@ -524,6 +534,11 @@ impl Node {
         self.providers_of(&holder_key(root)).await
     }
 
+    /// Peers that hold the whole Ollama model with manifest `digest` (`sha256:<hex>`).
+    pub async fn ollama_providers(&self, digest: &str) -> Result<Vec<PeerId>> {
+        self.providers_of(&ollama_key(digest)).await
+    }
+
     /// Peers that announce DHT key `key`, not counting this node.
     async fn providers_of(&self, key: &str) -> Result<Vec<PeerId>> {
         let (tx, rx) = oneshot::channel();
@@ -699,6 +714,12 @@ impl Runner {
             }
         }
         self.held.retain(|r, _| roots.contains(r));
+        // Ollama models held in full, by manifest digest, so pulls can find them.
+        for (digest, root) in crate::ollama::digest_records(&self.store) {
+            if want.contains(&root) {
+                want.insert(ollama_key(&digest));
+            }
+        }
 
         let stale: Vec<String> = self.provided.difference(&want).cloned().collect();
         for key in stale {
@@ -1211,6 +1232,7 @@ fn answer(store: &Store, req: Request, granted: &HashSet<String>) -> Response {
         }
         Request::Access(_) => Response::Granted(false),
         Request::Receipt(_) => Response::Receipt(false),
+        Request::Ollama(digest) => Response::Root(crate::ollama::root_for_digest(store, &digest)),
     }
 }
 
